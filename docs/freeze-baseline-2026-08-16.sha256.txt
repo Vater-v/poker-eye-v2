@@ -1,0 +1,6 @@
+# Frozen baseline manifest
+
+Production archive SHA-256:
+`F1351E604DD6D6EC2DEC16ABFCE73F81BD8EF2BEF8CEC611CCD033FEE0D5BBD6`
+
+Baseline source and `ready_v6` remain outside this repository and unchanged. The original detailed freeze report is retained locally in the working copy.
