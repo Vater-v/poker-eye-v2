@@ -1,26 +1,26 @@
 # Current
-- Read-only Android/network audit: current HmuriyBridge.java and core discovery/transport use matching UDP 37020 JSON advertisement and TCP v2 HMAC protocol; no source files modified.
-- v2 core is stdlib-only and green: 88 unit tests pass, compileall clean, trainer smoke prints READY and writes logs/run_<id>/{manifest.json,operator.txt,events.jsonl}.
-- New core modules: coin_wire, state, events, anomalies, policy, hints, ledger, pcap_ring, logging, actions.
+- Repo: `C:\projects\pokereye\poker-eye-v2`; clean Git state after commits `987e322` and `cf4f65b`, pushed to origin/main.
+- Full suite: 88 tests pass; compileall previously passed.
+- v2 Android APK source is `android/HmuriyBridge.java`; latest isolated build/sign artifact (outside Git) SHA-256 `ED22901EF22EEC562949441AB2F7F00A6B454FAD1988CF7054335DEC51A5709D`, apksigner v2/v3 verified.
+- Baseline APK was pulled before install and matched SHA `73E2113...A11AC7C3`. Baseline source was not modified.
+- Local ignored files now exist: `secrets/eye.agent` copied from ready_v6, `secrets/trainer.secret` generated locally, `config/backend_accounts.local.json` copied, `config/config.example.toml` tracked. No secret is tracked.
+- RUN.cmd now reads ignored secrets/trainer.secret or requires POKEREYE_V2_SECRET; no insecure default.
 
-# Verification
-- `python -m unittest discover`: 88 tests OK.
-- Real trainer stdout artifact `.goose-tmp/real_trainer_stdout.txt`: ready tcp=62214 udp=37020; no device discovery/connection evidence.
-- Existing logs contain only trainer.ready in inspected runs; no broadcast.received or hello.authenticated events.
-- APK build record docs/BUILD.md confirms signed artifact and bridge source hash, but no current ADB/logcat dump exists in repository.
+# Real acceptance finding
+- Target LDPlayer9 instance index 2 / emulator-5558 was tested with Coin installed/launched and SocksDroid VPN active. Coin reached authenticated home; no active table in final rebuilt run.
+- Before Wi-Fi binding patch, logcat repeatedly showed `Hmuriy: bridge fail-open` / `IllegalStateException: no trainer discovered`; trainer had only `trainer.ready`, no hello/auth/transport events.
+- Root cause observed: LDPlayer NAT guest wlan0 `172.16.1.49`/`.22`, host Ethernet `192.168.0.132`; guest-to-host broadcast/TCP did not reach host. ADB is not used as fallback. Android bridge now explicitly selects non-VPN Wi-Fi network for UDP bind and TCP socket and logs discovery bind/valid ads.
+- Reversible LDPlayer bridged-network experiment was performed and NAT config restored. No legacy/emulator data was intentionally deleted.
+- Final report: `docs/REAL_ACCEPTANCE_2026-08-17.md`. Production claim remains blocked; no real hook→EYE→CC→action→ACK claim.
 
-# Audit findings
-- Java discovery binds UDP/IPv4 0.0.0.0:37020 and accepts only JSON type=trainer, version=2, tcp_port, nonce; it does not log ignored/malformed advertisements. It starts in static initialization, so discovery itself is not gated by ws traffic.
-- Trainer advertises to 255.255.255.255:37020 with host exactly the configured `host`. Default host 0.0.0.0 is intentionally replaced by the Android receiver with packet source IP. UDP/TCP protocol fields and HMAC proof formula match core/protocol.py.
-- Most likely real-emulator failure is network topology/firewall: LDPlayer NAT/isolated mode commonly does not deliver host LAN IPv4 broadcasts to guest; ADB is not a runtime fallback. Also verify Windows firewall permits inbound UDP 37020 and advertised TCP ephemeral port (trainer output was 62214 in the captured run).
-- Minimal protocol-side hardening (if needed after network test): emit Java logs for bind/valid/ignored discovery and trainer broadcast send errors; optionally advertise a fixed LAN host/IP rather than 0.0.0.0. Do not replace UDP broadcast with ADB or unicast if broadcast-only contract is required.
-- Separate race: if UDP discovery succeeds just before TCP, trainerNonce/sessionId are volatile and updated from each ad; otherwise hello should authenticate. A TCP refusal/timeout after “discovered” indicates firewall/route or advertised wrong host/port, not parsing.
-
-# Not done / blocked
-- No files modified. No real ADB/logcat/network capture was available in repository, so exact emulator topology cannot be proven from files alone.
-- Double-board unsupported; real acceptance still needs discovery, TCP, hook/hint/CC/ACK/ledger evidence.
+# Technical audit findings applied / remaining
+- Fixed numeric-key `userTurnOptions` in Coin resolver.
+- Fixed negative protobuf varint compatibility.
+- Fixed failed EYE hint delivery leaving watchdog permanently armed; turn is only marked seen after successful delivery.
+- Remaining major gaps: production PPP/protobuf adapter and hero identity/routing, EYE logical session replay/auth, reconcile-before-retry semantics, true per-device serialization/queue behavior, real network acceptance.
 
 # Next
-1. Run host-side UDP listener and packet capture while trainer is running; verify advertisement source/destination and emulator visibility.
-2. Check LDPlayer network mode/route and Windows firewall; test TCP to the exact advertised port from emulator only after UDP visibility.
-3. Add only diagnostic logging first, then any topology-specific minimal fix.
+1. Rebuild/install latest APK after Wi-Fi patch, ensure Coin is in an active table, run host trainer, inspect `logcat -s Hmuriy` for `discovery UDP bound`, `trainer discovered`, TCP generation/handshake.
+2. If still no discovery, configure LDPlayer reachable bridged LAN using its supported UI/service, not ADB reverse; prove with UDP packet capture and TCP HMAC event logs.
+3. Implement actual PPP protobuf parser/adapter and EYE session replay before any production acceptance claim.
+4. Perform one table, reconnect, 2/4/5 table, multi-emulator and 10/10 launch gates.
