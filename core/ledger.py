@@ -83,6 +83,7 @@ class Ledger:
                 "ts": entry.ts,
                 "extra": entry.extra,
             }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8", newline="\n") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
                 fh.flush()

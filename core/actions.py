@@ -73,6 +73,9 @@ class ActionScheduler:
                 return False
             action.uncertain = True
             action.status = ActionStatus.NEEDS_OPERATOR
+            # Release the device slot: a fresh turn (new generation) must be
+            # allowed to start; stale ACKs cannot settle it (generation check).
+            del self._active[device_id]
             return True
 
     def finish_failed(self, device_id: str) -> Action | None:
@@ -84,6 +87,14 @@ class ActionScheduler:
                 return None
             action.status = ActionStatus.NEEDS_OPERATOR if action.uncertain else ActionStatus.FAILED
             return self._active.pop(device_id)
+
+    def active(self, device_id: str) -> Action | None:
+        with self._lock:
+            return self._active.get(device_id)
+
+    def has_active(self, device_id: str) -> bool:
+        with self._lock:
+            return device_id in self._active
 
 
 # --- Human-like delay calculator ----------------------------------------
