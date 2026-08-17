@@ -131,9 +131,10 @@ class FakeDevice:
         })
         self.welcome = recv_frame(self.sock)
 
-    def ws_message(self, payload: bytes, direction="in", url="wss://host/room=1", text=False):
+    def ws_message(self, payload: bytes, direction="in", url="wss://host/room=1", text=False,
+                   message_id=None):
         msg = {
-            "type": "ws_message", "v": 3, "id": f"id-{time.time_ns()}",
+            "type": "ws_message", "v": 3, "id": message_id or f"id-{time.time_ns()}",
             "kind": "ws_message", "direction": direction, "text": text,
             "url": url, "ws_id": "ab12",
             "payload_b64": base64.b64encode(payload).decode(),
@@ -178,8 +179,47 @@ class TrainerEndToEndTests(unittest.TestCase):
     # ── handshake ─────────────────────────────────────────────────────
     def test_handshake_welcome_and_slot(self):
         self.assertEqual(self.device.welcome["type"], "welcome")
+        self.assertEqual(self.device.welcome["version"], 2)
         self.assertEqual(self.device.welcome["slot"], 1)
+        # The authenticated physical and logical identities must both survive
+        # the direct single-port handshake (they are not interchangeable).
+        self.assertEqual(self.device.welcome["device_id"], "emulator-1")
         self.assertEqual(self.device.welcome["table_id"], "t1")
+
+    def test_duplicate_authenticated_connection_is_rejected(self):
+        duplicate = socket.create_connection(("127.0.0.1", self.trainer.server.port), timeout=5)
+        duplicate.settimeout(5)
+        send_frame(duplicate, {
+            "type": "hello", "version": 2, "device_id": "emulator-1",
+            "table_id": "t1",
+            "proof": proof(b"test-secret", self.trainer.advertised_nonce, "t1", "trainer"),
+        })
+        reply = recv_frame(duplicate)
+        self.assertEqual(reply, {"type": "error", "error": "duplicate_connection"})
+        duplicate.close()
+
+    def test_trainer_uses_configured_fixed_tcp_port(self):
+        # Pick a currently free port, then configure Trainer with that exact
+        # value; unlike tcp_port=0 this verifies the public endpoint is fixed.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        fixed_port = probe.getsockname()[1]
+        probe.close()
+        trainer = Trainer(secret="fixed-secret", host="127.0.0.1", tcp_port=fixed_port,
+                          log_dir=Path(self.tmp) / "fixed-logs", bootstrap_port=0)
+        try:
+            trainer.start()
+            self.assertEqual(trainer.server.port, fixed_port)
+            sock = socket.create_connection(("127.0.0.1", fixed_port), timeout=5)
+            send_frame(sock, {
+                "type": "hello", "version": 2, "device_id": "fixed-device",
+                "table_id": "fixed-table",
+                "proof": proof(b"fixed-secret", trainer.advertised_nonce, "fixed-table", "trainer"),
+            })
+            self.assertEqual(recv_frame(sock)["type"], "welcome")
+            sock.close()
+        finally:
+            trainer.shutdown()
 
     def test_bad_proof_rejected(self):
         sock = socket.create_connection(("127.0.0.1", self.trainer.server.port))
@@ -192,9 +232,10 @@ class TrainerEndToEndTests(unittest.TestCase):
     # ── forward pass-through ──────────────────────────────────────────
     def test_ws_message_forwarded_by_default(self):
         payload = coin_turn_frame()
-        resp = self.device.ws_message(payload)
+        message_id = "fixed-ws-message-id"
+        resp = self.device.ws_message(payload, message_id=message_id)
         self.assertEqual(resp["action"], "forward")
-        self.assertEqual(resp["id"], resp["id"])  # id echoed
+        self.assertEqual(resp["id"], message_id)
 
     # ── cc -> schedule_send -> ack -> ledger ──────────────────────────
     def test_hint_cc_action_ack_ledger(self):

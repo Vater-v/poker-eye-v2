@@ -48,7 +48,7 @@ class Trainer:
         *,
         secret: str,
         host: str = "0.0.0.0",
-        tcp_port: int = 0,
+        tcp_port: Optional[int] = None,
         broadcast_port: int = 37020,
         slots: int = 16,
         interval: float = 1.25,
@@ -64,11 +64,21 @@ class Trainer:
         callback_start: int = 54300,
         callback_end: int = 54399,
         public_host: str = "37.192.228.101",
+        direct_public: bool = True,
     ) -> None:
         self.secret = secret.encode("utf-8")
         self.session_id = session_id
         self.chip_scale = chip_scale
         self.ack_timeout_s = ack_timeout_s
+        self.direct_public = direct_public
+        self.public_host = public_host
+        # Direct mode owns the single public endpoint.  Keep an explicit
+        # tcp_port override for tests/private deployments, but default to the
+        # documented public port rather than an ephemeral listener.
+        if self.direct_public and tcp_port is None:
+            tcp_port = bootstrap_port or 19037
+        if tcp_port is None:
+            tcp_port = 0
 
         self.logger = SessionLogger(log_dir)
         self.bootstrap = BootstrapServer(
@@ -122,15 +132,22 @@ class Trainer:
 
     # в”Ђв”Ђ lifecycle в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def start(self) -> None:
-        self.bootstrap.start()
+        # Direct mode has no discovery/bootstrap side channel: Android connects
+        # straight to this authenticated public TCP listener.
+        if not self.direct_public:
+            self.bootstrap.start()
         port = self.server.start()
-        self.broadcaster.tcp_port = port
-        threading.Thread(target=self.broadcaster.run, daemon=True).start()
+        if not self.direct_public:
+            self.broadcaster.tcp_port = port
+            threading.Thread(target=self.broadcaster.run, daemon=True).start()
         self.logger.emit("trainer.ready", flush=True, tcp_port=port,
-                         broadcast_port=self.broadcaster.broadcast_port,
+                         broadcast_port=None if self.direct_public else self.broadcaster.broadcast_port,
+                         public_host=getattr(self, "public_host", None),
                          slots=self.slot_pool.metadata()["available"])
-        print(f"[+] Trainer v2 ready  tcp={port} udp={self.broadcaster.broadcast_port} "
-              f"slots={self.slot_pool.metadata()['available']}", flush=True)
+        endpoint = f"{self.public_host}:{port}" if self.direct_public else str(port)
+        print(f"[+] Trainer v2 ready  public={endpoint} "
+              + ("(direct) " if self.direct_public else f"udp={self.broadcaster.broadcast_port} ")
+              + f"slots={self.slot_pool.metadata()['available']}", flush=True)
         print(f"[+] run={self.logger.run_id} dir={self.logger.directory}", flush=True)
         if self.eye_client:
             print(f"[+] EYE target {self.eye_host}:{self.eye_port}", flush=True)
@@ -201,13 +218,11 @@ class Trainer:
         self.table_devices[str(table_id)] = device_id
         return self._ws_handler(str(table_id), message)
 
-    def _on_device_connect(self, table_id, slot, conn, address):
-        # device_id is carried by the authenticated welcome but the legacy
-        # callback signature is table-first; use table_id as a stable fallback.
-        self.table_devices.setdefault(str(table_id), str(table_id))
-        print(f"[+] table connected {table_id} slot={slot} peer={address[0]}:{address[1]}", flush=True)
-        self.logger.emit("transport.connected", table_id=table_id, slot=slot,
-                         peer=str(address), flush=True)
+    def _on_device_connect(self, device_id, table_id, slot, conn, address):
+        self.table_devices[str(table_id)] = str(device_id)
+        print(f"[+] device connected device={device_id} table={table_id} slot={slot} peer={address[0]}:{address[1]}", flush=True)
+        self.logger.emit("transport.connected", device_id=device_id, table_id=table_id,
+                         slot=slot, peer=str(address), flush=True)
 
     def _on_transport_event(self, event, **fields):
         sev = fields.pop("severity", "INFO")

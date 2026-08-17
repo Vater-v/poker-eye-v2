@@ -21,6 +21,8 @@ successful authenticated handshake and is released when the connection closes.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import socket
 import threading
@@ -40,6 +42,10 @@ class TrainerServer:
         self._server: Optional[socket.socket] = None
         self._stop = threading.Event()
         self._active: set = set()
+        # A table identity is globally unique while connected.  Keep the
+        # physical device identity in the key as well so routing never has to
+        # infer one from the other.
+        self._active_tables: Dict[str, str] = {}
         self._lock = threading.Lock()
         self._threads: list = []
         self._seq = 0
@@ -84,15 +90,34 @@ class TrainerServer:
         try:
             conn.settimeout(10)
             try:
-                device_id, table_id = verify_hello(recv_frame(conn), self.secret, self.advertised_nonce, self.session_id)
+                hello = recv_frame(conn)
+                if hello.get("type") == "direct_hello":
+                    device_id = hello.get("device_id")
+                    table_id = hello.get("table_id")
+                    supplied = hello.get("proof")
+                    material = f"{device_id}|{table_id}|{self.session_id}|{PROTOCOL_VERSION}".encode()
+                    expected = hmac.new(self.secret, material, hashlib.sha256).hexdigest()
+                    if (not isinstance(device_id, str) or not device_id or
+                            not isinstance(table_id, str) or not table_id or
+                            not isinstance(supplied, str) or not hmac.compare_digest(supplied, expected)):
+                        raise ValueError("authentication failed")
+                else:
+                    device_id, table_id = verify_hello(hello, self.secret, self.advertised_nonce, self.session_id)
             except ValueError as exc:
                 send_frame(conn, {"type": "error", "error": type(exc).__name__})
                 self._emit("hello.rejected", peer=str(address), error=type(exc).__name__)
                 return
             connection_key = (device_id, table_id)
             with self._lock:
-                if connection_key in self._active:
+                # Reject both an exact reconnect and a second physical device
+                # claiming an already-connected table.  The latter prevents
+                # cross-device table state from being silently overwritten.
+                if connection_key in self._active or (
+                    table_id in self._active_tables and self._active_tables[table_id] != device_id
+                ):
                     send_frame(conn, {"type": "error", "error": "duplicate_connection"})
+                    self._emit("hello.rejected", device_id=device_id, table_id=table_id,
+                               peer=str(address), error="duplicate_connection")
                     return
                 # Reservation is after successful authenticated handshake only.
                 slot = self.slot_pool.reserve(connection_key) if self.slot_pool else None
@@ -100,13 +125,14 @@ class TrainerServer:
                     send_frame(conn, {"type": "error", "error": "no_free_slots"})
                     return
                 self._active.add(connection_key)
+                self._active_tables[table_id] = device_id
             self._emit("hello.authenticated", device_id=device_id, table_id=table_id, peer=str(address))
             self._emit("slot.reserved", device_id=device_id, table_id=table_id, slot=slot)
             send_frame(conn, {"type": "welcome", "version": PROTOCOL_VERSION,
                               "device_id": device_id, "table_id": table_id, "slot": slot})
             if self.on_connect:
                 try:
-                    self.on_connect(table_id, slot, conn, address)
+                    self.on_connect(device_id, table_id, slot, conn, address)
                 except Exception:
                     pass
             conn.settimeout(5)
@@ -139,6 +165,8 @@ class TrainerServer:
                 key = (device_id, table_id)
                 with self._lock:
                     self._active.discard(key)
+                    if self._active_tables.get(table_id) == device_id:
+                        self._active_tables.pop(table_id, None)
                 if self.slot_pool:
                     self.slot_pool.release(key)
                 self._emit("slot.released", device_id=device_id, table_id=table_id)

@@ -42,7 +42,7 @@ def main():
     p = argparse.ArgumentParser(description="poker-eye-v2 minimal trainer")
     p.add_argument("--secret", required=True, help="shared HMAC secret (POKEREYE_V2_SECRET)")
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--tcp-port", type=int, default=0, help="0 = OS-assigned")
+    p.add_argument("--tcp-port", type=int, default=None, help="0 = OS-assigned")
     p.add_argument("--broadcast-port", type=int, default=37020)
     p.add_argument("--slots", type=int, default=16)
     p.add_argument("--interval", type=float, default=1.25)
