@@ -1,13 +1,10 @@
 .dist/
 coin/
-_bridge_src/
-apktool.jar
-build_apk.ps1
-patch_coin_update_check.ps1
-inject_classes_dex.py
 *.apk
+*.apks
 *.aab
 *.keystore
+*.jks
 secrets/
 config.local.toml
 *.token
@@ -16,6 +13,13 @@ captures/
 logs/
 *.pcap
 *.pcapng
+# Local APK/decompiled/build workspace stays outside Git; only .dist is ignored output.
+coin/
+_bridge_src/
+apktool.jar
+build_apk.ps1
+patch_coin_update_check.ps1
+inject_classes_dex.py
 __pycache__/
 .pytest_cache/
 .venv/

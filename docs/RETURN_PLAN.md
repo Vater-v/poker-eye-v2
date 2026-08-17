@@ -2,26 +2,103 @@
 
 ## Current verdict
 
-The `call=0` incident is not closed as harmless CHECK. The available capture proves a repeated inconsistency (`call=0` -> backend CHECK 0 -> Coin CALL 0), but does not prove whether a raise was lost. Do not change action policy blindly before a clean reference is correlated.
+The `call=0` incident is **not closed as a harmless CHECK**. The available capture proves a repeated inconsistency (`call=0` -> backend CHECK 0 -> Coin CALL 0), but does not prove whether a raise was lost. Do not change action policy blindly before a clean reference is correlated.
 
 The double-board hand is not a clean reproduction because `GAME_IS_BROKEN` preceded it. A clean PPP reference is required.
 
 ## What to provide
 
-Provide a short clean PCAP for a normal single-board hand containing a raise before the hero decision, and/or a clean PPP double-board PCAP. Note approximate time, emulator, profile/stakes, PPP vs Coin/EYE, expected result, and whether it is raw device or host/EYE traffic. No credentials or unrelated captures are needed.
+Please provide one or more of:
 
-## Test progression
+1. A short clean PCAP for a normal single-board hand containing a raise before the hero decision.
+2. A short clean PPP double-board PCAP containing board transitions and showdown.
+3. The matching trainer/session logs if they were captured in the same interval.
 
-1. Start v2 from local disk; confirm READY and run manifest/operator log.
-2. One emulator/one table; save the run directory.
-3. Reproduce a known raise and correlate frame metadata/hash, decoded CallNeedChips/min/max/can, state before/after, hint, action and ACK.
-4. Use a clean double-board hand from RoundStartBRC through RoundOverBRC, with board source/index and WinnerRSP correlation.
-5. Progress: 1 device/1 table -> 1/2 -> 1/4 -> 1/5 -> 2/2 each -> 2/4–5 each. Check no duplicate action IDs, stale ACK mutations or global blocking.
+For each capture, note:
+
+- approximate local start/end time;
+- emulator name;
+- game/profile and stakes;
+- whether it is PPP or Coin/EYE;
+- expected result at the suspect decision;
+- whether the capture is raw device traffic or host/EYE traffic.
+
+No credentials or unrelated full-disk captures are needed.
+
+## Recommended test procedure
+
+### A. Baseline transport
+
+1. Start v2 trainer from a local disk path.
+2. Confirm one `READY` line.
+3. Confirm `logs/run_<run_id>/manifest.json` and `operator.txt` exist.
+4. Open one emulator and one table.
+5. Save the complete run directory after disconnect.
+
+### B. Suspect raise case
+
+1. Use one table only.
+2. Enable a short forensic window for that table if available.
+3. Trigger a known raise before the hero decision.
+4. Verify the log contains, in order:
+   - raw frame metadata/hash;
+   - decoded `CallNeedChips`, min/max/can;
+   - state before/after contribution/current max/last full raise;
+   - backend hint and selected action;
+   - Coin action and ACK.
+5. If `call_need=0` while CHECK is legal, the runtime must emit `state.gap` rather than silently sending `CALL amount=0`.
+
+### C. Double-board case
+
+1. Use a clean game with no prior `GAME_IS_BROKEN`.
+2. Capture the entire hand from `RoundStartBRC` through `RoundOverBRC`.
+3. Confirm both boards have explicit source/index and cards.
+4. Confirm `WinnerRSP` is correlated with the correct board/hand generation.
+
+### D. Multi-table progression
+
+Do not jump directly to 4–5 tables. Use:
+
+```text
+1 emulator / 1 table
+1 emulator / 2 tables
+1 emulator / 4 tables
+1 emulator / 5 tables
+2 emulators / 2 tables each
+2 emulators / 4–5 tables each
+```
+
+At every stage verify no duplicate action IDs, no stale ACK affects a new table generation, and one slow table does not block all other tables.
 
 ## PCAP policy
 
-Always-on per-table PCAP is acceptable only as a bounded filtered ring: `tcp port 17770` (or exact verified port), 4 x 64 MiB segments/table, 256 MiB/table cap, 3 completed captures retained. JSONL metadata remains primary. Do not use unrestricted `tcpdump -i any -s 0 -w`.
+Always-on per-table PCAP is acceptable only as a bounded filtered ring:
+
+```text
+filter: tcp port 17770 (or the exact verified game port)
+segment: 64 MiB
+ring: 4 segments/table by default
+cap: 256 MiB/table
+completed retention: 3 captures/account/session
+```
+
+Do not use unrestricted `tcpdump -i any -s 0 -w ...` without a BPF filter. Keep JSONL metadata as the primary searchable evidence. Escalate to full PCAP only for a bounded reproduction window.
 
 ## Implementation order
 
-Keep root `main.py` and small `core/` modules. Wire session logging, add pure state/hint/action modules, port tested EYE framing helpers, add Android discovery in an isolated APK workspace, then run one-table LAN canary and multi-table soak. Legacy baseline stays untouched. Do not add GUI/web/admin/Telegram or commit raw captures/decompiled APK/.dist/secrets.
+1. Keep root `main.py`; keep small modules under `core/`.
+2. Finish session logging wiring for broadcast/TCP/slot/heartbeat/frame metadata.
+3. Add pure state/hint/action modules; do not copy `LiveCoinBridge` wholesale.
+4. Port only tested EYE envelope/framing helpers.
+5. Add Android discovery client in an isolated APK workspace.
+6. Run one-table LAN canary.
+7. Run 1→2→4→5 table soak, then multiple emulators.
+8. Only after evidence, enable production action path.
+
+## Do not do
+
+- Do not delete or modify the legacy baseline.
+- Do not commit PCAP, decompiled APK, `.dist`, secrets, or generated bytecode.
+- Do not add another admin/web/GUI layer.
+- Do not permanently add full raw payload dumps to normal logs.
+- Do not claim a 97%+ uptime target from unit tests; measure it with repeated soak/fault runs.

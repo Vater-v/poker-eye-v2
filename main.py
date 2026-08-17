@@ -9,7 +9,8 @@ def run(args):
     broadcaster = Broadcaster(args.host, 0, args.secret.encode(), args.slots, args.interval, args.broadcast_port, args.session_id)
     broadcaster.advertised_nonce = secrets.token_hex(16)
     server = TrainerServer(broadcaster.secret, broadcaster.session_id, broadcaster.advertised_nonce, broadcaster.slot_pool, args.host, args.port,
-                           on_connect=lambda table, _slot, _conn, address: logger.emit("transport.connected", message=f"[+] Новое подключение от {table}!", table_id=table, peer=str(address), flush=True))
+                           on_connect=lambda table, _slot, _conn, address: logger.emit(
+                               "transport.connected", message=f"[+] Новое подключение от {table}!", table_id=table, peer=str(address), flush=True))
     server.start(); broadcaster.tcp_port = server.port
     threading.Thread(target=broadcaster.run, daemon=True).start()
     logger.emit("trainer.ready", message="[+] Trainer корректно запущен, ожидаю подключений.", flush=True, tcp_port=server.port, broadcast_port=args.broadcast_port, slots=args.slots)
@@ -17,7 +18,8 @@ def run(args):
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt: pass
-    finally: broadcaster.stop(); server.stop(); logger.close()
+    finally:
+        broadcaster.stop(); server.stop(); logger.close()
 
 def main():
     p = argparse.ArgumentParser(description="minimal trainer discovery/TCP prototype")

@@ -8,14 +8,18 @@ The v2 core must be understandable, observable, restartable, and safe. It must n
 
 ## Operator experience
 
-One entry point: `RUN.cmd`.
+One entry point:
 
-The console is the source of truth and prints short, rate-limited, human-readable lifecycle lines such as:
+```cmd
+RUN.cmd
+```
+
+The console is the source of truth. It prints short, rate-limited, human-readable lifecycle lines:
 
 ```text
 [+] Trainer корректно запущен, ожидаю подключений.
 [+] Новое подключение #1 от Player 4!
-[+] Player 4 подключен: transport=lan-tcp
+[+] Player 4 подключен: transport=tcp-authenticated
 [+] Player 4 зашел за новый стол #1
 - Ход Player 4 за столом #1! Запрашиваем подсказку...
 - Пришла подсказка для Player 4, стол #1: (CALL, 0.02)
@@ -24,50 +28,84 @@ The console is the source of truth and prints short, rate-limited, human-readabl
 [+] Повтор успешен: Player 4 / стол #1: (CALL, 0.02)
 ```
 
-Every line has a structured event behind it. Raw packets and full traffic dumps never go to normal logs.
+Every line has a structured event behind it (JSONL file), but stdout stays compact. Secrets, raw packets, and full traffic dumps never go to normal logs.
 
-## Scale and action policy
-
-Target scale is multiple emulators with 4–5+ tables per device. Capacity is bounded by measured resources.
-
-- Human-readable table numbers are allocated per device and reused after a table closes.
-- One in-flight CC per device across active tables; actions are separated by a sampled human-like delay range.
-- Actions involving 60 BB or more may add a configured probability of extra delay, bounded by the server/action deadline.
-- Every EYE CC has exactly three explicit attempts: first after calculated delay, second after 1 second, third after another 1 second. No unbounded retry loop.
-- On uncertain timeout, reconcile before resending; never blindly duplicate an uncertain action.
-
-## Lifecycle
+## Explicit lifecycle
 
 ```text
-STARTING -> READY -> DISCOVERED -> AUTHENTICATED -> HOOK_READY -> TABLE_ACTIVE
--> HINT_PENDING -> ACTION_SENT -> ACTION_ACKED -> DEGRADED -> STOPPING -> STOPPED
+STARTING
+  -> READY (listener/runtime alive)
+  -> CONNECTED (emulator transport authenticated)
+  -> HOOK_READY (hook handshake and heartbeat)
+  -> TABLE_ACTIVE (table identified)
+  -> HINT_PENDING
+  -> ACTION_SENT
+  -> ACTION_ACKED
+  -> DEGRADED (bounded recovery)
+  -> STOPPING
+  -> STOPPED
 ```
 
-No pending state may remain indefinitely: it ends in success, bounded retry, or explicit failure.
+No `RUN_REQUESTED` state may remain indefinitely. Every pending state has a deadline and ends as success, retry, or explicit failure.
 
-## Minimal core
+## Minimal modules
 
-`RUN.cmd`, `main.py`, `transport.py`, `protocol.py`, `sessions.py`, `hints.py`, `actions.py`, `ledger.py`, `logging.py`.
+```text
+poker-eye-v2/
+  RUN.cmd                 # only operator entry point
+  trainer.py              # bounded main loop and signal handling
+  config.toml             # explicit safe defaults
+  transport.py            # authenticated TCP after UDP IPv4 broadcast discovery
+  protocol.py             # framed hook/EYE messages and sequence IDs
+  sessions.py             # emulator/table identity and generations
+  hints.py                # hint request, validation, deduplication
+  actions.py              # CC send, ACK, timeout, retry policy
+  ledger.py               # append-only local JSONL/SQLite accounting
+  logging.py              # compact stdout + structured JSONL
+  tests/
+  docs/
+```
 
-No GUI, web admin, browser panel, Telegram or Sheets dependency belongs in the core.
+No GUI, HTTP server, browser admin, Sheets client, or Telegram dependency belongs in the core. External notification/export can be a separate optional process later.
 
-## Broadcast/TCP transport
+## Reliability contract
 
-UDP IPv4 broadcast is discovery only. Every 0.5 seconds during bootstrap, the trainer advertises a short-lived slot and metadata. After discovery, the emulator initiates authenticated TCP in the LAN. One TCP connection is created per new table; a slot is reserved immediately and another slot is advertised. Slots are bounded (default 1–3) and released on clean close or heartbeat timeout.
+- Target scale: multiple emulators with 4–5+ tables per device; capacity is bounded by measured resources, not an arbitrary single-table default.
+- Every connection/table/action has a stable ID and generation; stdout uses a recyclable human table number (`стол #1`, `стол #2`) allocated per device and reused after close.
+- One in-flight CC per device across all active tables; actions are separated by a sampled human-like delay range.
+- Human-like timing: actions involving elements of 60 BB or more may add a configured probability of an extra delay; all delays remain bounded by the server/action deadline.
+- When EYE returns a CC, make exactly three explicit attempts: attempt 1 after the calculated delay, attempt 2 after 1 second, attempt 3 after another 1 second. Never create an unbounded retry loop. If the result is uncertain, reconcile before resending.
+- Retry only idempotent/replay-safe commands; never blindly duplicate an uncertain action.
+- On uncertain timeout: reconcile state first, then retry or mark `NEEDS_OPERATOR`.
+- Per-stage deadlines: connect, handshake, hook heartbeat, hint, action ACK, table teardown.
+- Exponential backoff with cap and jitter; no infinite hot loop.
+- TCP/emulator transport loss is a transport event, not a generic backend error; ADB is never a runtime transport.
+- Recovery sequence: mark degraded → stop affected worker → remove mapping → wait for same serial → reinstall mapping → handshake → resume only after fresh state.
+- Crash-safe local ledger and startup reconciliation.
+- One broken emulator/table cannot stop others.
+- Normal logs are bounded and never contain raw payload dumps.
 
-Long-term, prefer one authenticated multiplexed TCP connection per device with logical table channels; retain one-connection-per-table during the first prototype because it matches the requested observable behavior. Do not use unbounded port+1 as an application contract.
+## Runtime transport contract
 
-Discovery packet contains version, trainer instance, LAN endpoint, nonce/TTL and capabilities only. Commands and hook payloads stay on authenticated TCP. Use per-device credentials, replay protection, sequence/correlation IDs, frame limits and heartbeats.
+The only v2 runtime transport is UDP IPv4 broadcast discovery (default interval 1.25 seconds) followed by authenticated TCP LAN. Broadcast advertises trainer endpoint, session nonce, protocol version, and free slots; it never reserves slots and connected clients ignore repeated advertisements. ADB is lab control/observation only, never a runtime fallback. The first implementation uses one TCP connection per table; a later milestone may add logical table channels over one TCP connection per device.
 
-Migration phases: trainer prototype -> authenticated client in APK -> one-table canary -> 4–5 tables/device -> multiplexing. No ADB fallback is planned for v2; `ready_v6` remains the separate fallback baseline until acceptance is proven.
+Do not implement unbounded port+1 as the long-term contract. If a temporary port is needed, allocate from a bounded OS-selected range and persist device-to-channel identity separately.
 
 ## Acceptance gates
 
-1. 10/10 starts from local disk print READY.
-2. One emulator discovers, authenticates and produces hook traffic.
-3. One table is identified and a hint/CC is acknowledged and journaled.
-4. Three-attempt retry never duplicates an uncertain action.
-5. ADB is not required for v2 transport.
-6. Loss/reconnect recovers with fresh handshake and no stale ACK mutation.
-7. 4–5+ tables per device pass soak and readable-log tests.
-8. Baseline remains runnable unchanged until all gates pass.
+A v2 build is not called ready until:
+
+1. 10/10 starts from local disk succeed and print READY within the budget.
+2. One emulator connects, handshakes, and produces hook traffic.
+3. One table is discovered and identified.
+4. A hint is received, validated, sent, acknowledged, and journaled.
+5. A timeout/reconnect does not duplicate an action.
+6. Stop produces a final ledger event exactly once.
+7. Authenticated TCP loss/reconnect recovers without duplicating an action; ADB remains lab-only.
+8. Logs remain readable under multi-table traffic.
+9. The current baseline remains runnable unchanged until v2 passes the same evidence gates.
+
+## Non-goals for v2 core
+
+- Web UI, GUI trainer, browser control, Telegram, Google Sheets, raw PCAP/log streaming, and speculative gRPC are not core requirements.
+- They may consume the structured event journal in separate adapters after the core is stable.
