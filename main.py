@@ -29,6 +29,10 @@ def run(args):
         eye_port=args.eye_port,
         game_port=args.game_port,
         chip_scale=args.chip_scale,
+        bootstrap_port=args.bootstrap_port,
+        callback_start=args.callback_start,
+        callback_end=args.callback_end,
+        public_host=args.public_host,
     )
     trainer.start()
     trainer.run_forever()
@@ -48,6 +52,10 @@ def main():
     p.add_argument("--eye-port", type=int, default=None, help="PokerEYE app/backend port")
     p.add_argument("--game-port", type=int, default=17770, help="verified game port for the PCAP BPF")
     p.add_argument("--chip-scale", type=int, default=100)
+    p.add_argument("--bootstrap-port", type=int, default=19037)
+    p.add_argument("--callback-start", type=int, default=54300)
+    p.add_argument("--callback-end", type=int, default=54399)
+    p.add_argument("--public-host", default="37.192.228.101")
     run(p.parse_args())
 
 

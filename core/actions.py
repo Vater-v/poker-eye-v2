@@ -27,6 +27,7 @@ class Action:
     attempt: int = 0
     status: ActionStatus = ActionStatus.PENDING
     uncertain: bool = False
+    turn_id: str | None = None
 
 
 class ActionScheduler:

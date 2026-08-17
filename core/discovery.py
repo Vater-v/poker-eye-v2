@@ -35,15 +35,20 @@ class SlotPool:
 
     def metadata(self):
         with self._lock:
-            return {"slots": self._total, "available": self._total - len(self._claims), "claims": dict(self._claims)}
+            claims = {}
+            for key, value in self._claims.items():
+                label = f"{key[0]}:{key[1]}" if isinstance(key, tuple) else str(key)
+                claims[label] = value
+            return {"slots": self._total, "available": self._total - len(self._claims), "claims": claims}
 
 
 class Broadcaster:
     def __init__(self, host, tcp_port, secret, slots=1, interval=DEFAULT_INTERVAL,
-                 broadcast_port=37020, session_id="session"):
+                 broadcast_port=37020, session_id="session", slot_pool=None):
         self.host, self.tcp_port, self.secret = host, tcp_port, secret
         self.interval, self.broadcast_port, self.session_id = interval, broadcast_port, session_id
-        self.slot_pool = SlotPool(slots)
+        # Share the transport allocator so advertisements reflect reservations.
+        self.slot_pool = slot_pool or SlotPool(slots)
         self.advertised_nonce = None
         self._stop = threading.Event()
 

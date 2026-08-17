@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .actions import Action, ActionScheduler, ActionStatus, HumanDelay
+from .bootstrap import BootstrapServer
 from .coin_wire import (
     ACTION_CHECK, ACTION_CALL, ACTION_FOLD, ACTION_RAISE,
     build_game_user_action_packet, decode_packet,
@@ -59,6 +60,10 @@ class Trainer:
         game_port: int = 17770,
         chip_scale: int = 100,
         ack_timeout_s: float = 2.5,
+        bootstrap_port: int = 19037,
+        callback_start: int = 54300,
+        callback_end: int = 54399,
+        public_host: str = "37.192.228.101",
     ) -> None:
         self.secret = secret.encode("utf-8")
         self.session_id = session_id
@@ -66,10 +71,16 @@ class Trainer:
         self.ack_timeout_s = ack_timeout_s
 
         self.logger = SessionLogger(log_dir)
+        self.bootstrap = BootstrapServer(
+            self.secret, host=host, bootstrap_port=bootstrap_port,
+            callback_start=callback_start, callback_end=callback_end,
+            advertised_host=public_host, on_event=self._on_bootstrap_event,
+            callback_handler=self._on_callback_message)
+
         self.slot_pool = SlotPool(slots)
 
         self.broadcaster = Broadcaster(host, 0, self.secret, slots, interval,
-                                       broadcast_port, session_id)
+                                       broadcast_port, session_id, slot_pool=self.slot_pool)
         self.broadcaster.advertised_nonce = secrets.token_hex(16)
         self.advertised_nonce = self.broadcaster.advertised_nonce
 
@@ -108,6 +119,7 @@ class Trainer:
 
     # в”Ђв”Ђ lifecycle в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def start(self) -> None:
+        self.bootstrap.start()
         port = self.server.start()
         self.broadcaster.tcp_port = port
         threading.Thread(target=self.broadcaster.run, daemon=True).start()
@@ -133,12 +145,21 @@ class Trainer:
         self._stop.set()
         self.broadcaster.stop()
         self.server.stop()
+        self.bootstrap.stop()
         if self.eye_client:
             self.eye_client.stop()
         self.pcap.close_all()
         self.logger.close()
 
     # в”Ђв”Ђ transport callbacks в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    def _on_bootstrap_event(self, event, **fields):
+        self.logger.emit(f"bootstrap.{event}", **fields)
+        if event in {"bootstrap.registered", "callback.connected", "callback.disconnected"}:
+            print(f"[*] {event} {fields}", flush=True)
+
+    def _on_callback_message(self, lease, message):
+        return self._ws_handler(lease.device_id, message)
+
     def _on_device_connect(self, table_id, slot, conn, address):
         # device_id is carried by the authenticated welcome but the legacy
         # callback signature is table-first; use table_id as a stable fallback.
@@ -190,7 +211,7 @@ class Trainer:
             self._observe_frame(table_id, state, decoded, direction, url)
 
         # PULL: answer a due pending action with schedule_send.
-        due = self._take_due_action(table_id)
+        due = self._take_due_action(table_id, binary_payload=(raw is not None and decoded is not None))
         if due is not None and raw is not None:
             action = due
             room = self._room_from_url(url)
@@ -277,7 +298,11 @@ class Trainer:
             self.pending[table_id] = action
             self.pending_due[table_id] = time.monotonic() + delay_ms / 1000.0
 
-    def _take_due_action(self, table_id: str) -> Optional[Action]:
+    def _take_due_action(self, table_id: str, *, binary_payload: bool) -> Optional[Action]:
+        # Do not consume an attempt on text, empty, malformed, or undecodable
+        # hook frames. The next valid Coin binary frame must get the attempt.
+        if not binary_payload:
+            return None
         with self._pending_lock:
             action = self.pending.get(table_id)
             due = self.pending_due.get(table_id, 0.0)

