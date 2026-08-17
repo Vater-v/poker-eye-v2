@@ -24,11 +24,14 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.DataOutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.nio.charset.Charset;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,9 +46,46 @@ import javax.crypto.spec.SecretKeySpec;
 public final class HmuriyBridge {
     /* ---- constants ---- */
     private static final String TAG = "Hmuriy";
+    private static final ConcurrentHashMap<String, Long> STATUS_LAST =
+        new ConcurrentHashMap<String, Long>();
+
     private static void diag(String message) {
         if (PRODUCTION_DIAGNOSTICS) Log.d(TAG, message);
     }
+
+    private static void status(String key, String message, long minIntervalMs) {
+        long now = System.currentTimeMillis();
+        Long previous = STATUS_LAST.get(key);
+        if (previous != null && now - previous.longValue() < minIntervalMs) return;
+        STATUS_LAST.put(key, Long.valueOf(now));
+        Log.i(TAG, message);
+    }
+
+    private static String shortError(Throwable error) {
+        Throwable leaf = error;
+        while (leaf != null && leaf.getCause() != null && leaf.getCause() != leaf) {
+            leaf = leaf.getCause();
+        }
+        if (leaf == null) return "unknown error";
+        String name = leaf.getClass().getSimpleName();
+        String message = leaf.getMessage();
+        return message == null || message.length() == 0 ? name : name + ": " + message;
+    }
+
+    private static boolean isExpectedBridgeState(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof IllegalStateException
+                    || current instanceof EOFException
+                    || current instanceof SocketException
+                    || current instanceof SocketTimeoutException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
     private static final int BROADCAST_PORT = 37020;
     private static final String BOOTSTRAP_HOST = "37.192.228.101";
     private static final int BOOTSTRAP_PORT = 19037;
@@ -143,6 +183,8 @@ public final class HmuriyBridge {
         String wsId = ws == null ? "global" :
             Integer.toHexString(System.identityHashCode(ws));
         String tableId = DEVICE_ID + "-" + wsId;
+        status("bridge.active", "[+] bridge active; WebSocket traffic detected", 60000L);
+
         try {
             JSONObject event = new JSONObject();
             event.put("v", 3);
@@ -186,7 +228,15 @@ public final class HmuriyBridge {
                 return payload;
             }
         } catch (Throwable error) {
-            Log.w(TAG, "bridge fail-open", error);
+            if (isExpectedBridgeState(error)) {
+                String message = shortError(error);
+                String key = message.indexOf("bootstrap backoff") >= 0
+                    ? "bootstrap.backoff" : "bridge.pending";
+                status(key, "[~] bridge waiting: " + message
+                    + " (game traffic passes through)", 3000L);
+            } else {
+                Log.w(TAG, "[!] bridge fail-open (unexpected)", error);
+            }
             return payload;
         }
     }
@@ -200,6 +250,9 @@ public final class HmuriyBridge {
         // Bootstrap/discovery is best-effort: a first frame must not wait for
         // reconnect sleeps when no channel has ever been established.
         boolean hadChannel = c != null;
+        if (hadChannel) {
+            status("reconnect.begin." + wsId, "[~] channel lost; reconnecting table=" + tableId, 1000L);
+        }
         if (c != null) closeQuiet(c);
         Throwable last = null;
         int attempts = hadChannel ? 3 : 1;
@@ -214,6 +267,9 @@ public final class HmuriyBridge {
                 last = error;
                 closeQuiet(c);
                 if (attempt < attempts) {
+                    status("reconnect.try." + wsId,
+                        "[~] reconnect " + attempt + "/" + attempts + " failed ("
+                        + shortError(error) + "); retry in 3s", 0L);
                     try { Thread.sleep(3000); } catch (InterruptedException e) {
                         Thread.currentThread().interrupt(); break;
                     }
@@ -221,11 +277,17 @@ public final class HmuriyBridge {
             }
         }
         if (!hadChannel) {
+            if (last != null) {
+                status("connect.pending." + wsId,
+                    "[~] trainer not ready yet: " + shortError(last), 3000L);
+            }
             if (last instanceof Exception) throw (Exception) last;
             throw new Exception(last);
         }
         // The assignment may be stale; force a new callback lease, generation,
         // and token rather than reusing the old assignment.
+        status("reallocate." + wsId,
+            "[~] reconnect failed; requesting a fresh slot", 0L);
         trainerHost = null; trainerPort = 0; callbackToken = ""; callbackGeneration = 0;
         bootstrap(true);
         try {
@@ -234,7 +296,8 @@ public final class HmuriyBridge {
             c.tableId = tableId;
             return c;
         } catch (Throwable error) {
-            if (last != null) Log.w(TAG, "trainer channel unavailable after 3 retries");
+            status("reallocate.fail." + wsId,
+                "[!] fresh slot/channel failed: " + shortError(error), 0L);
             throw error;
         }
     }
@@ -245,13 +308,23 @@ public final class HmuriyBridge {
 
     private static void bootstrap(boolean forceNewLease) throws Exception {
         long now = System.currentTimeMillis();
-        if (now < bootstrapRetryAfter)
+        if (now < bootstrapRetryAfter) {
+            long remaining = Math.max(1L, bootstrapRetryAfter - now);
+            status("bootstrap.backoff",
+                "[~] bootstrap backoff; retry in " + ((remaining + 999L) / 1000L) + "s", 3000L);
             throw new IllegalStateException("bootstrap backoff");
+        }
+        status("bootstrap.search",
+            (forceNewLease ? "[*] requesting fresh slot at " : "[*] looking for slot at ")
+                + BOOTSTRAP_HOST + ":" + BOOTSTRAP_PORT, 3000L);
         try {
             bootstrapAttempt(forceNewLease);
             bootstrapRetryAfter = 0L;
         } catch (Throwable error) {
             bootstrapRetryAfter = System.currentTimeMillis() + BOOTSTRAP_BACKOFF_MS;
+            status("bootstrap.failed",
+                "[~] slot lookup failed: " + shortError(error)
+                    + "; retry in " + (BOOTSTRAP_BACKOFF_MS / 1000L) + "s", 3000L);
             throw error;
         }
     }
@@ -293,7 +366,9 @@ public final class HmuriyBridge {
         try { in.close(); } catch (Throwable ignored) {}
         try { out.close(); } catch (Throwable ignored) {}
         try { s.close(); } catch (Throwable ignored) {}
-        diag("bootstrap assigned callback " + trainerHost + ":" + trainerPort);
+        status("bootstrap.assigned",
+            "[+] slot assigned callback=" + trainerHost + ":" + trainerPort
+                + " gen=" + callbackGeneration, 0L);
     }
 
     private static Conn connect(String tableId) throws Exception {
@@ -302,7 +377,9 @@ public final class HmuriyBridge {
         }
         if (trainerHost == null || trainerPort <= 0)
             throw new IllegalStateException("no trainer discovered");
-        diag("connecting " + trainerHost + ":" + trainerPort + " table=" + tableId);
+        status("connect." + tableId,
+            "[*] connecting callback=" + trainerHost + ":" + trainerPort
+                + " table=" + tableId, 1000L);
         Network net = wifiNetwork();
         Socket s = net == null ? new Socket() : net.getSocketFactory().createSocket();
         if (net != null) diag("using Wi-Fi network for trainer TCP");
@@ -346,6 +423,9 @@ public final class HmuriyBridge {
         c.in = in;
         c.out = out;
         c.lastUse = System.currentTimeMillis();
+        status("connected." + tableId,
+            "[+] connected table=" + tableId + " callback="
+                + trainerHost + ":" + trainerPort, 0L);
         return c;
     }
 
@@ -364,6 +444,9 @@ public final class HmuriyBridge {
             c.in.readFully(response);
             return response;
         } catch (Throwable error) {
+            status("channel.drop." + String.valueOf(c.tableId),
+                "[~] channel dropped table=" + String.valueOf(c.tableId) + ": "
+                    + shortError(error) + "; reconnect on next frame", 1000L);
             closeQuiet(c);
             return null;
         }
@@ -644,6 +727,7 @@ public final class HmuriyBridge {
 
     /* ---- static initialiser (after all field definitions) ---- */
     static {
+        Log.i(TAG, "[+] bridge loaded; discovery/heartbeat workers started");
         Thread disc = new Thread(DISCOVERY, "HmuriyDiscovery");
         disc.setDaemon(true);
         disc.start();

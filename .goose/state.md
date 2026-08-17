@@ -1,4 +1,4 @@
-# State
+﻿# State
 
 ## Reliability hardening subagent (2026-08-17)
 - Updated only `core/trainer.py` and `core/actions.py`.
@@ -20,3 +20,12 @@
 - Updated only `android/HmuriyBridge.java`. First-channel bootstrap/discovery is fail-open with one attempt, 1s bootstrap/connect timeouts, and 15s bootstrap retry backoff; established channels retain 3x/3s reconnect behavior.
 - Production diagnostics are controlled by `PRODUCTION_DIAGNOSTICS`, default false; existing diagnostic hooks remain available.
 - Verification: `javac -source 8 -target 8 -cp C:\Android\platforms\android-35\android.jar` passed (4 standard warnings). d8/APK build not run.
+
+## Cleanup/build/install (2026-08-18)
+- Cleaned generated artifacts: removed `.v2-repair-backup-20260818-010414`, root `logs`, Python `__pycache__`, disposable `.dist\\v2workspace` before rebuild, `.dist\\phone_logs`, and phone acceptance output files. Preserved `.dist\\baseline`, `.dist\\tooling`, and `.dist\\latest`.
+- Built isolated APK from `.dist\\baseline\\coin` using `android\\build_v2.ps1`; apktool, d8, zipalign, apksigner verification passed (v2/v3).
+- Latest APK: `.dist\\latest\\poker-eye-v2-latest.apk`; SHA-256: E3AC2650B40E0F74B1910B43C4C53E24685E83E97EFDB3A099E874DBBECD8DD7
+; versionName 1.27.0, versionCode 2.
+- Installed successfully via ADB on device `8a0d2d77` and launched `com.coingames.coinpoker/.MainActivity`; no crash was observed in the checked logcat window.
+- Activity launch returned “current task brought to front”; Android focus later moved to another app, so Coin process/activity launch is verified but foreground persistence is not.
+

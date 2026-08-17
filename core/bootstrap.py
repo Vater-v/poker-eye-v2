@@ -150,6 +150,9 @@ class BootstrapServer:
             if not hmac.compare_digest(supplied, expected):
                 raise ValueError("bootstrap authentication failed")
             force_new = bool(msg.get("reallocate", False))
+            self._emit("bootstrap.requested", device_id=device_id, local_ipv4=local_ipv4,
+                       reallocate=force_new, peer=str(addr))
+
             if force_new:
                 self._invalidate_callback(device_id)
             lease = self.allocator.allocate(device_id, local_ipv4, force_new=force_new)
@@ -255,8 +258,9 @@ class BootstrapServer:
             send_frame(conn, {"type": "callback_welcome", "version": PROTOCOL_VERSION,
                               "device_id": lease.device_id, "table_id": table_id,
                               "generation": lease.generation})
-            self._emit("callback.connected", device_id=lease.device_id,
-                       callback_port=lease.callback_port, generation=lease.generation, peer=str(addr))
+            self._emit("callback.connected", device_id=lease.device_id, table_id=table_id,
+                       callback_port=lease.callback_port, generation=lease.generation,
+                       peer=str(addr))
             while not self._stop.is_set():
                 msg = recv_frame(conn)
                 if msg.get("type") == "heartbeat":
@@ -286,8 +290,9 @@ class BootstrapServer:
                 if connections is not None:
                     connections.discard(conn)
             if authenticated:
-                self._emit("callback.disconnected", device_id=lease.device_id,
-                           callback_port=lease.callback_port, generation=lease.generation)
+                self._emit("callback.disconnected", device_id=lease.device_id, table_id=table_id,
+                           callback_port=lease.callback_port,
+                           generation=lease.generation)
                 self._close_callback_lease(lease)
             try:
                 conn.close()

@@ -155,10 +155,40 @@ class Trainer:
         self.logger.close()
 
     # в”Ђв”Ђ transport callbacks в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    def _print_bootstrap_status(self, event, fields):
+        device = fields.get("device_id", "?")
+        table = fields.get("table_id")
+        port = fields.get("callback_port")
+
+        if event == "bootstrap.requested":
+            verb = "fresh slot requested" if fields.get("reallocate") else "looking for slot"
+            print(f"[*] {verb} device={device} local={fields.get('local_ipv4', '?')}", flush=True)
+        elif event == "bootstrap.registered":
+            print(
+                f"[+] slot assigned device={device} "
+                f"callback={self.bootstrap.advertised_host}:{port} "
+                f"gen={fields.get('generation', '?')}",
+                flush=True,
+            )
+        elif event == "bootstrap.rejected":
+            print(f"[!] slot request rejected device={device} error={fields.get('error', '?')}",
+                  flush=True)
+        elif event == "callback.connected":
+            print(
+                f"[+] bridge connected device={device} table={table or '?'} "
+                f"callback=:{port} peer={fields.get('peer', '?')}",
+                flush=True,
+            )
+        elif event == "callback.disconnected":
+            print(
+                f"[~] bridge disconnected device={device} table={table or '?'} "
+                f"callback=:{port}; waiting for reconnect",
+                flush=True,
+            )
+
     def _on_bootstrap_event(self, event, **fields):
         self.logger.emit(f"bootstrap.{event}", **fields)
-        if event in {"bootstrap.registered", "callback.connected", "callback.disconnected"}:
-            print(f"[*] {event} {fields}", flush=True)
+        self._print_bootstrap_status(event, fields)
 
     def _on_callback_message(self, device_id, table_id, message):
         if not table_id:
