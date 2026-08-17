@@ -1,7 +1,8 @@
-"""Device-serialized CC schedule with exactly three explicit send attempts."""
+"""Device-serialized CC schedule with exactly three explicit send attempts and human-like delay calculator."""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
+import random
 import threading
 import time
 import uuid
@@ -83,3 +84,54 @@ class ActionScheduler:
                 return None
             action.status = ActionStatus.NEEDS_OPERATOR if action.uncertain else ActionStatus.FAILED
             return self._active.pop(device_id)
+
+
+# --- Human-like delay calculator ----------------------------------------
+@dataclass(frozen=True)
+class HumanDelay:
+    """Samples human-like action delays; extra delay probability for 60 BB+ pots.
+
+    All delays are bounded by a ``max_delay_ms`` (turn deadline minus margin).
+    """
+
+    MAX_DELAY_MS: int = 15_000
+    TURN_DEADLINE_MARGIN_MS: int = 750
+    BIG_POT_THRESHOLD_BB: float = 60.0
+    BIG_POT_EXTRA_PROBABILITY: float = 0.3
+    BIG_POT_EXTRA_MS_MIN: int = 500
+    BIG_POT_EXTRA_MS_MAX: int = 2_000
+
+    @staticmethod
+    def compute(
+        cc_delay_ms: int,
+        *,
+        turn_time_s: float = 0.0,
+        observed_at: float | None = None,
+        now: float | None = None,
+        current_pot_bb: float = 0.0,
+        rng: random.Random | None = None,
+    ) -> int:
+        """Return the human-like delay in whole milliseconds for a CC action.
+
+        * ``cc_delay_ms`` — the CC's ``delay`` field, clamped to [0, MAX_DELAY_MS].
+        * ``turn_time_s`` — the Coin turn timer in seconds (0 means unknown/instant).
+        * ``observed_at`` — monotonic clock when the turn was observed.
+        * ``now`` — current monotonic clock.
+        * ``current_pot_bb`` — pot size in big blinds (0 means unknown).
+        """
+        rng = rng or random.Random()
+        requested = max(0, min(HumanDelay.MAX_DELAY_MS, int(cc_delay_ms)))
+        # Cap by turn deadline if available.
+        if turn_time_s > 0 and observed_at is not None and now is not None:
+            turn_deadline_at = observed_at + turn_time_s
+            remaining_ms = max(0, int(round((turn_deadline_at - now) * 1000)) - HumanDelay.TURN_DEADLINE_MARGIN_MS)
+        else:
+            remaining_ms = HumanDelay.MAX_DELAY_MS
+        delay_ms = min(requested, remaining_ms)
+
+        # Big-pot extra delay.
+        if current_pot_bb >= HumanDelay.BIG_POT_THRESHOLD_BB and rng.random() < HumanDelay.BIG_POT_EXTRA_PROBABILITY:
+            extra = rng.randint(HumanDelay.BIG_POT_EXTRA_MS_MIN, HumanDelay.BIG_POT_EXTRA_MS_MAX)
+            delay_ms = min(delay_ms + extra, remaining_ms)
+
+        return delay_ms

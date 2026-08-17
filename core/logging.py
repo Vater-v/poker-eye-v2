@@ -1,4 +1,10 @@
-"""Small append-only session logger: compact operator view plus JSONL evidence."""
+"""Structured per-run/per-device/per-session/per-table logging.
+
+Compact operator view (``operator.txt``) + append-only JSONL evidence
+(``events.jsonl`` at each scope). Technical IDs and human display numbers
+are separate: ``table_01`` is a recyclable operator label; every event also
+carries stable ``table_id`` and ``table_generation``.
+"""
 from __future__ import annotations
 import json, os, re, threading, uuid
 from datetime import datetime, timezone
