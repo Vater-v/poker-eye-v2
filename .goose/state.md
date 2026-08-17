@@ -15,3 +15,8 @@
 - Callback hello requires non-empty table_id; welcome includes it; 3-argument handlers receive (device_id, table_id, message), with legacy 2-argument compatibility.
 - Authenticated callback disconnect releases current lease and listener. Failed callback bind rolls back reservation. stop() closes listeners/connections and releases leases.
 - Verification: python -m unittest -v tests.test_bootstrap (9 passed); bootstrap + trainer E2E (16 passed).
+
+## Android network stall hardening (2026-08-18)
+- Updated only `android/HmuriyBridge.java`. First-channel bootstrap/discovery is fail-open with one attempt, 1s bootstrap/connect timeouts, and 15s bootstrap retry backoff; established channels retain 3x/3s reconnect behavior.
+- Production diagnostics are controlled by `PRODUCTION_DIAGNOSTICS`, default false; existing diagnostic hooks remain available.
+- Verification: `javac -source 8 -target 8 -cp C:\Android\platforms\android-35\android.jar` passed (4 standard warnings). d8/APK build not run.

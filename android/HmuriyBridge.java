@@ -43,11 +43,18 @@ import javax.crypto.spec.SecretKeySpec;
 public final class HmuriyBridge {
     /* ---- constants ---- */
     private static final String TAG = "Hmuriy";
+    private static void diag(String message) {
+        if (PRODUCTION_DIAGNOSTICS) Log.d(TAG, message);
+    }
     private static final int BROADCAST_PORT = 37020;
     private static final String BOOTSTRAP_HOST = "37.192.228.101";
     private static final int BOOTSTRAP_PORT = 19037;
-    private static final int CONNECT_TIMEOUT_MS = 120;
+    private static final int CONNECT_TIMEOUT_MS = 1000;
+    private static final int BOOTSTRAP_TIMEOUT_MS = 1000;
     private static final int READ_TIMEOUT_MS = 220;
+    private static final long BOOTSTRAP_BACKOFF_MS = 15000L;
+    // Keep production diagnostics off; enable only for targeted field debugging.
+    private static final boolean PRODUCTION_DIAGNOSTICS = false;
     private static final int MAX_FRAME = 8 * 1024 * 1024;
     private static final int MAX_INJECT = 32;
     private static final int MAX_SCHEDULE_DELAY_MS = 15000;
@@ -78,6 +85,7 @@ public final class HmuriyBridge {
     private static volatile String sessionId = "trainer";
     private static volatile String callbackToken = "";
     private static volatile int callbackGeneration = 0;
+    private static volatile long bootstrapRetryAfter = 0L;
 
     /* ---- device identity ---- */
     private static final String DEVICE_ID = deviceId();
@@ -189,11 +197,14 @@ public final class HmuriyBridge {
     private static Conn ensureConn(String wsId, String tableId) throws Exception {
         Conn c = CONNS.get(wsId);
         if (c != null && connected(c)) return c;
+        // Bootstrap/discovery is best-effort: a first frame must not wait for
+        // reconnect sleeps when no channel has ever been established.
+        boolean hadChannel = c != null;
         if (c != null) closeQuiet(c);
         Throwable last = null;
-        // A lost channel is retried exactly three times with 3 s spacing.
-        // After that, discard the old assignment and request a fresh slot.
-        for (int attempt = 1; attempt <= 3; attempt++) {
+        int attempts = hadChannel ? 3 : 1;
+        // Only an established channel gets the 3x/3s reconnect policy.
+        for (int attempt = 1; attempt <= attempts; attempt++) {
             try {
                 c = connect(tableId);
                 CONNS.put(wsId, c);
@@ -202,12 +213,16 @@ public final class HmuriyBridge {
             } catch (Throwable error) {
                 last = error;
                 closeQuiet(c);
-                if (attempt < 3) {
+                if (attempt < attempts) {
                     try { Thread.sleep(3000); } catch (InterruptedException e) {
                         Thread.currentThread().interrupt(); break;
                     }
                 }
             }
+        }
+        if (!hadChannel) {
+            if (last instanceof Exception) throw (Exception) last;
+            throw new Exception(last);
         }
         // The assignment may be stale; force a new callback lease, generation,
         // and token rather than reusing the old assignment.
@@ -229,9 +244,22 @@ public final class HmuriyBridge {
     }
 
     private static void bootstrap(boolean forceNewLease) throws Exception {
+        long now = System.currentTimeMillis();
+        if (now < bootstrapRetryAfter)
+            throw new IllegalStateException("bootstrap backoff");
+        try {
+            bootstrapAttempt(forceNewLease);
+            bootstrapRetryAfter = 0L;
+        } catch (Throwable error) {
+            bootstrapRetryAfter = System.currentTimeMillis() + BOOTSTRAP_BACKOFF_MS;
+            throw error;
+        }
+    }
+
+    private static void bootstrapAttempt(boolean forceNewLease) throws Exception {
         Socket s = new Socket();
-        s.connect(new InetSocketAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT), 5000);
-        s.setSoTimeout(5000);
+        s.connect(new InetSocketAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT), BOOTSTRAP_TIMEOUT_MS);
+        s.setSoTimeout(BOOTSTRAP_TIMEOUT_MS);
         DataInputStream in = new DataInputStream(s.getInputStream());
         DataOutputStream out = new DataOutputStream(s.getOutputStream());
         String n = Long.toHexString(System.nanoTime());
@@ -239,7 +267,7 @@ public final class HmuriyBridge {
         hello.put("type", "bootstrap_hello");
         hello.put("version", PROTOCOL_VERSION);
         hello.put("device_id", DEVICE_ID);
-        hello.put("local_ipv4", "0.0.0.0");
+        hello.put("local_ipv4", activeIpv4());
         hello.put("nonce", n);
         hello.put("session_id", "bootstrap");
         if (forceNewLease) hello.put("reallocate", true);
@@ -265,7 +293,7 @@ public final class HmuriyBridge {
         try { in.close(); } catch (Throwable ignored) {}
         try { out.close(); } catch (Throwable ignored) {}
         try { s.close(); } catch (Throwable ignored) {}
-        Log.d(TAG, "bootstrap assigned callback " + trainerHost + ":" + trainerPort);
+        diag("bootstrap assigned callback " + trainerHost + ":" + trainerPort);
     }
 
     private static Conn connect(String tableId) throws Exception {
@@ -274,10 +302,10 @@ public final class HmuriyBridge {
         }
         if (trainerHost == null || trainerPort <= 0)
             throw new IllegalStateException("no trainer discovered");
-        Log.d(TAG, "connecting " + trainerHost + ":" + trainerPort + " table=" + tableId);
+        diag("connecting " + trainerHost + ":" + trainerPort + " table=" + tableId);
         Network net = wifiNetwork();
         Socket s = net == null ? new Socket() : net.getSocketFactory().createSocket();
-        if (net != null) Log.d(TAG, "using Wi-Fi network for trainer TCP");
+        if (net != null) diag("using Wi-Fi network for trainer TCP");
         s.connect(new InetSocketAddress(trainerHost, trainerPort), CONNECT_TIMEOUT_MS);
         s.setSoTimeout(READ_TIMEOUT_MS);
         DataInputStream in = new DataInputStream(s.getInputStream());
@@ -430,10 +458,10 @@ public final class HmuriyBridge {
                 Network net = wifiNetwork();
                 if (net != null) {
                     net.bindSocket(sock);
-                    Log.d(TAG, "discovery bound to Wi-Fi network " + net);
+                    diag("discovery bound to Wi-Fi network " + net);
                 }
                 sock.bind(new InetSocketAddress(BROADCAST_PORT));
-                Log.d(TAG, "discovery UDP bound port=" + BROADCAST_PORT);
+                diag("discovery UDP bound port=" + BROADCAST_PORT);
                 sock.setSoTimeout(1000);
             } catch (Throwable error) {
                 Log.w(TAG, "discovery socket bind failed", error);
@@ -465,7 +493,7 @@ public final class HmuriyBridge {
                         trainerPort = port;
                         trainerNonce = ad.optString("nonce", "");
                         sessionId = ad.optString("session_id", "trainer");
-                        Log.d(TAG, "trainer discovered " + trainerHost + ":" + trainerPort);
+                        diag("trainer discovered " + trainerHost + ":" + trainerPort);
                     } catch (Throwable ignored) {
                     }
                 }
@@ -549,6 +577,37 @@ public final class HmuriyBridge {
         } catch (Throwable ignored) {}
         return "em-" + Integer.toHexString(
             (Build.MODEL == null ? "" : Build.MODEL).hashCode());
+    }
+
+    private static String activeIpv4() {
+        try {
+            Network net = wifiNetwork();
+            if (net != null) {
+                java.net.NetworkInterface ni = java.net.NetworkInterface.getByName("wlan0");
+                if (ni != null) {
+                    java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        java.net.InetAddress a = addrs.nextElement();
+                        if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress())
+                            return a.getHostAddress();
+                    }
+                }
+            }
+            java.util.Enumeration<java.net.NetworkInterface> all = java.net.NetworkInterface.getNetworkInterfaces();
+            while (all != null && all.hasMoreElements()) {
+                java.net.NetworkInterface ni = all.nextElement();
+                if (!ni.isUp() || ni.isLoopback() || ni.getName().startsWith("tun")) continue;
+                java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    java.net.InetAddress a = addrs.nextElement();
+                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress())
+                        return a.getHostAddress();
+                }
+            }
+        } catch (Throwable error) {
+            if (PRODUCTION_DIAGNOSTICS) Log.w(TAG, "active IPv4 lookup failed", error);
+        }
+        return "0.0.0.0";
     }
 
     private static Network wifiNetwork() {
