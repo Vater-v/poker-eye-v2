@@ -12,6 +12,7 @@ operator must expose 19037 and the callback range to the target LAN/public path.
 from __future__ import annotations
 
 import hmac
+import inspect
 import secrets
 import socket
 import threading
@@ -42,11 +43,14 @@ class CallbackAllocator:
         self._ports: Dict[int, str] = {}
         self._generations: Dict[str, int] = {}
 
-    def allocate(self, device_id: str, local_ipv4: str) -> CallbackLease:
+    def allocate(self, device_id: str, local_ipv4: str, *, force_new: bool = False) -> CallbackLease:
         with self._lock:
             old = self._leases.get(device_id)
-            if old is not None:
+            if old is not None and not force_new:
                 return old
+            if old is not None:
+                self._leases.pop(device_id, None)
+                self._ports.pop(old.callback_port, None)
             port = next((p for p in range(self.start, self.end + 1) if p not in self._ports), None)
             if port is None:
                 raise RuntimeError("callback capacity exhausted")
@@ -95,6 +99,7 @@ class BootstrapServer:
         self.callback_handler = callback_handler
         self._server: Optional[socket.socket] = None
         self._callback_servers: Dict[int, socket.socket] = {}
+        self._callback_connections: Dict[int, set[socket.socket]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -144,8 +149,16 @@ class BootstrapServer:
                              str(msg.get("session_id", "bootstrap")))
             if not hmac.compare_digest(supplied, expected):
                 raise ValueError("bootstrap authentication failed")
-            lease = self.allocator.allocate(device_id, local_ipv4)
-            self._ensure_callback(lease)
+            force_new = bool(msg.get("reallocate", False))
+            if force_new:
+                self._invalidate_callback(device_id)
+            lease = self.allocator.allocate(device_id, local_ipv4, force_new=force_new)
+            try:
+                self._ensure_callback(lease)
+            except (OSError, RuntimeError):
+                # A reservation must never survive a failed callback bind.
+                self.allocator.release(device_id, lease.generation)
+                raise
             send_frame(conn, {
                 "type": "bootstrap_ok", "version": PROTOCOL_VERSION,
                 "device_id": device_id, "callback_host": self.advertised_host,
@@ -167,15 +180,47 @@ class BootstrapServer:
             except OSError:
                 pass
 
+    def _invalidate_callback(self, device_id: str) -> None:
+        """Close the prior callback listener/connections before reallocating."""
+        old = self.allocator.get(device_id)
+        if old is None:
+            return
+        with self._lock:
+            sock = self._callback_servers.pop(old.callback_port, None)
+            connections = self._callback_connections.pop(old.callback_port, set())
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        self.allocator.release(device_id, old.generation)
+
     def _ensure_callback(self, lease: CallbackLease) -> None:
         with self._lock:
             if lease.callback_port in self._callback_servers:
                 return
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, lease.callback_port))
-            sock.listen(16)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, lease.callback_port))
+                sock.listen(16)
+            except BaseException:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise
             self._callback_servers[lease.callback_port] = sock
+            self._callback_connections.setdefault(lease.callback_port, set())
         threading.Thread(target=self._accept_callback, args=(sock, lease), daemon=True,
                          name=f"callback-{lease.callback_port}").start()
 
@@ -188,6 +233,8 @@ class BootstrapServer:
                 continue
             except OSError:
                 return
+            with self._lock:
+                self._callback_connections.setdefault(lease.callback_port, set()).add(conn)
             threading.Thread(target=self._handle_callback, args=(conn, addr, lease), daemon=True).start()
 
     def _handle_callback(self, conn: socket.socket, addr: Tuple[str, int], lease: CallbackLease) -> None:
@@ -197,13 +244,17 @@ class BootstrapServer:
             hello = recv_frame(conn)
             if hello.get("type") != "callback_hello" or hello.get("version") != PROTOCOL_VERSION:
                 raise ValueError("invalid callback hello")
-            if hello.get("device_id") != lease.device_id or hello.get("generation") != lease.generation:
+            table_id = hello.get("table_id")
+            if (hello.get("device_id") != lease.device_id
+                    or not isinstance(table_id, str) or not table_id
+                    or hello.get("generation") != lease.generation):
                 raise ValueError("callback identity mismatch")
             if not hmac.compare_digest(str(hello.get("token", "")), lease.token):
                 raise ValueError("callback token mismatch")
             authenticated = True
             send_frame(conn, {"type": "callback_welcome", "version": PROTOCOL_VERSION,
-                              "device_id": lease.device_id, "generation": lease.generation})
+                              "device_id": lease.device_id, "table_id": table_id,
+                              "generation": lease.generation})
             self._emit("callback.connected", device_id=lease.device_id,
                        callback_port=lease.callback_port, generation=lease.generation, peer=str(addr))
             while not self._stop.is_set():
@@ -214,7 +265,13 @@ class BootstrapServer:
                     decision = {"type": "forward", "id": msg.get("id")}
                     if self.callback_handler is not None:
                         try:
-                            custom = self.callback_handler(lease, msg)
+                            # New handlers receive explicit device/table identity;
+                            # retain compatibility with the existing lease/message hook.
+                            parameters = inspect.signature(self.callback_handler).parameters
+                            if len(parameters) >= 3:
+                                custom = self.callback_handler(lease.device_id, table_id, msg)
+                            else:
+                                custom = self.callback_handler(lease, msg)
                             if isinstance(custom, dict):
                                 decision.update(custom)
                         except Exception as exc:
@@ -224,13 +281,32 @@ class BootstrapServer:
         except (ConnectionError, OSError, ValueError):
             pass
         finally:
+            with self._lock:
+                connections = self._callback_connections.get(lease.callback_port)
+                if connections is not None:
+                    connections.discard(conn)
             if authenticated:
                 self._emit("callback.disconnected", device_id=lease.device_id,
                            callback_port=lease.callback_port, generation=lease.generation)
+                self._close_callback_lease(lease)
             try:
                 conn.close()
             except OSError:
                 pass
+
+    def _close_callback_lease(self, lease: CallbackLease) -> None:
+        """Release a lease and close its listener, unless it was superseded."""
+        if self.allocator.get(lease.device_id) != lease:
+            return
+        with self._lock:
+            listener = self._callback_servers.pop(lease.callback_port, None)
+            self._callback_connections.pop(lease.callback_port, None)
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        self.allocator.release(lease.device_id, lease.generation)
 
     def stop(self) -> None:
         self._stop.set()
@@ -240,9 +316,24 @@ class BootstrapServer:
             except OSError:
                 pass
         with self._lock:
-            for sock in self._callback_servers.values():
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+            listeners = list(self._callback_servers.values())
+            connections = [conn for group in self._callback_connections.values() for conn in group]
+            leases = list(self.allocator.leases().values())
             self._callback_servers.clear()
+            self._callback_connections.clear()
+        for sock in listeners:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        for lease in leases:
+            self.allocator.release(lease.device_id, lease.generation)

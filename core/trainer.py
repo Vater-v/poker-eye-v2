@@ -94,6 +94,9 @@ class Trainer:
 
         self.tables: Dict[str, TableState] = {}
         self.table_devices: Dict[str, str] = {}
+        # Latest turn identity per table.  A turn frame is only ACK evidence
+        # when it advances beyond the identity captured by the action.
+        self.table_turn_ids: Dict[str, str] = {}
         self._tables_lock = threading.Lock()
         self.pending: Dict[str, Action] = {}          # table_id -> action awaiting send
         self.pending_due: Dict[str, float] = {}       # table_id -> due monotonic
@@ -157,8 +160,16 @@ class Trainer:
         if event in {"bootstrap.registered", "callback.connected", "callback.disconnected"}:
             print(f"[*] {event} {fields}", flush=True)
 
-    def _on_callback_message(self, lease, message):
-        return self._ws_handler(lease.device_id, message)
+    def _on_callback_message(self, device_id, table_id, message):
+        if not table_id:
+            self.logger.emit("callback.unrouted", severity="WARN",
+                             device_id=device_id,
+                             message="callback frame lacks table_id; reconciliation required")
+            return {"action": "forward"}
+        if self.table_devices.get(str(table_id)) not in (None, device_id):
+            return {"action": "forward"}
+        self.table_devices[str(table_id)] = device_id
+        return self._ws_handler(str(table_id), message)
 
     def _on_device_connect(self, table_id, slot, conn, address):
         # device_id is carried by the authenticated welcome but the legacy
@@ -255,6 +266,7 @@ class Trainer:
         # the next actor (or a stack update) after our synthetic send.
         if cmd == "game.user_turn" and direction == "in":
             self._mark_acked_if_pending(table_id, data)
+            self.table_turn_ids[table_id] = turn_identity(data)
 
         if cmd == "game.user_turn" and direction == "in":
             whose = str(data.get("whoseTurn") or data.get("userName") or "")
@@ -275,6 +287,10 @@ class Trainer:
             return
         # A fresh turn means our action was accepted and the hand advanced.
         tid = turn_identity(data)
+        # The ACK must be a new turn, not the same/replayed frame that
+        # preceded the CC.  Exact identity is insufficient evidence.
+        if action.turn_id is not None and tid == action.turn_id:
+            return
         self._confirm_action(table_id, action, f"turn-{tid}")
 
     def _confirm_action(self, table_id: str, action: Action, evidence: str) -> None:
@@ -319,16 +335,22 @@ class Trainer:
             return act
 
     def _ack_deadline_thread(self, table_id: str, action: Action) -> None:
-        threading.Thread(target=self._ack_deadline, args=(table_id, action),
+        # Capture the immutable attempt number.  The Action object is reused
+        # for retries, so passing only the object would let an old timeout
+        # worker act on a later attempt.
+        attempt = action.attempt
+        threading.Thread(target=self._ack_deadline, args=(table_id, action, attempt),
                          daemon=True).start()
 
-    def _ack_deadline(self, table_id: str, action: Action) -> None:
+    def _ack_deadline(self, table_id: str, action: Action, attempt: int) -> None:
         time.sleep(self.ack_timeout_s)
         if not self.scheduler.has_active(action.device_id):
             return
         with self._pending_lock:
             cur = self.pending.get(table_id)
-            if cur is not action:
+            # Deadline workers are attempt-owned.  A retry may already have
+            # advanced the same Action; an old worker must not fail it.
+            if cur is not action or cur.attempt != attempt:
                 return
             # If attempts remain, the next ws_message triggers the retry send.
             # If exhausted, finalize failed exactly once.
@@ -383,11 +405,15 @@ class Trainer:
             self.logger.emit("state.gap", table_id=table_id, severity="WARN", flush=True,
                              message=decision.reason)
         action = Action(
-            device_id=f"device:{table_id}",
+            # This key deliberately serializes all tables belonging to one
+            # physical device when callback identity is available.  Legacy
+            # direct tables retain their own stable fallback key.
+            device_id=self.table_devices.get(table_id, f"device:{table_id}"),
             table_id=table_id,
             generation=state.generation,
             command=decision.action.name,
             amount=decision.action.bet_amount,
+            turn_id=self.table_turn_ids.get(table_id),
         )
         if not self.scheduler.create(action):
             self.logger.emit("action.skipped", table_id=table_id, severity="WARN",

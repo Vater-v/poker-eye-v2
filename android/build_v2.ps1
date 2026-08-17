@@ -3,7 +3,7 @@
 # copy of the Coin APK. The baseline tree C:\projects\pokereye\coin is never
 # touched; this script operates only on the local coin_v2 copy.
 Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $PSNativeCommandUseErrorActionPreference = $false
 
 $root = $PSScriptRoot
@@ -47,6 +47,24 @@ if (-not (Test-Path -LiteralPath (Join-Path $builtinsSource "kotlin.kotlin_built
 # 1. Fresh isolated copy of the decompiled tree (baseline untouched).
 if (Test-Path -LiteralPath $project) { Remove-Item -LiteralPath $project -Recurse -Force }
 Copy-Item -Path $baselineCoin -Destination $project -Recurse -Force
+
+# The baseline smali prints full WS text/hex payloads under Hmuriy. Replace only
+# the four Log.d invocation instructions with nop; this keeps the hook bridge
+# active while eliminating per-frame payload logcat overhead. Also disable the
+# copied OkHttp logger so HTTP payloads do not flood the Hmuriy tag.
+$wsSmali = Join-Path $project "smali_classes6\okhttp3\internal\ws\RealWebSocket.smali"
+$httpLoggerSmali = Join-Path $project "smali_classes7\com\hmuriy\HmuriyLogger.smali"
+if (Test-Path -LiteralPath $wsSmali) {
+    $wsText = Get-Content -LiteralPath $wsSmali -Raw
+    $wsText = $wsText.Replace('invoke-static {v2, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I', 'nop')
+    [IO.File]::WriteAllText($wsSmali, $wsText, (New-Object Text.UTF8Encoding($false)))
+}
+if (Test-Path -LiteralPath $httpLoggerSmali) {
+    $httpText = Get-Content -LiteralPath $httpLoggerSmali -Raw
+    $logStub = '$1' + [Environment]::NewLine + '    .locals 0' + [Environment]::NewLine + '    return-void' + [Environment]::NewLine + '$2'
+    $httpText = $httpText -replace '(?s)(\.method public log\(Ljava/lang/String;\)V).*?(\.end method)', $logStub
+    [IO.File]::WriteAllText($httpLoggerSmali, $httpText, (New-Object Text.UTF8Encoding($false)))
+}
 
 # Copy the unknown/ resources the original build script restores.
 $builtinsTarget = Join-Path $project "unknown\kotlin"

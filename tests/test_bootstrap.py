@@ -22,6 +22,14 @@ class CallbackAllocatorTests(unittest.TestCase):
         self.assertEqual(x, y)
         self.assertEqual(a.available(), 99)
 
+    def test_force_reallocation_invalidates_generation(self):
+        a = CallbackAllocator(54300, 54301)
+        x = a.allocate("a", "192.168.0.1")
+        y = a.allocate("a", "192.168.0.2", force_new=True)
+        self.assertNotEqual(x.token, y.token)
+        self.assertEqual(y.generation, 2)
+        self.assertEqual(y.callback_port, x.callback_port)
+
     def test_generation_rejects_stale_release(self):
         a = CallbackAllocator(54300, 54300)
         x = a.allocate("a", "192.168.0.1")
@@ -65,7 +73,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
 
         cb = socket.create_connection(("127.0.0.1", 54300), timeout=2)
         cb.sendall(frame({"type": "callback_hello", "version": 2,
-                          "device_id": "emu-1", "generation": 1,
+                          "device_id": "emu-1", "table_id": "table-1", "generation": 1,
                           "token": reply["callback_token"]}))
         welcome = recv_frame(cb)
         self.assertEqual(welcome["type"], "callback_welcome")
@@ -82,6 +90,24 @@ class BootstrapIntegrationTests(unittest.TestCase):
         self.assertEqual(reply["type"], "error")
         sock.close()
 
+    def test_callback_disconnect_releases_lease_and_listener(self):
+        sock = socket.create_connection(("127.0.0.1", self.server.bootstrap_port), timeout=2)
+        nonce = "release"
+        sock.sendall(frame({"type": "bootstrap_hello", "version": 2, "device_id": "emu-r",
+                            "local_ipv4": "192.168.0.1", "nonce": nonce, "session_id": "bootstrap",
+                            "proof": proof(self.secret, nonce, "emu-r", "bootstrap")}))
+        reply = recv_frame(sock); sock.close()
+        cb = socket.create_connection(("127.0.0.1", reply["callback_port"]), timeout=2)
+        cb.sendall(frame({"type": "callback_hello", "version": 2, "device_id": "emu-r",
+                          "table_id": "t-r", "generation": 1, "token": reply["callback_token"]}))
+        self.assertEqual(recv_frame(cb)["type"], "callback_welcome")
+        cb.close()
+        for _ in range(20):
+            if self.server.allocator.get("emu-r") is None:
+                break
+            time.sleep(.02)
+        self.assertIsNone(self.server.allocator.get("emu-r"))
+
     def test_bad_callback_token_rejected(self):
         nonce = "x"
         sock = socket.create_connection(("127.0.0.1", self.server.bootstrap_port), timeout=2)
@@ -91,7 +117,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
         reply = recv_frame(sock); sock.close()
         cb = socket.create_connection(("127.0.0.1", reply["callback_port"]), timeout=2)
         cb.sendall(frame({"type": "callback_hello", "version": 2, "device_id": "emu-2",
-                          "generation": 1, "token": "wrong"}))
+                          "table_id": "table-2", "generation": 1, "token": "wrong"}))
         with self.assertRaises((ConnectionError, OSError, TimeoutError)):
             cb.settimeout(.5); recv_frame(cb)
         cb.close()

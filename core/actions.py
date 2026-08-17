@@ -27,6 +27,9 @@ class Action:
     attempt: int = 0
     status: ActionStatus = ActionStatus.PENDING
     uncertain: bool = False
+    # Turn identity observed before creating the action.  ACKs must advance
+    # beyond this identity; an unrelated/replayed turn is not evidence.
+    turn_id: str | None = None
     turn_id: str | None = None
 
 

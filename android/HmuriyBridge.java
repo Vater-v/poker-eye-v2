@@ -190,13 +190,45 @@ public final class HmuriyBridge {
         Conn c = CONNS.get(wsId);
         if (c != null && connected(c)) return c;
         if (c != null) closeQuiet(c);
-        c = connect(tableId);
-        CONNS.put(wsId, c);
-        c.tableId = tableId;
-        return c;
+        Throwable last = null;
+        // A lost channel is retried exactly three times with 3 s spacing.
+        // After that, discard the old assignment and request a fresh slot.
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                c = connect(tableId);
+                CONNS.put(wsId, c);
+                c.tableId = tableId;
+                return c;
+            } catch (Throwable error) {
+                last = error;
+                closeQuiet(c);
+                if (attempt < 3) {
+                    try { Thread.sleep(3000); } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt(); break;
+                    }
+                }
+            }
+        }
+        // The assignment may be stale; force a new callback lease, generation,
+        // and token rather than reusing the old assignment.
+        trainerHost = null; trainerPort = 0; callbackToken = ""; callbackGeneration = 0;
+        bootstrap(true);
+        try {
+            c = connect(tableId);
+            CONNS.put(wsId, c);
+            c.tableId = tableId;
+            return c;
+        } catch (Throwable error) {
+            if (last != null) Log.w(TAG, "trainer channel unavailable after 3 retries");
+            throw error;
+        }
     }
 
     private static void bootstrap() throws Exception {
+        bootstrap(false);
+    }
+
+    private static void bootstrap(boolean forceNewLease) throws Exception {
         Socket s = new Socket();
         s.connect(new InetSocketAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT), 5000);
         s.setSoTimeout(5000);
@@ -210,6 +242,7 @@ public final class HmuriyBridge {
         hello.put("local_ipv4", "0.0.0.0");
         hello.put("nonce", n);
         hello.put("session_id", "bootstrap");
+        if (forceNewLease) hello.put("reallocate", true);
         hello.put("proof", hmacHex(SECRET, n + "|" + DEVICE_ID + "|bootstrap|" + PROTOCOL_VERSION));
         byte[] b = hello.toString().getBytes(UTF8);
         out.writeInt(b.length); out.write(b); out.flush();
@@ -219,13 +252,16 @@ public final class HmuriyBridge {
         JSONObject reply = new JSONObject(new String(raw, UTF8));
         if (!"bootstrap_ok".equals(reply.optString("type")))
             throw new IllegalStateException("bootstrap rejected");
+        String replyDevice = reply.optString("device_id", "");
+        if (!DEVICE_ID.equals(replyDevice))
+            throw new IllegalStateException("bootstrap device mismatch");
         trainerHost = reply.optString("callback_host", BOOTSTRAP_HOST);
         trainerPort = reply.optInt("callback_port", 0);
-        trainerNonce = reply.optString("callback_token", "");
-        callbackToken = trainerNonce;
+        callbackToken = reply.optString("callback_token", "");
         callbackGeneration = reply.optInt("generation", 0);
+        if (callbackToken.length() == 0 || callbackGeneration <= 0)
+            throw new IllegalStateException("invalid callback lease");
         bootstrapCallbackPort = trainerPort;
-        closeQuiet(new Conn());
         try { in.close(); } catch (Throwable ignored) {}
         try { out.close(); } catch (Throwable ignored) {}
         try { s.close(); } catch (Throwable ignored) {}
@@ -251,6 +287,7 @@ public final class HmuriyBridge {
         hello.put("device_id", DEVICE_ID);
         if (callbackToken.length() > 0 && callbackGeneration > 0) {
             hello.put("type", "callback_hello");
+            hello.put("table_id", tableId);
             hello.put("generation", callbackGeneration);
             hello.put("token", callbackToken);
         } else {
@@ -271,6 +308,11 @@ public final class HmuriyBridge {
         String welcomeType = welcome.optString("type");
         if (!"welcome".equals(welcomeType) && !"callback_welcome".equals(welcomeType))
             throw new IllegalStateException("handshake rejected: " + welcome.optString("error", "?"));
+        if ("callback_welcome".equals(welcomeType)) {
+            if (!DEVICE_ID.equals(welcome.optString("device_id", "")) ||
+                    welcome.optInt("generation", -1) != callbackGeneration)
+                throw new IllegalStateException("callback welcome identity mismatch");
+        }
         Conn c = new Conn();
         c.socket = s;
         c.in = in;
