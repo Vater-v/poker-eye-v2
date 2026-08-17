@@ -45,3 +45,22 @@ python -m unittest discover
 Модульные тесты доказывают инварианты ядра; release-заявления требуют
 реального эмуляторного evidence (discovery, TCP, hook, hint→CC→ACK→ledger,
 reconnect, multitable).
+
+
+## Public bootstrap (target-PC)
+
+The trainer can also accept an authenticated emulator bootstrap on
+`0.0.0.0:19037` (publicly forwarded as `37.192.228.101:19037`). It allocates
+the lowest free callback port in `54300..54399`, returns a generation/token,
+and keeps the callback authenticated. The public endpoint is served by this
+local target-PC; no VPS-side change and no ADB runtime transport are involved.
+
+```cmd
+RUN.cmd --public-host 37.192.228.101 --bootstrap-port 19037
+```
+
+The forwarded public bootstrap and callback range must point to this machine.
+The Android bridge tries LAN broadcast first and bootstraps through the public
+endpoint when LDPlayer NAT cannot deliver broadcast. Runtime action routing
+still requires active hook traffic and real EYE/backend integration evidence.
+
