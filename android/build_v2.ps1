@@ -1,34 +1,40 @@
-# poker-eye-v2 isolated APK build.
+﻿# poker-eye-v2 isolated APK build.
 # Builds the v2 bridge (UDP discovery + authenticated TCP) into an isolated
 # copy of the Coin APK. The baseline tree C:\projects\pokereye\coin is never
 # touched; this script operates only on the local coin_v2 copy.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 
 $root = $PSScriptRoot
 Set-Location -LiteralPath $root
 
-$apktool     = "C:\projects\pokereye\apktool.jar"
+$apktool     = Join-Path $root "..\.dist\tooling\apktool.jar"
 $androidJar  = "C:\Android\platforms\android-35\android.jar"
 $d8          = "C:\Android\build-tools\35.0.0\d8.bat"
 $zipalign    = "C:\Android\build-tools\35.0.0\zipalign.exe"
 $apksigner   = "C:\Android\build-tools\35.0.0\apksigner.bat"
 $keystore    = Join-Path $env:USERPROFILE ".android\debug.keystore"
-$patchScript = "C:\projects\pokereye\patch_coin_update_check.ps1"
-$injectScript = "C:\projects\pokereye\inject_classes_dex.py"
-$baselineCoin = "C:\projects\pokereye\coin"
+$patchScript = Join-Path $root "patch_coin_update_check.ps1"
+$injectScript = Join-Path $root "inject_classes_dex.py"
+$baselineCoin = Join-Path $root "..\.dist\baseline\coin"
 
-$project   = Join-Path $root "coin_v2"
+$project   = Join-Path $root "..\.dist\v2workspace\coin_v2"
+$javaTmp  = Join-Path $env:TEMP ("pokereye-v2-bridge-" + $PID)
 $javaTemplate = Join-Path $root "HmuriyBridge.java"
 $javaSrc   = Join-Path $javaTmp "HmuriyBridge.java"
-$builtinsSource = Join-Path "C:\projects\pokereye\_bridge_src" "kotlin\kotlin"
-$serviceSource  = Join-Path "C:\projects\pokereye\_bridge_src" "kotlin\META-INF\services\kotlin.reflect.jvm.internal.impl.builtins.BuiltInsLoader"
-$publicSuffixSource = Join-Path "C:\projects\pokereye\_bridge_src" "okhttp3\internal\publicsuffix\publicsuffixes.gz"
+$runtimeSecretFile = Join-Path $root "..\secrets\trainer.secret"
+if (-not (Test-Path -LiteralPath $runtimeSecretFile)) {
+    throw "Missing local runtime secret: $runtimeSecretFile"
+}
+$builtinsSource = Join-Path $root "..\.dist\tooling\kotlin\kotlin"
+$serviceSource  = Join-Path $root "..\.dist\tooling\kotlin\META-INF\services\kotlin.reflect.jvm.internal.impl.builtins.BuiltInsLoader"
+$publicSuffixSource = Join-Path $root "..\.dist\tooling\okhttp3\internal\publicsuffix\publicsuffixes.gz"
 
 $javaTmp  = Join-Path $env:TEMP ("pokereye-v2-bridge-" + $PID)
 $classes  = Join-Path $javaTmp "classes"
 $dex      = Join-Path $javaTmp "dex"
-$dist     = Join-Path $root "out"
+$dist     = Join-Path $root "..\.dist\v2workspace\out"
 $unsigned = Join-Path $dist "coinpoker-v2-unsigned.apk"
 $injected = Join-Path $dist "coinpoker-v2-injected.apk"
 $aligned  = Join-Path $dist "coinpoker-v2-aligned.apk"
@@ -56,6 +62,13 @@ New-Item -ItemType Directory -Force -Path $javaTmp | Out-Null
 Copy-Item -LiteralPath $javaTemplate -Destination $javaSrc -Force
 # Record source hashes before the build (evidence).
 $srcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $javaTemplate).Hash
+$secret = (Get-Content -LiteralPath $runtimeSecretFile -Raw).Trim()
+if ([string]::IsNullOrWhiteSpace($secret)) { throw "Runtime secret is empty" }
+# Build the APK with the same local secret used by the trainer. The placeholder
+# never appears in the installed artifact.
+$javaText = Get-Content -LiteralPath $javaSrc -Raw
+$javaText = $javaText.Replace('__POKEREYE_V2_SECRET__', $secret.Replace('"','\\"'))
+[IO.File]::WriteAllText($javaSrc, $javaText, (New-Object Text.UTF8Encoding($false)))
 Write-Host "v2 bridge source SHA256: $srcHash"
 
 # 2. Disable the Coin custom update check in the isolated copy.
