@@ -1,0 +1,14 @@
+# v2 local-only runtime configuration
+# Copy `secrets/eye.agent` from the operator-managed PokerEYE credential when
+# the direct backend integration is enabled. This file is intentionally ignored.
+[trainer]
+secret_env = "POKEREYE_V2_SECRET"
+secret_file = "secrets/trainer.secret"
+
+[eye]
+host = "127.0.0.1"
+port = 17770
+credential_file = "secrets/eye.agent"
+
+[device]
+# Runtime is UDP broadcast + authenticated TCP only. ADB is lab control only.

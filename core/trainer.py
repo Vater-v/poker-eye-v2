@@ -1,4 +1,4 @@
-"""Full v2 trainer process: broadcast + TCP + per-table state + operator status.
+﻿"""Full v2 trainer process: broadcast + TCP + per-table state + operator status.
 
 Single stdlib process, no GUI/web/admin/Telegram. Ties together UDP broadcast
 discovery, authenticated TCP (one connection per table), Coin SFS2X decode,
@@ -82,6 +82,7 @@ class Trainer:
         )
 
         self.tables: Dict[str, TableState] = {}
+        self.table_devices: Dict[str, str] = {}
         self._tables_lock = threading.Lock()
         self.pending: Dict[str, Action] = {}          # table_id -> action awaiting send
         self.pending_due: Dict[str, float] = {}       # table_id -> due monotonic
@@ -105,7 +106,7 @@ class Trainer:
 
         self._stop = threading.Event()
 
-    # ── lifecycle ─────────────────────────────────────────────────────
+    # в”Ђв”Ђ lifecycle в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def start(self) -> None:
         port = self.server.start()
         self.broadcaster.tcp_port = port
@@ -137,8 +138,11 @@ class Trainer:
         self.pcap.close_all()
         self.logger.close()
 
-    # ── transport callbacks ───────────────────────────────────────────
+    # в”Ђв”Ђ transport callbacks в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def _on_device_connect(self, table_id, slot, conn, address):
+        # device_id is carried by the authenticated welcome but the legacy
+        # callback signature is table-first; use table_id as a stable fallback.
+        self.table_devices.setdefault(str(table_id), str(table_id))
         print(f"[+] table connected {table_id} slot={slot} peer={address[0]}:{address[1]}", flush=True)
         self.logger.emit("transport.connected", table_id=table_id, slot=slot,
                          peer=str(address), flush=True)
@@ -155,7 +159,7 @@ class Trainer:
                 self.tables[table_id] = ts
             return ts
 
-    # ── ws_message handler (runs in the connection thread; must be fast) ──
+    # в”Ђв”Ђ ws_message handler (runs in the connection thread; must be fast) в”Ђв”Ђ
     def _ws_handler(self, table_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
         mid = message.get("id", "")
         text = bool(message.get("text", False))
@@ -205,7 +209,7 @@ class Trainer:
 
         return {"id": mid, "action": "forward"}
 
-    # ── inbound/outbound observation ──────────────────────────────────
+    # в”Ђв”Ђ inbound/outbound observation в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def _observe_frame(self, table_id: str, state: TableState,
                        decoded: Dict[str, Any], direction: str, url: str) -> None:
         p = decoded.get("p")
@@ -267,7 +271,7 @@ class Trainer:
                          message=f"{action.command} acknowledged ({evidence})")
         print(f"[+] {action.command} ACKED on {table_id} ({evidence})", flush=True)
 
-    # ── action PULL scheduling ────────────────────────────────────────
+    # в”Ђв”Ђ action PULL scheduling в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def _enqueue(self, table_id: str, action: Action, delay_ms: int) -> None:
         with self._pending_lock:
             self.pending[table_id] = action
@@ -316,7 +320,7 @@ class Trainer:
                                  message=f"{action.command} failed after 3 attempts")
                 print(f"[-] {action.command} on {table_id} FAILED (3 attempts, no ACK)", flush=True)
 
-    # ── EYE channel ────────────────────────────────────────────────────
+    # в”Ђв”Ђ EYE channel в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def _on_eye_frame(self, frame: EyeFrame) -> None:
         if frame.tag != "cc":
             return
@@ -386,7 +390,7 @@ class Trainer:
             self.logger.emit("eye.disconnected", severity="WARN", **fields)
             print("[-] EYE disconnected (will reconnect)", flush=True)
 
-    # ── hint request ───────────────────────────────────────────────────
+    # в”Ђв”Ђ hint request в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     def _request_hint(self, table_id: str, state: TableState, turn: Dict[str, Any]) -> None:
         if self.eye_client is None or not self.eye_client.connected.is_set():
             return
@@ -404,9 +408,10 @@ class Trainer:
         self.logger.emit("hint.requested", table_id=table_id, flush=True, call_need=call_need)
         print(f"[*] hint requested {table_id} call={call_need} min={min_r} max={max_r}", flush=True)
 
-    # ── misc ───────────────────────────────────────────────────────────
+    # в”Ђв”Ђ misc в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     @staticmethod
     def _room_from_url(url: str) -> int:
         import re
         m = re.search(r"room[/=](\d+)", url or "")
         return int(m.group(1)) if m else 1
+

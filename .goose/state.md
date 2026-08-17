@@ -1,26 +1,26 @@
 # Current
-- v2 core is stdlib-only and green: 65 unit tests pass, compileall clean, trainer smoke prints READY and writes logs/run_<id>/{manifest.json,operator.txt,events.jsonl}.
-- New core modules: coin_wire (ported verified SFS2X + CC resolver), state (street/table state + turn_identity), events (normalized Coin/EYE metadata model + eye-channel CC parsing), anomalies (call=0 guard), policy (hint->action decision layer with state-gap), hints (hint watchdog), ledger (JSONL accounting), pcap_ring (4x64MiB ring, 256MiB cap, BPF), logging (run/device/session/table hierarchy), actions (+ HumanDelay for 60BB+).
-- Two read-only analyst reports integrated into docs/: PROTOCOL_REFERENCE_PCAP.md (reference PCAP = pppoker hook channel to PokerEYE on 127.0.0.1:17770, 4-byte BE length + JSON framing; CC schema confirmed; single-board NLH HU; NO SmartFox 0x80 frames in this capture — that framing belongs to CoinPoker, verified separately in legacy selftests) and MIGRATION_MAP.md (port-as-is / port-with-adaptation / do-not-port lists + 10 invariants).
+- Read-only Android/network audit: current HmuriyBridge.java and core discovery/transport use matching UDP 37020 JSON advertisement and TCP v2 HMAC protocol; no source files modified.
+- v2 core is stdlib-only and green: 88 unit tests pass, compileall clean, trainer smoke prints READY and writes logs/run_<id>/{manifest.json,operator.txt,events.jsonl}.
+- New core modules: coin_wire, state, events, anomalies, policy, hints, ledger, pcap_ring, logging, actions.
 
 # Verification
-- `python -m unittest discover`: 65 tests OK (was 9).
-- Fixed during build: pcap_ring RLock deadlock (rotate under write lock), close() self-deadlock, bpf interface string, ledger read_text newline kwarg (Python 3.10), policy guard only fires for paid CC types.
-- README.md updated.
+- `python -m unittest discover`: 88 tests OK.
+- Real trainer stdout artifact `.goose-tmp/real_trainer_stdout.txt`: ready tcp=62214 udp=37020; no device discovery/connection evidence.
+- Existing logs contain only trainer.ready in inspected runs; no broadcast.received or hello.authenticated events.
+- APK build record docs/BUILD.md confirms signed artifact and bridge source hash, but no current ADB/logcat dump exists in repository.
+
+# Audit findings
+- Java discovery binds UDP/IPv4 0.0.0.0:37020 and accepts only JSON type=trainer, version=2, tcp_port, nonce; it does not log ignored/malformed advertisements. It starts in static initialization, so discovery itself is not gated by ws traffic.
+- Trainer advertises to 255.255.255.255:37020 with host exactly the configured `host`. Default host 0.0.0.0 is intentionally replaced by the Android receiver with packet source IP. UDP/TCP protocol fields and HMAC proof formula match core/protocol.py.
+- Most likely real-emulator failure is network topology/firewall: LDPlayer NAT/isolated mode commonly does not deliver host LAN IPv4 broadcasts to guest; ADB is not a runtime fallback. Also verify Windows firewall permits inbound UDP 37020 and advertised TCP ephemeral port (trainer output was 62214 in the captured run).
+- Minimal protocol-side hardening (if needed after network test): emit Java logs for bind/valid/ignored discovery and trainer broadcast send errors; optionally advertise a fixed LAN host/IP rather than 0.0.0.0. Do not replace UDP broadcast with ADB or unicast if broadcast-only contract is required.
+- Separate race: if UDP discovery succeeds just before TCP, trainerNonce/sessionId are volatile and updated from each ad; otherwise hello should authenticate. A TCP refusal/timeout after “discovered” indicates firewall/route or advertised wrong host/port, not parsing.
 
 # Not done / blocked
-- No Android client/build source in v2; no v2 APK built/signed/installed. No real UDP discovery + TCP LAN + hook/hint/CC/ACK/ledger acceptance yet.
-- EYE backend client (the trainer-side piece that connects to PokerEYE and forwards CCs) not yet implemented.
-- Double-board explicitly unsupported (docs/CAPABILITY_GAPS.md).
-- PCAP ring has no live capture driver yet (policy/rotation is unit-tested; tcpdump driver is a future step for the Linux target).
+- No files modified. No real ADB/logcat/network capture was available in repository, so exact emulator topology cannot be proven from files alone.
+- Double-board unsupported; real acceptance still needs discovery, TCP, hook/hint/CC/ACK/ledger evidence.
 
 # Next
-1. Implement trainer-side EYE backend client (lp_pack/lp_read frames, SCLogin-lite, cc reception) as core/eye_backend.py with tests.
-2. Wire the full local loop: TCP client sim (tests) -> hint request -> cc -> policy -> action schedule -> attempts -> ACK -> ledger -> operator lines, as an integration test.
-3. Android broadcast/TCP client + isolated APK build (biggest remaining milestone).
-4. Real emulator acceptance: 1 table -> 2 -> 4 -> 5, then multiple emulators; 10/10 launches.
-
-# Decisions
-- Keep root main.py + small core modules; stdlib only. Port from legacy per MIGRATION_MAP, never copy LiveCoinBridge wholesale.
-- Normal logs carry frame metadata (direction/type/length/seq/correlation/SHA-256) and allowlisted decoded fields only; no payloads.
-- The call=0 guard lives in core/policy.py (decide_cc_action): paid CC + call_need==0 + CHECK legal -> state_gap_check (CHECK), never CALL 0; without CHECK legal -> needs_operator.
+1. Run host-side UDP listener and packet capture while trainer is running; verify advertisement source/destination and emulator visibility.
+2. Check LDPlayer network mode/route and Windows firewall; test TCP to the exact advertised port from emulator only after UDP visibility.
+3. Add only diagnostic logging first, then any topology-specific minimal fix.

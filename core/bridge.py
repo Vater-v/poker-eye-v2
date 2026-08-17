@@ -108,7 +108,6 @@ class BridgeContext:
             last = self.seen_turns.get(table_id)
             if last == tid:
                 return False  # reconnect replay of the same turn: no duplicate hint
-            self.seen_turns[table_id] = tid
         state.user_turn_options = dict(user_turn_options or {})
         if hand_id and state.hand_id != hand_id:
             state.new_hand(hand_id)
@@ -123,8 +122,13 @@ class BridgeContext:
         frame = hint_frame or self._build_hint_frame(table_id, hand_id, turn, turn_time_s)
         ok = self.eye_sender(frame)
         if not ok:
+            self.watchdog.cancel(table_id, hand_id)
+            with self._lock:
+                self._pending_finish_hint.pop(table_id, None)
             self._emit("hint.send_failed", table_id=table_id, message="EYE channel unavailable", severity="WARN")
             return False
+        with self._lock:
+            self.seen_turns[table_id] = tid
         with self._lock:
             self._pending_finish_hint[table_id] = True
         self._emit("hint.requested", table_id=table_id, message=f"hint for {table_id}", turn_id=tid,

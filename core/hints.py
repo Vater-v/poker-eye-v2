@@ -61,6 +61,19 @@ class HintWatchdog:
         )
         return False, (HintTransition("hint.held", table_id, hand_id, "held newer hint while one outstanding"),)
 
+    def cancel(self, table_id: str, hand_id: Optional[str] = None) -> Tuple[HintTransition, ...]:
+        """Cancel an armed/held hint after a failed delivery or stale turn."""
+        table_id = str(table_id)
+        cur = self._outstanding.get(table_id)
+        if cur is None:
+            self._successor.pop(table_id, None)
+            return ()
+        if hand_id is not None and cur.hand_id != hand_id:
+            return ()
+        self._outstanding.pop(table_id, None)
+        self._successor.pop(table_id, None)
+        return (HintTransition("hint.canceled", table_id, cur.hand_id, "hint delivery/state canceled"),)
+
     def observe_finish(self, table_id: str) -> Tuple[HintTransition, ...]:
         table_id = str(table_id)
         cur = self._outstanding.pop(table_id, None)

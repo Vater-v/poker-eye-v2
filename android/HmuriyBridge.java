@@ -14,6 +14,10 @@
  */
 package com.hmuriy;
 
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.util.Base64;
 import android.util.Log;
@@ -46,7 +50,7 @@ public final class HmuriyBridge {
     private static final int MAX_INJECT = 32;
     private static final int MAX_SCHEDULE_DELAY_MS = 15000;
     private static final int PROTOCOL_VERSION = 2;
-    private static final String SECRET = "change-me-local-only";
+    private static final String SECRET = "__POKEREYE_V2_SECRET__";
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     /* ---- shared state ---- */
@@ -191,7 +195,9 @@ public final class HmuriyBridge {
         if (trainerHost == null || trainerPort <= 0)
             throw new IllegalStateException("no trainer discovered");
         Log.d(TAG, "connecting " + trainerHost + ":" + trainerPort + " table=" + tableId);
-        Socket s = new Socket();
+        Network net = wifiNetwork();
+        Socket s = net == null ? new Socket() : net.getSocketFactory().createSocket();
+        if (net != null) Log.d(TAG, "using Wi-Fi network for trainer TCP");
         s.connect(new InetSocketAddress(trainerHost, trainerPort), CONNECT_TIMEOUT_MS);
         s.setSoTimeout(READ_TIMEOUT_MS);
         DataInputStream in = new DataInputStream(s.getInputStream());
@@ -328,7 +334,13 @@ public final class HmuriyBridge {
             try {
                 sock = new DatagramSocket(null);
                 sock.setReuseAddress(true);
+                Network net = wifiNetwork();
+                if (net != null) {
+                    net.bindSocket(sock);
+                    Log.d(TAG, "discovery bound to Wi-Fi network " + net);
+                }
                 sock.bind(new InetSocketAddress(BROADCAST_PORT));
+                Log.d(TAG, "discovery UDP bound port=" + BROADCAST_PORT);
                 sock.setSoTimeout(1000);
             } catch (Throwable error) {
                 Log.w(TAG, "discovery socket bind failed", error);
@@ -360,6 +372,7 @@ public final class HmuriyBridge {
                         trainerPort = port;
                         trainerNonce = ad.optString("nonce", "");
                         sessionId = ad.optString("session_id", "trainer");
+                        Log.d(TAG, "trainer discovered " + trainerHost + ":" + trainerPort);
                     } catch (Throwable ignored) {
                     }
                 }
@@ -443,6 +456,28 @@ public final class HmuriyBridge {
         } catch (Throwable ignored) {}
         return "em-" + Integer.toHexString(
             (Build.MODEL == null ? "" : Build.MODEL).hashCode());
+    }
+
+    private static Network wifiNetwork() {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object app = at.getMethod("currentApplication").invoke(null);
+            if (!(app instanceof Context)) return null;
+            ConnectivityManager cm = (ConnectivityManager)
+                ((Context) app).getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return null;
+            Network[] networks = cm.getAllNetworks();
+            for (Network n : networks) {
+                NetworkCapabilities caps = cm.getNetworkCapabilities(n);
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                        && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    return n;
+                }
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "wifi network lookup failed", error);
+        }
+        return null;
     }
 
     private static String hmacHex(String key, String data) throws Exception {

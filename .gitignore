@@ -7,6 +7,9 @@ coin/
 *.jks
 secrets/
 config.local.toml
+config/*.local.*
+config/backend_accounts.local.json
+*.agent
 *.token
 *.jsonl
 captures/
@@ -14,7 +17,6 @@ logs/
 *.pcap
 *.pcapng
 # Local APK/decompiled/build workspace stays outside Git; only .dist is ignored output.
-coin/
 _bridge_src/
 apktool.jar
 build_apk.ps1

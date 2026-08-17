@@ -13,10 +13,10 @@ from typing import Any, Optional
 
 
 def _varint(value: int) -> bytes:
-    if value < 0:
-        raise ValueError("negative varint")
+    # Protobuf int32/int64 negatives are encoded as unsigned 64-bit
+    # two's-complement varints, matching the verified legacy helper.
     out = bytearray()
-    n = value
+    n = int(value) & ((1 << 64) - 1) if int(value) < 0 else int(value)
     while True:
         b = n & 0x7F
         n >>= 7

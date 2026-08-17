@@ -176,11 +176,15 @@ class ResolvedAction:
 
 
 def _opts_get(opts: Optional[dict], key) -> Any:
+    """Read JSON string keys and decoded integer-key variants."""
     if not isinstance(opts, dict):
         return None
     if key in opts:
         return opts[key]
-    return None
+    try:
+        return opts.get(int(key))
+    except (TypeError, ValueError):
+        return None
 
 
 def resolve_eye_cc_action(

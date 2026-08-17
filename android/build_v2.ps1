@@ -19,7 +19,8 @@ $injectScript = "C:\projects\pokereye\inject_classes_dex.py"
 $baselineCoin = "C:\projects\pokereye\coin"
 
 $project   = Join-Path $root "coin_v2"
-$javaSrc   = Join-Path $root "HmuriyBridge.java"
+$javaTemplate = Join-Path $root "HmuriyBridge.java"
+$javaSrc   = Join-Path $javaTmp "HmuriyBridge.java"
 $builtinsSource = Join-Path "C:\projects\pokereye\_bridge_src" "kotlin\kotlin"
 $serviceSource  = Join-Path "C:\projects\pokereye\_bridge_src" "kotlin\META-INF\services\kotlin.reflect.jvm.internal.impl.builtins.BuiltInsLoader"
 $publicSuffixSource = Join-Path "C:\projects\pokereye\_bridge_src" "okhttp3\internal\publicsuffix\publicsuffixes.gz"
@@ -50,8 +51,11 @@ Copy-Item -Path (Join-Path $builtinsSource "*") -Destination $builtinsTarget -Re
 Copy-Item -Force $serviceSource $serviceTarget
 Copy-Item -Force $publicSuffixSource $publicSuffixTarget
 
+# Copy source into the disposable build workspace so the build is isolated.
+New-Item -ItemType Directory -Force -Path $javaTmp | Out-Null
+Copy-Item -LiteralPath $javaTemplate -Destination $javaSrc -Force
 # Record source hashes before the build (evidence).
-$srcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $javaSrc).Hash
+$srcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $javaTemplate).Hash
 Write-Host "v2 bridge source SHA256: $srcHash"
 
 # 2. Disable the Coin custom update check in the isolated copy.
