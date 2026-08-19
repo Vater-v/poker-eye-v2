@@ -4,12 +4,15 @@ import android.app.Activity;
 import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.graphics.Rect;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
@@ -17,6 +20,8 @@ import android.widget.TextView;
 import java.io.FileInputStream;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 
@@ -45,6 +50,11 @@ public final class HmuriyBridge {
     private static volatile WeakReference<Activity> CURRENT_ACTIVITY =
         new WeakReference<Activity>(null);
     private static volatile boolean UI_JANITOR_STARTED = false;
+    // Coin keeps TABLE CLOSED tabs after protocol quit_table. Janitor walks
+    // overflow ("...") -> leave-table -> confirm. One tap per 700ms sweep.
+    private static long JANITOR_CLOSED_SEEN_MS = 0L;
+    private static long JANITOR_LAST_TAP_MS = 0L;
+    private static int JANITOR_OVERFLOW_ROT = 0;
     private static final String DEVICE_ID = deviceId();
     private static final String PROCESS_NAME = currentProcessName();
     private static final String PROCESS_KEY = processKey(PROCESS_NAME);
@@ -81,7 +91,7 @@ public final class HmuriyBridge {
 
     public static void bootstrap(Context context) {
         // <clinit> already started nativeInit. Attach a UI janitor so Coin
-        // dialogs (max tables / table closed) cannot block protocol automation.
+        // dialogs and leftover TABLE CLOSED tabs cannot block protocol automation.
         if (context == null) return;
         try {
             startUiJanitor(context.getApplicationContext());
@@ -163,37 +173,309 @@ public final class HmuriyBridge {
         if (activity == null || activity.isFinishing()) return;
         View root = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
         if (root == null) return;
-        List<View> taps = new ArrayList<View>();
-        collectDialogTaps(root, taps);
-        for (int i = 0; i < taps.size(); i++) {
-            View target = taps.get(i);
-            if (target != null && target.isShown()) target.performClick();
+        List<UiNode> nodes = new ArrayList<UiNode>();
+        collectUiNodes(root, nodes);
+        if (nodes.isEmpty()) return;
+
+        long now = SystemClock.uptimeMillis();
+        if (now - JANITOR_LAST_TAP_MS < 650L) return;
+
+        UiNode confirmTitle = null;
+        UiNode yesBtn = null;
+        UiNode leaveTable = null;
+        UiNode goToTables = null;
+        UiNode closedTab = null;
+        UiNode overflowGlyph = null;
+        boolean closedEvidence = false;
+        boolean maxTablesVisible = false;
+        boolean dangerousConfirm = false;
+        int screenW = root.getWidth();
+        int screenH = root.getHeight();
+        if (screenW <= 0 || screenH <= 0) {
+            screenW = activity.getResources().getDisplayMetrics().widthPixels;
+            screenH = activity.getResources().getDisplayMetrics().heightPixels;
+        }
+
+        for (int i = 0; i < nodes.size(); i++) {
+            UiNode node = nodes.get(i);
+            if (isDangerousConfirm(node.compact)) dangerousConfirm = true;
+            if (isExitTableConfirm(node.compact) && confirmTitle == null) confirmTitle = node;
+            if (isConfirmYes(node.compact) && yesBtn == null) yesBtn = node;
+            if (isLeaveTableMenu(node.compact) && leaveTable == null) leaveTable = node;
+            if (isGoToMyTables(node.compact) && goToTables == null) goToTables = node;
+            if (isMaxTables(node.compact)) maxTablesVisible = true;
+            if (isMaxTables(node.compact) || isTableClosed(node.compact)) closedEvidence = true;
+            if (isTableClosed(node.compact) && closedTab == null) closedTab = node;
+            if (isOverflowGlyph(node.text, node.compact) && isTopLeft(node, screenW, screenH)
+                    && overflowGlyph == null) {
+                overflowGlyph = node;
+            }
+        }
+
+        // TABLE CLOSED felt is often an image; the overlay still exposes
+        // "Go to my tables" as Text. That is closed-tab evidence, not a leave.
+        if (goToTables != null && !maxTablesVisible) closedEvidence = true;
+        if (closedEvidence) JANITOR_CLOSED_SEEN_MS = now;
+        boolean wantClose = closedEvidence || (now - JANITOR_CLOSED_SEEN_MS) < 12000L;
+
+        // Never confirm logout / exit-app / KYC. Table-exit confirm is the
+        // last step of overflow -> leave table -> yes.
+        if (confirmTitle != null && !dangerousConfirm) {
+            View tap = yesBtn != null ? clickableOf(yesBtn.view) : rightConfirmButton(nodes, screenW, screenH);
+            if (tapView(tap, "confirm-exit-table")) {
+                JANITOR_CLOSED_SEEN_MS = 0L;
+                JANITOR_OVERFLOW_ROT = 0;
+            }
+            return;
+        }
+        if (leaveTable != null) {
+            tapView(clickableOf(leaveTable.view), "leave-table");
+            return;
+        }
+        // Only the Maximum Tables Opened modal. TABLE CLOSED overlays also
+        // show Go to my tables and tapping it would starve the leave path.
+        if (goToTables != null && maxTablesVisible) {
+            tapView(clickableOf(goToTables.view), "go-to-my-tables");
+            return;
+        }
+        if (closedTab != null && clickableOf(closedTab.view) != null
+                && (now - JANITOR_LAST_TAP_MS) > 1200L) {
+            tapView(clickableOf(closedTab.view), "focus-closed-tab");
+            return;
+        }
+        if (wantClose && overflowGlyph != null) {
+            tapView(clickableOf(overflowGlyph.view), "overflow-glyph");
+            return;
+        }
+        if (wantClose) {
+            View overflow = pickTopLeftOverflow(nodes, screenW, screenH);
+            if (overflow != null) tapView(overflow, "overflow-topleft");
         }
     }
 
-    private static void collectDialogTaps(View view, List<View> taps) {
+    private static final class UiNode {
+        final View view;
+        final String text;
+        final String compact;
+        final Rect bounds;
+        UiNode(View view, String text, String compact, Rect bounds) {
+            this.view = view;
+            this.text = text;
+            this.compact = compact;
+            this.bounds = bounds;
+        }
+    }
+
+    private static void collectUiNodes(View view, List<UiNode> out) {
         if (view == null || !view.isShown()) return;
-        CharSequence raw = null;
-        if (view instanceof TextView) raw = ((TextView) view).getText();
-        if (raw == null) raw = view.getContentDescription();
-        String text = raw == null ? "" : raw.toString().replace('\n', ' ').trim();
-        String compact = text.replace(" ", "").toLowerCase();
-        if (compact.contains("gotomytables")
-                || (compact.contains("tableclosed") && view.isClickable())) {
-            View click = view;
-            while (click != null && !click.isClickable()) {
-                Object parent = click.getParent();
-                click = parent instanceof View ? (View) parent : null;
-            }
-            if (click != null && click.isClickable() && !taps.contains(click)) {
-                taps.add(click);
+        String text = viewLabel(view);
+        if (text.length() > 0 || view.isClickable()) {
+            Rect bounds = new Rect();
+            if (view.getGlobalVisibleRect(bounds) && !bounds.isEmpty()) {
+                out.add(new UiNode(view, text, compact(text), bounds));
             }
         }
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
             int n = group.getChildCount();
-            for (int i = 0; i < n; i++) collectDialogTaps(group.getChildAt(i), taps);
+            for (int i = 0; i < n; i++) collectUiNodes(group.getChildAt(i), out);
         }
+    }
+
+    private static String viewLabel(View view) {
+        CharSequence raw = null;
+        if (view instanceof TextView) {
+            raw = ((TextView) view).getText();
+            if (raw == null || raw.length() == 0) raw = ((TextView) view).getHint();
+        }
+        if (raw == null || raw.length() == 0) raw = view.getContentDescription();
+        if ((raw == null || raw.length() == 0) && Build.VERSION.SDK_INT >= 26) {
+            try { raw = view.getTooltipText(); } catch (Throwable ignored) {}
+        }
+        if (raw == null) return "";
+        return raw.toString().replace('\n', ' ').trim();
+    }
+
+    private static String compact(String text) {
+        if (text == null) return "";
+        StringBuilder sb = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch <= 32) continue;
+            if (ch == '?' || ch == '!' || ch == '.' || ch == ',' || ch == ':'
+                    || ch == '\'' || ch == '"' || ch == '\u2026') continue;
+            sb.append(Character.toLowerCase(ch));
+        }
+        return sb.toString();
+    }
+
+    private static boolean isGoToMyTables(String c) {
+        return c.contains("gotomytables")
+                || c.contains("\u043f\u0435\u0440\u0435\u0439\u0442\u0438\u043a\u043c\u043e\u0438\u043c\u0441\u0442\u043e\u043b\u0430\u043c");
+    }
+
+    private static boolean isMaxTables(String c) {
+        return c.contains("maximumtablesopened") || c.contains("maximumtables");
+    }
+
+    private static boolean isTableClosed(String c) {
+        return c.contains("tableclosed")
+                || c.contains("\u044d\u0442\u043e\u0442\u0441\u0442\u043e\u043b\u0437\u0430\u043a\u0440\u044b\u0442")
+                || c.contains("\u0441\u0442\u043e\u043b\u0437\u0430\u043a\u0440\u044b\u0442")
+                || c.contains("thistableisclosed");
+    }
+
+    private static boolean isDangerousConfirm(String c) {
+        return c.contains("exitthecoinpoker")
+                || c.contains("exitcoinpoker")
+                || c.contains("\u0432\u044b\u0439\u0442\u0438\u0438\u0437\u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f")
+                || c.contains("wanttologout")
+                || c.contains("areyousureyouwanttologout")
+                || c.contains("\u0445\u043e\u0442\u0438\u0442\u0435\u0432\u044b\u0439\u0442\u0438\u0438\u0437")
+                || c.equals("\u0432\u044b\u0443\u0432\u0435\u0440\u0435\u043d\u044b\u0447\u0442\u043e\u0445\u043e\u0442\u0438\u0442\u0435\u0432\u044b\u0439\u0442\u0438")
+                || c.contains("exitkyc")
+                || c.contains("fantasycricket");
+    }
+
+    private static boolean isExitTableConfirm(String c) {
+        if (isDangerousConfirm(c)) return false;
+        if (c.contains("areyousureyouwanttoexittable")) return true;
+        if (c.contains("\u0432\u044b\u0443\u0432\u0435\u0440\u0435\u043d\u044b\u0447\u0442\u043e\u0445\u043e\u0442\u0438\u0442\u0435\u043f\u043e\u043a\u0438\u043d\u0443\u0442\u044c\u0441\u0442\u043e\u043b")) return true;
+        return c.contains("\u0443\u0432\u0435\u0440\u0435\u043d\u044b")
+                && c.contains("\u043f\u043e\u043a\u0438\u043d\u0443\u0442\u044c\u0441\u0442\u043e\u043b");
+    }
+
+    private static boolean isLeaveSeatMenu(String c) {
+        return c.contains("\u043f\u043e\u043a\u0438\u043d\u0443\u0442\u044c\u043c\u0435\u0441\u0442\u043e")
+                || c.contains("leaveyourseat")
+                || c.equals("leaveseat")
+                || c.contains("\u0445\u043e\u0442\u0438\u0442\u0435\u043f\u043e\u043a\u0438\u043d\u0443\u0442\u044c\u0441\u0432\u043e\u043c\u0435\u0441\u0442\u043e");
+    }
+
+    private static boolean isLeaveTableMenu(String c) {
+        if (isLeaveSeatMenu(c)) return false;
+        return c.contains("\u043f\u043e\u043a\u0438\u043d\u0443\u0442\u044c\u0441\u0442\u043e\u043b\u0438\u0432\u044b\u0439\u0442\u0438")
+                || c.contains("\u043f\u043e\u043a\u0438\u043d\u0443\u0442\u044c\u0438\u0437\u0430\u043a\u0440\u044b\u0442\u044c\u0441\u0442\u043e\u043b")
+                || c.contains("leaveandexittable")
+                || c.equals("exittable")
+                || c.equals("leavetable")
+                || c.equals("\u043f\u043e\u043a\u0438\u043d\u0443\u0442\u044c\u0441\u0442\u043e\u043b");
+    }
+
+    private static boolean isConfirmYes(String c) {
+        return c.equals("yes") || c.equals("\u0434\u0430") || c.equals("ok")
+                || c.equals("okay") || c.equals("confirm") || c.equals("\u043e\u043a");
+    }
+
+    private static boolean isOverflowGlyph(String text, String compact) {
+        String trimmed = text == null ? "" : text.trim();
+        return trimmed.equals("...") || trimmed.equals("\u2026")
+                || trimmed.equals("\u2022\u2022\u2022")
+                || trimmed.equals("\u22ee") || trimmed.equals("\u22ef")
+                || compact.equals("menu") || compact.contains("moreoptions")
+                || compact.contains("overflow");
+    }
+
+    private static boolean isTopLeft(UiNode node, int screenW, int screenH) {
+        if (node == null || node.bounds == null) return false;
+        int cx = node.bounds.centerX();
+        int cy = node.bounds.centerY();
+        return cx <= screenW * 22 / 100 && cy <= screenH * 18 / 100;
+    }
+
+    private static View clickableOf(View view) {
+        View cur = view;
+        while (cur != null && !cur.isClickable()) {
+            Object parent = cur.getParent();
+            cur = parent instanceof View ? (View) parent : null;
+        }
+        return cur != null && cur.isClickable() && cur.isShown() ? cur : view;
+    }
+
+    private static View rightConfirmButton(List<UiNode> nodes, int screenW, int screenH) {
+        View best = null;
+        int bestX = -1;
+        for (int i = 0; i < nodes.size(); i++) {
+            UiNode node = nodes.get(i);
+            if (node.bounds.centerY() < screenH * 45 / 100) continue;
+            if (node.bounds.height() > screenH * 20 / 100) continue;
+            String c = node.compact;
+            if (c.equals("no") || c.equals("\u043d\u0435\u0442") || c.equals("cancel")
+                    || c.equals("\u043e\u0442\u043c\u0435\u043d\u0430")
+                    || c.contains("\u043e\u0442\u043c\u0435\u043d\u0438\u0442\u044c")) continue;
+            View click = clickableOf(node.view);
+            if (click == null || !click.isShown()) continue;
+            int x = node.bounds.centerX();
+            if (x > bestX && x > screenW * 45 / 100) {
+                bestX = x;
+                best = node.view;
+            }
+        }
+        return best;
+    }
+
+    private static View pickTopLeftOverflow(List<UiNode> nodes, int screenW, int screenH) {
+        List<View> cands = new ArrayList<View>();
+        List<Integer> xs = new ArrayList<Integer>();
+        for (int i = 0; i < nodes.size(); i++) {
+            UiNode node = nodes.get(i);
+            if (!isTopLeft(node, screenW, screenH)) continue;
+            if (node.bounds.width() > screenW * 24 / 100) continue;
+            if (node.bounds.height() > screenH * 16 / 100) continue;
+            if (node.bounds.width() < 12 || node.bounds.height() < 12) continue;
+            if (isLeaveTableMenu(node.compact) || isGoToMyTables(node.compact)
+                    || isConfirmYes(node.compact) || isLeaveSeatMenu(node.compact)) continue;
+            if (node.compact.contains("fold") || node.compact.contains("check")
+                    || node.compact.contains("call") || node.compact.contains("raise")) continue;
+            View click = clickableOf(node.view);
+            if (click == null || !click.isShown() || cands.contains(click)) continue;
+            cands.add(click);
+            xs.add(Integer.valueOf(node.bounds.left));
+        }
+        if (cands.isEmpty()) return null;
+        List<Integer> order = new ArrayList<Integer>();
+        for (int i = 0; i < cands.size(); i++) order.add(Integer.valueOf(i));
+        Collections.sort(order, new Comparator<Integer>() {
+            @Override public int compare(Integer a, Integer b) {
+                return xs.get(a.intValue()).compareTo(xs.get(b.intValue()));
+            }
+        });
+        int idx = Math.abs(JANITOR_OVERFLOW_ROT) % order.size();
+        JANITOR_OVERFLOW_ROT++;
+        return cands.get(order.get(idx).intValue());
+    }
+
+    private static boolean tapView(View target, String why) {
+        if (target == null || !target.isShown()) return false;
+        JANITOR_LAST_TAP_MS = SystemClock.uptimeMillis();
+        boolean clicked = false;
+        try { clicked = target.performClick(); } catch (Throwable ignored) {}
+        if (!clicked) {
+            try {
+                int[] loc = new int[2];
+                target.getLocationOnScreen(loc);
+                float x = loc[0] + Math.max(1, target.getWidth()) / 2f;
+                float y = loc[1] + Math.max(1, target.getHeight()) / 2f;
+                View root = target.getRootView();
+                long t = SystemClock.uptimeMillis();
+                MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
+                MotionEvent up = MotionEvent.obtain(t, t + 40L, MotionEvent.ACTION_UP, x, y, 0);
+                if (root != null) {
+                    root.dispatchTouchEvent(down);
+                    root.dispatchTouchEvent(up);
+                } else {
+                    target.dispatchTouchEvent(down);
+                    target.dispatchTouchEvent(up);
+                }
+                down.recycle();
+                up.recycle();
+                clicked = true;
+            } catch (Throwable ignored) {}
+        }
+        if (clicked) {
+            Log.i(TAG, "[+] UI janitor tap " + why);
+        }
+        return clicked;
     }
 
     private static String deviceDisplayName() {

@@ -31,8 +31,8 @@ MIN_PLAYERS = 3
 JOIN_GAP_SECONDS = 8.0
 WATCHDOG_SECONDS = 2.0
 EMPTY_GRACE_SECONDS = 25.0
-TAB_COOLDOWN_SECONDS = 25.0
-JOIN_REJECT_COOLDOWN = 20.0
+TAB_COOLDOWN_SECONDS = 18.0
+JOIN_REJECT_COOLDOWN = 25.0
 
 
 def _policy_path() -> Path:
@@ -239,6 +239,21 @@ class DeviceAutomation:
         if self.policy.enabled:
             self._status = "refill"
 
+    def _extend_ghost_tabs(self, extra_seconds: float) -> None:
+        """Keep protocol-closed Coin tabs occupying the 5-slot cap.
+
+        quit_table ACKs the trainer session but the RN tab stays until the APK
+        janitor walks overflow → leave table → confirm. Joining during that
+        window hits Maximum Tables Opened and the new table is invisible.
+        """
+        now = time.monotonic()
+        hold = now + max(1.0, float(extra_seconds))
+        for table_id, expiry in list(self._tabs.items()):
+            current = float(expiry or 0.0)
+            # Live tabs use expiry 0. Only stretch already-closed ghosts.
+            if current > 0:
+                self._tabs[int(table_id)] = max(current, hold)
+
     def drain_leaves(self) -> list[tuple[int, str]]:
         now = time.monotonic()
         due = [row for row in self._gradual if row[1] <= now]
@@ -409,6 +424,7 @@ class DeviceAutomation:
             if failed:
                 self._joining = False
                 self._join_block_until = time.monotonic() + JOIN_REJECT_COOLDOWN
+                self._extend_ghost_tabs(JOIN_REJECT_COOLDOWN)
                 self._status = "join-rejected"
                 self._note("automation.join_rejected", "Coin отклонил поиск стола · пауза", severity="WARN")
         if routed.command == "lobby.join_game_table" and routed.direction == "in":

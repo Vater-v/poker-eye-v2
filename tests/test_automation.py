@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from core.v6router.automation import AutoPolicy, AutomationStore, DeviceAutomation
+from core.v6router.router import RoutedEvent
 from core.verified_v1.coin_action_wire import build_lobby_join_game_packet, decode_packet
 from core.verified_v1.coin_bridge_live import LiveCoinBridge
 
@@ -115,6 +116,40 @@ class WatchdogJoinTests(unittest.TestCase):
         for table_id in range(1, 6):
             auto._tabs[table_id] = 0.0
         auto.tick(seated_tables=0, live_table_ids=[])
+        self.assertFalse(auto._joining)
+
+    def test_protocol_close_keeps_ghost_tab_until_ui_cooldown(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": True, "table_count": 5, "bb": 0.02})
+        auto.lobby_ws = "aabbccdd"
+        auto._remember_config({
+            "configId": 200588, "bigBlind": 0.02, "miniGameTypeId": 1,
+            "minbuyin": 0.8, "maxbuyin": 2.0, "tableSize": 6,
+        })
+        for table_id in range(1, 6):
+            auto.note_table_closed(table_id, "quit")
+        self.assertEqual(auto.coin_tab_count(), 5)
+        auto.tick(seated_tables=0, live_table_ids=[])
+        self.assertFalse(auto._joining)
+        auto._tabs = {table_id: time.monotonic() - 1.0 for table_id in range(1, 6)}
+        self.assertEqual(auto.coin_tab_count(), 0)
+        auto.tick(seated_tables=0, live_table_ids=[])
+        self.assertTrue(auto._joining)
+
+    def test_join_rejected_extends_ghost_tabs_not_live_ones(self):
+        auto = DeviceAutomation("dev")
+        auto.note_table_closed(11, "quit")
+        auto._tabs[11] = time.monotonic() + 1.0
+        auto._tabs[22] = 0.0
+        routed = RoutedEvent(
+            event={}, payload=None, raw=b"", command="lobby.join_game",
+            direction="in", room_id=-1, table_ids=(),
+            data={"isSuccess": False, "errorCode": 1},
+        )
+        auto._observe(routed)
+        self.assertGreater(auto._tabs[11], time.monotonic() + 20.0)
+        self.assertEqual(auto._tabs[22], 0.0)
+        self.assertGreater(auto._join_block_until, time.monotonic())
         self.assertFalse(auto._joining)
 
 
