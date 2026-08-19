@@ -286,32 +286,38 @@ class CoinAutoplayCoordinator:
         otherwise FOLD when Coin exposes fold.  No paid CALL/RAISE decision is
         invented without PokerEYE.
         """
-        if not self.turn_by_room:
-            raise RuntimeError("no Coin hero game.user_turn available for failsafe")
         active=state.get('_hook_room')
+        turn=None
+        room=None
         if active is not None and int(active) in self.turn_by_room:
             room=int(active); turn=self.turn_by_room[room]
-        elif active is not None:
-            raise RuntimeError(f"no current hero turn for active room={active}")
-        else:
+        elif self.turn_by_room:
             room,turn=max(
                 self.turn_by_room.items(),
                 key=lambda kv: float(kv[1].get('_observed_monotonic') or 0.0),
             )
+        elif active is not None:
+            room=int(active)
+            turn={}
+        if room is None:
+            raise RuntimeError("no Coin hero game.user_turn available for failsafe")
+        if not isinstance(turn, dict):
+            turn={}
+        ws=self.ws_by_room.get(int(room), {})
+        turn.setdefault('_ws_id', ws.get('ws_id'))
+        turn.setdefault('_url', ws.get('url'))
+        turn.setdefault('_channel_id', ws.get('channel_id'))
 
         opts=turn.get('userTurnOptions') or {}
         def present(code:int)->bool:
             return str(code) in opts or code in opts
 
+        # A live hero turn with missing/odd option keys still must not sit out
+        # the clock. CHECK if Coin listed it; otherwise FOLD. Never invent CALL.
         if present(3):
             name,coin_code='CHECK',3
-        elif present(7):
-            name,coin_code='FOLD',7
         else:
-            raise RuntimeError(
-                f"failsafe unavailable: Coin exposes neither CHECK nor FOLD; "
-                f"options={sorted(str(k) for k in opts.keys())}"
-            )
+            name,coin_code='FOLD',7
 
         now=time.monotonic()
         try:turn_seconds=max(0.0,float(turn.get('turnTime') or 0.0))

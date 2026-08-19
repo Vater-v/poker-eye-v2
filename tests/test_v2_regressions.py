@@ -625,6 +625,16 @@ class MidHandStandupTests(unittest.TestCase):
         self.assertTrue(bridge._lifecycle_aborts_cc("game.leave_Seat"))
         self.assertTrue(bridge._should_announce_standup_to_eye())
 
+    def test_first_sit_packet_claims_the_table_room(self):
+        from core.verified_v1.coin_bridge_live import LiveCoinBridge
+
+        bridge = LiveCoinBridge()
+        self.assertFalse(bridge._is_active_room(None))
+        self.assertTrue(bridge._is_active_room(57953))
+        self.assertEqual(bridge.active_hook_room, 57953)
+        self.assertTrue(bridge._is_active_room(57953))
+        self.assertFalse(bridge._is_active_room(1))
+
     def test_operator_fleet_snapshot_counts_hands_by_type(self):
         logger = _Logger()
         console = OperatorConsole(logger, 7, accounts_dynamic=True)

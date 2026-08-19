@@ -203,6 +203,27 @@ class TurnOptionPcapRegressionTests(unittest.TestCase):
         fallback = autoplay.schedule_failsafe(state, reason="TEST")
         self.assertEqual(fallback["action"], "FOLD")
 
+    def test_failsafe_folds_when_coin_omits_legal_options(self):
+        autoplay = CoinAutoplayCoordinator(chip_scale=100)
+        state = {"user_name": "Hero", "user_id": 1, "_hook_room": ROOM}
+        autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {},
+            "_turn_id": "turn-empty-options",
+            "_observed_monotonic": 0.0,
+            "_ws_id": "abcd0001",
+        }
+        fallback = autoplay.schedule_failsafe(state, reason="NO_OPTIONS")
+        self.assertEqual(fallback["action"], "FOLD")
+
+    def test_failsafe_folds_when_turn_map_is_empty_but_room_is_known(self):
+        autoplay = CoinAutoplayCoordinator(chip_scale=100)
+        state = {"user_name": "Hero", "user_id": 1, "_hook_room": ROOM}
+        autoplay.ws_by_room[ROOM] = {"ws_id": "abcd0001", "url": "", "channel_id": "ch"}
+        fallback = autoplay.schedule_failsafe(state, reason="NO_TURN_YET")
+        self.assertEqual(fallback["action"], "FOLD")
+        self.assertEqual(fallback["room"], ROOM)
+
 
 class MidHandRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_seed_is_retried_before_failsafe(self):

@@ -2088,6 +2088,7 @@ class DeviceIngressRouter:
             "game.player_info",
             "game.seatInfo",
             "game.seat",
+            "game.take_Seat",
             "game.potInfo",
             "game.dealer_cards",
         }
@@ -2121,6 +2122,15 @@ class DeviceIngressRouter:
             # multiplexed websocket.
             self._ws_table_hints.pop(routed.websocket_id, None)
             return hinted, "recent GameRoomProperties table hint"
+        if routed.websocket_id and routed.websocket_id not in self._ws_to_tables:
+            unadmitted = [
+                int(table_id)
+                for table_id in self._provisional
+                if int(table_id) not in self._closing_tables
+                and int(table_id) not in self._sessions
+            ]
+            if len(unadmitted) == 1:
+                return unadmitted[0], "new game websocket for one unadmitted table"
         return 0, ""
 
     def _bind_locked(self, routed: RoutedEvent, table_id: int) -> None:
@@ -2808,6 +2818,14 @@ class DeviceIngressRouter:
                         "game.pre_hand_start_info",
                         "game.user_turn",
                     }
+                    if routed.command == "game.take_Seat":
+                        strong_recovery_edge = bool(
+                            routed.data.get("seatId")
+                            or routed.data.get("isSeated") is True
+                        )
+                    if routed.command in {"game.player_info", "game.hole_cards"}:
+                        cards = routed.data.get("playerCards") or routed.data.get("holeCards") or []
+                        strong_recovery_edge = bool(cards)
                     if routed.command == "game.game_alldata":
                         source = routed.data.get("gameInitResponseData")
                         if not isinstance(source, dict):

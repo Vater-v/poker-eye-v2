@@ -1010,7 +1010,25 @@ class LiveCoinBridge:
         for room,tid in self.room_to_table.items():model.hook_rooms_by_table[tid].add(room)
         return model
 
+    def _claim_hook_room(self, room: Optional[int]) -> None:
+        """First real packet on this session's SmartFox room owns the table.
+
+        A sit/cards/user_turn used to be dropped while active_hook_room was
+        still None, so Coin had a seated hero and the trainer thought the
+        table was never opened — and never armed a fallback.
+        """
+        if room is None:
+            return
+        room=int(room)
+        if room in self.closing_rooms:
+            return
+        if self.active_hook_room is None:
+            self.active_hook_room=room
+        if self.context_active and self.context_hook_room is None:
+            self.context_hook_room=room
+
     def _is_active_room(self,room:Optional[int]) -> bool:
+        self._claim_hook_room(room)
         active=self.context_hook_room if self.context_active else self.active_hook_room
         return active is not None and room==active and room not in self.closing_rooms
 
