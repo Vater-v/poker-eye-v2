@@ -136,6 +136,12 @@ class CoinAutoplayCoordinator:
         if cmd=='game.user_turn' and room is not None:
             whose=str(data.get('whoseTurn') or data.get('userName') or '')
             hero=str(state.get('user_name') or '')
+            try:hero_id=int(state.get('user_id') or 0)
+            except (TypeError,ValueError):hero_id=0
+            try:whose_id=int(data.get('userId') or data.get('whoseTurnUserId') or 0)
+            except (TypeError,ValueError):whose_id=0
+            if (not whose or not hero or whose.casefold()!=hero.casefold()) and hero_id and whose_id==hero_id:
+                whose=hero
             cached=self.pending_options_by_room.pop(room,None)
             if cached and now-float(cached.get('observed') or 0.0)<=3.0:
                 options=cached.get('options')

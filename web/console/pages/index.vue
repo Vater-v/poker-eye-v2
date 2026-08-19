@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ConsoleEvent, DeviceRow, LogMode, TableRow } from "~/composables/useConsole";
+import type { AutoPolicy, ConsoleEvent, DeviceRow, LogMode, TableRow } from "~/composables/useConsole";
 
 const {
   snapshot, events, run, health, error, tab, expanded, filter, paused,
@@ -8,6 +8,67 @@ const {
 
 const clock = ref("");
 const logBox = ref<HTMLElement | null>(null);
+const autoOpen = ref<Record<string, boolean>>({});
+const autoDraft = ref<Record<string, AutoPolicy>>({});
+const gradualLeave = ref<Record<string, boolean>>({});
+const BB_OPTIONS = [0.02, 0.05, 0.1, 0.2, 0.5, 1];
+
+function defaultPolicy(): AutoPolicy {
+  return {
+    enabled: false,
+    table_count: 5,
+    bb: 0.02,
+    watch_balance: true,
+    watch_players: true,
+    min_players: 3,
+    leave_below_bb: 79,
+    open_if_free_bb: 100,
+  };
+}
+
+function policyOf(device: DeviceRow): AutoPolicy {
+  return autoDraft.value[device.device_id] || device.automation?.policy || defaultPolicy();
+}
+
+function setDraft(device: DeviceRow, patch: Partial<AutoPolicy>) {
+  autoDraft.value = {
+    ...autoDraft.value,
+    [device.device_id]: { ...policyOf(device), ...patch },
+  };
+}
+
+async function toggleAutoPanel(device: DeviceRow, on: boolean) {
+  autoOpen.value = { ...autoOpen.value, [device.device_id]: on };
+  if (on && !autoDraft.value[device.device_id]) {
+    setDraft(device, { enabled: device.automation?.enabled || false });
+  }
+  if (!on && device.automation?.enabled) {
+    await control("device/auto", {
+      device_id: device.device_id,
+      policy: { ...policyOf(device), enabled: false },
+      apply: true,
+    });
+  }
+}
+
+async function saveAuto(device: DeviceRow, apply = false) {
+  const policy = { ...policyOf(device), enabled: apply ? true : (device.automation?.enabled || false) };
+  await control("device/auto", { device_id: device.device_id, policy, apply });
+  autoDraft.value = { ...autoDraft.value, [device.device_id]: policy };
+}
+
+async function cancelAuto(device: DeviceRow) {
+  const saved = device.automation?.policy || defaultPolicy();
+  autoDraft.value = { ...autoDraft.value, [device.device_id]: { ...saved } };
+  if (!saved.enabled) autoOpen.value = { ...autoOpen.value, [device.device_id]: false };
+}
+
+async function leaveAll(device: DeviceRow) {
+  const gradual = !!gradualLeave.value[device.device_id];
+  const label = gradual ? "Покинуть все столы постепенно (2–10 мин на стол)?" : "Покинуть все столы сразу?";
+  if (!confirm(label)) return;
+  await control("device/leave-all", { device_id: device.device_id, gradual });
+}
 onMounted(() => {
   const tick = () => { clock.value = new Date().toLocaleTimeString(); };
   tick();
@@ -247,12 +308,13 @@ const modes: Array<[LogMode, string]> = [
         <table class="w-full text-[12px] table-fixed">
           <thead class="bg-[#10141a] text-[#8b95a3] text-left sticky top-0">
             <tr>
-              <th class="px-3 py-2 font-medium w-[22%]">Устройство</th>
+              <th class="px-3 py-2 font-medium w-[20%]">Устройство</th>
+              <th class="px-3 py-2 font-medium w-[8%]">Auto</th>
               <th class="px-3 py-2 font-medium w-[10%]">Связь</th>
               <th class="px-3 py-2 font-medium w-[8%]">Столы</th>
-              <th class="px-3 py-2 font-medium w-[28%]">Руки</th>
-              <th class="px-3 py-2 font-medium w-[12%]">Fuel</th>
-              <th class="px-3 py-2 font-medium w-[20%]">Игры</th>
+              <th class="px-3 py-2 font-medium w-[26%]">Руки</th>
+              <th class="px-3 py-2 font-medium w-[10%]">Fuel</th>
+              <th class="px-3 py-2 font-medium w-[18%]">Игры</th>
             </tr>
           </thead>
           <tbody>
@@ -261,6 +323,12 @@ const modes: Array<[LogMode, string]> = [
                 <td class="px-3 py-2 min-w-0">
                   <div class="font-semibold truncate">{{ deviceName(d) }}</div>
                   <div class="text-[10px] text-[#8b95a3] font-mono truncate">{{ d.device_label || d.device_id }}</div>
+                </td>
+                <td class="px-3 py-2" @click.stop>
+                  <label class="inline-flex items-center gap-1 text-[11px]">
+                    <input type="checkbox" :checked="!!(autoOpen[d.device_id] || d.automation?.enabled)" @change="toggleAutoPanel(d, ($event.target as HTMLInputElement).checked)" />
+                    auto
+                  </label>
                 </td>
                 <td class="px-3 py-2">
                   <span class="uppercase tracking-wide text-[10px] font-bold" :class="d.connected ? 'text-[#53d18c]' : 'text-[#ff6b73]'">
@@ -272,8 +340,46 @@ const modes: Array<[LogMode, string]> = [
                 <td class="px-3 py-2 tabular-nums">{{ fmtFuel((d.tables || []).map(t => t.fuel_quantity).filter((n): n is number => n != null)[0]) }}</td>
                 <td class="px-3 py-2 text-[#c5ccd6] truncate">{{ games(d.tables || []) }}</td>
               </tr>
+              <tr v-if="autoOpen[d.device_id] || d.automation?.enabled">
+                <td colspan="7" class="bg-[#10151c] px-3 py-3 border-t border-[#1c232c]" @click.stop>
+                  <div class="flex flex-wrap items-end gap-3 text-[12px]">
+                    <label class="grid gap-1">
+                      <span class="text-[10px] text-[#8b95a3]">Столов</span>
+                      <input class="w-16 bg-[#0d1014] border border-[#262c35] rounded px-2 py-1" type="number" min="1" max="8"
+                        :value="policyOf(d).table_count" @input="setDraft(d, { table_count: Number(($event.target as HTMLInputElement).value) || 1 })" />
+                    </label>
+                    <label class="grid gap-1">
+                      <span class="text-[10px] text-[#8b95a3]">Лимит BB</span>
+                      <select class="bg-[#0d1014] border border-[#262c35] rounded px-2 py-1"
+                        :value="policyOf(d).bb" @change="setDraft(d, { bb: Number(($event.target as HTMLSelectElement).value) })">
+                        <option v-for="bb in (d.automation?.catalog_bb || BB_OPTIONS)" :key="bb" :value="bb">{{ bb }}</option>
+                      </select>
+                    </label>
+                    <label class="flex items-center gap-2 py-1">
+                      <input type="checkbox" :checked="policyOf(d).watch_balance" @change="setDraft(d, { watch_balance: ($event.target as HTMLInputElement).checked })" />
+                      баланс: выйти &lt; 79BB, сесть если &gt; 100BB свободно
+                    </label>
+                    <label class="flex items-center gap-2 py-1">
+                      <input type="checkbox" :checked="policyOf(d).watch_players" @change="setDraft(d, { watch_players: ($event.target as HTMLInputElement).checked })" />
+                      игроки: выйти если &lt; 3 включая hero
+                    </label>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2 mt-3 text-[12px]">
+                    <button class="px-2 py-1 rounded border border-[#2c3644] hover:border-[#70a7ff]" @click="saveAuto(d, false)">Сохранить</button>
+                    <button class="px-2 py-1 rounded border border-[#2c3644] hover:border-[#53d18c]" @click="saveAuto(d, true)">Применить</button>
+                    <button class="px-2 py-1 rounded border border-[#2c3644]" @click="cancelAuto(d)">Отмена</button>
+                    <span class="text-[11px] text-[#8b95a3]">{{ d.automation?.status || "idle" }}<span v-if="d.automation?.wallet_bb != null"> · кошелёк {{ d.automation.wallet_bb }} BB</span></span>
+                    <div class="flex-1" />
+                    <label v-if="(d.tables || []).length" class="flex items-center gap-1 text-[11px] text-[#8b95a3]">
+                      <input type="checkbox" :checked="!!gradualLeave[d.device_id]" @change="gradualLeave = { ...gradualLeave, [d.device_id]: ($event.target as HTMLInputElement).checked }" />
+                      постепенно
+                    </label>
+                    <button v-if="(d.tables || []).length" class="px-2 py-1 rounded border border-[#2c3644] hover:border-[#ff6b73]" @click="leaveAll(d)">Покинуть все столы</button>
+                  </div>
+                </td>
+              </tr>
               <tr v-if="expanded === d.device_id">
-                <td colspan="6" class="bg-[#0c1015] px-3 py-2">
+                <td colspan="7" class="bg-[#0c1015] px-3 py-2">
                   <div v-if="!(d.tables || []).length" class="text-[#8b95a3] text-[12px] py-2">Нет живых столов на этом устройстве.</div>
                   <div v-for="t in d.tables || []" :key="t.table_id" class="grid grid-cols-1 xl:grid-cols-[220px_1fr_auto] gap-3 items-start py-3 border-t border-[#1c232c] first:border-0">
                     <div>

@@ -48,6 +48,29 @@ export type TableRow = {
   hero_seat?: number;
 };
 
+export type AutoPolicy = {
+  enabled: boolean;
+  table_count: number;
+  bb: number;
+  watch_balance: boolean;
+  watch_players: boolean;
+  min_players: number;
+  leave_below_bb: number;
+  open_if_free_bb: number;
+};
+
+export type AutomationState = {
+  enabled?: boolean;
+  policy?: AutoPolicy;
+  status?: string;
+  wallet_cash?: number | null;
+  wallet_bb?: number | null;
+  catalog_bb?: number[];
+  joining?: boolean;
+  gradual_leave?: number;
+  sitout_tables?: number[];
+};
+
 export type DeviceRow = {
   device_id: string;
   device_label: string;
@@ -59,6 +82,7 @@ export type DeviceRow = {
   hands_by_type?: Record<string, number>;
   session_hands?: string;
   tables: TableRow[];
+  automation?: AutomationState;
 };
 
 export type Snapshot = {

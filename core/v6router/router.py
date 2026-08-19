@@ -1507,6 +1507,7 @@ class DeviceIngressRouter:
         navigation_handler: Optional[
             Callable[[dict[str, Any]], dict[str, Any]]
         ] = None,
+        automation: Any = None,
     ) -> None:
         if int(startup_max_attempts) < 1:
             raise ValueError("startup_max_attempts must be positive")
@@ -1570,6 +1571,10 @@ class DeviceIngressRouter:
         # One player/device arbiter; per-table backend hint computation remains parallel.
         self._action_arbiter = action_arbiter or ActionArbiter(self.device_id)
         self._navigation_handler = navigation_handler
+        self.automation = automation
+        if self.automation is not None and self._navigation_handler is None:
+            self._navigation_handler = self.automation.handle
+        self._watchdog_task: Optional[asyncio.Task[Any]] = None
         # Unsupported table policy is per physical-device session.  A table that
         # advertises/enters any DOUBLE BOARD variant is never leased again during
         # this router lifetime.  Exit commands remain independent from business.
@@ -1579,6 +1584,17 @@ class DeviceIngressRouter:
         self._unsupported_close_tasks: dict[int, asyncio.Task[Any]] = {}
         self._forced_sequence = 0
         self._closed = False
+
+    def start_watchdog(self) -> None:
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._watchdog_task = loop.create_task(
+            self._watchdog_loop(), name=f"auto-watch-{self.device_id}"
+        )
 
     def _navigation_decision(self, event: dict[str, Any]) -> dict[str, Any]:
         if self._navigation_handler is None:
@@ -2165,6 +2181,123 @@ class DeviceIngressRouter:
     def unsupported_table_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self._unsupported_tables))
 
+    async def _watchdog_loop(self) -> None:
+        try:
+            while not self._closed:
+                await asyncio.sleep(2.0)
+                await self._watchdog_tick()
+        except asyncio.CancelledError:
+            return
+
+    async def _watchdog_tick(self) -> None:
+        auto = self.automation
+        if auto is None:
+            return
+        async with self._lock:
+            live = [int(table_id) for table_id in self._sessions]
+            seated = []
+            for table_id, slot in self._sessions.items():
+                session = slot.session
+                if not isinstance(session, LiveTableSession):
+                    continue
+                bridge = session._bridge
+                players = 0
+                stack_bb = 0.0
+                sitout = False
+                try:
+                    snap = session._snapshot()
+                    coin_bb = float(snap.coin_bb or 0.0)
+                    seats = getattr(bridge, "seat_map", {}) or {}
+                    players = len([row for row in seats.values() if isinstance(row, dict) and (row.get("userId") or row.get("userName"))])
+                    hero_id = int(bridge.state.get("user_id") or 0)
+                    hero_name = str(bridge.state.get("user_name") or "")
+                    hero_row = None
+                    for row in seats.values():
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            uid = int(row.get("userId") or 0)
+                        except (TypeError, ValueError):
+                            uid = 0
+                        if (hero_id and uid == hero_id) or (hero_name and str(row.get("userName") or "") == hero_name):
+                            hero_row = row
+                            break
+                    if hero_row is not None and coin_bb > 0:
+                        try:
+                            stack_bb = float(hero_row.get("userChips") or 0.0) / coin_bb
+                        except (TypeError, ValueError):
+                            stack_bb = 0.0
+                    sitting_out = bool(getattr(bridge, "hero_sitting_out", False))
+                    is_playing = True
+                    if hero_row is not None:
+                        is_playing = hero_row.get("isPlaying") is True
+                    sitout = sitting_out or (
+                        bool(getattr(bridge, "hero_sitting", False))
+                        and not is_playing
+                        and not getattr(bridge, "current_hand", None)
+                        and int(getattr(bridge, "cc_miss_streak", 0) or 0) > 0
+                    )
+                    auto.mark_stack(int(table_id), stack_bb, players, bool(getattr(bridge, "hero_sitting", False)))
+                    auto.mark_sitout(int(table_id), sitout)
+                    if sitout:
+                        seated.append(int(table_id))
+                    elif getattr(bridge, "hero_sitting", False):
+                        seated.append(int(table_id))
+                    streak = int(getattr(bridge, "cc_miss_streak", 0) or 0)
+                    if streak >= 3:
+                        self._queue_policy_leave_locked(
+                            int(table_id),
+                            room=int(bridge.context_hook_room or bridge.active_hook_room or 0),
+                            ws_id=str(self.game_ws_for(int(table_id))),
+                            kind="cc_streak",
+                            reason="PokerEYE silent 3 hands",
+                        )
+                except Exception:
+                    continue
+            auto.tick(seated_tables=len(seated), live_table_ids=live)
+            for table_id, reason in auto.drain_leaves():
+                slot = self._sessions.get(int(table_id))
+                session = slot.session if slot is not None else None
+                room = 0
+                ws_id = ""
+                if isinstance(session, LiveTableSession):
+                    room = int(session._bridge.context_hook_room or session._bridge.active_hook_room or 0)
+                    ws_id = str(auto.game_ws.get(int(table_id)) or "")
+                self._queue_policy_leave_locked(int(table_id), room=room, ws_id=ws_id, kind="policy", reason=reason)
+
+    def game_ws_for(self, table_id: int) -> str:
+        owners = [ws for ws, tables in self._ws_to_tables.items() if int(table_id) in tables]
+        return owners[0] if len(owners) == 1 else ""
+
+    def _queue_policy_leave_locked(
+        self, table_id: int, *, room: int, ws_id: str, kind: str, reason: str,
+    ) -> None:
+        if int(table_id) in self._unsupported_exit:
+            return
+        event = {"id": f"auto-leave-{table_id}", "ws_id": ws_id}
+        routed = RoutedEvent(
+            event=event, payload=None, raw=b"", command="game.leave_Seat",
+            direction="out", room_id=int(room) or None, table_ids=(int(table_id),),
+            websocket_id=str(ws_id or ""), data={},
+        )
+        self._ensure_unsupported_exit_locked(
+            int(table_id), routed, reset=True, exit_kind=str(kind or "policy"),
+            detail={"reason": reason},
+        )
+        self._action_arbiter.cancel_table(int(table_id), "POLICY_LEAVE")
+        if table_id not in self._unsupported_close_tasks:
+            self._unsupported_close_tasks[int(table_id)] = asyncio.create_task(
+                self._close_unsupported_after(int(table_id)),
+                name=f"policy-close-{self.device_id}-{table_id}",
+            )
+        self._sink(
+            RouterObservation(
+                "automation_leave", self.device_id, int(table_id), status="yellow",
+                reason=str(reason or "policy leave"),
+                detail={"kind": kind, "reason": reason},
+            )
+        )
+
     def _ensure_unsupported_exit_locked(
         self, table_id: int, routed: RoutedEvent, *, reset: bool = False,
         exit_kind: str = "unsupported", detail: Optional[dict[str, Any]] = None,
@@ -2269,7 +2402,11 @@ class DeviceIngressRouter:
                 reason = (
                     "low stack below 79 BB"
                     if kind == "low_stack"
-                    else "DOUBLE BOARD unsupported table"
+                    else (
+                        str((state.get("detail") or {}).get("reason") or "automation leave")
+                        if kind in {"policy", "cc_streak", "sitout", "short_table"}
+                        else "DOUBLE BOARD unsupported table"
+                    )
                 )
                 await self.close_table(int(table_id), reason=reason)
         except asyncio.CancelledError:
@@ -2813,9 +2950,11 @@ class DeviceIngressRouter:
         task = self._unsupported_close_tasks.get(int(table_id))
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
+        auto = self.automation
         async with self._lock:
             forced_state = self._unsupported_exit.get(int(table_id))
-            if forced_state and str(forced_state.get("kind") or "") == "low_stack":
+            kind = str((forced_state or {}).get("kind") or "")
+            if kind in {"low_stack", "policy", "cc_streak", "sitout", "short_table"}:
                 self._unsupported_exit.pop(int(table_id), None)
             slot = self._sessions.pop(int(table_id), None)
             if slot is None:
@@ -2856,6 +2995,8 @@ class DeviceIngressRouter:
                     reason=reason,
                 )
             )
+        if auto is not None:
+            auto.note_table_closed(int(table_id), str(reason or ""))
         async with self._lock:
             if int(table_id) in self._closing_tables:
                 self._schedule_tombstone_clear_locked(int(table_id))
@@ -3005,10 +3146,12 @@ class DeviceIngressRouter:
                     hero_seat=int(bridge.state.get("hero_seat") or 0),
                 )
             tables.append(row)
+        auto = self.automation.snapshot() if self.automation is not None else {}
         return {
             "device_id": self.device_id,
             "hero_name": hero_name,
             "tables": tables,
+            "automation": auto,
         }
 
     async def wait_table_ready(self, table_id: int, timeout: float = 5.0) -> TableSession:
@@ -3029,6 +3172,10 @@ class DeviceIngressRouter:
         if self._closed:
             return
         self._closed = True
+        task = self._watchdog_task
+        self._watchdog_task = None
+        if task is not None:
+            task.cancel()
         server = self._server
         self._server = None
         if server is not None:

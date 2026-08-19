@@ -56,6 +56,40 @@ def build_extension_packet(command:str, room_id:int, data:Optional[Dict[str,Any]
     }
     return encode_packet(root)
 
+def json_wire_number(value:float|int):
+    number=float(value)
+    if abs(number-round(number))<1e-9:
+        return int(round(number))
+    text=f"{number:.8f}".rstrip("0").rstrip(".")
+    if "." in text:
+        return float(text)
+    return int(text)
+
+def build_lobby_join_game_packet(*,config_id:int,big_blind:float,buyin:float,mini_game_type:int=1,coin_type:int=1)->bytes:
+    data={
+        "buyInAmount":json_wire_number(buyin),
+        "configId":int(config_id),
+        "gameType":"Ring",
+        "bigblind":json_wire_number(big_blind),
+        "miniGameType":int(mini_game_type),
+        "coinType":int(coin_type),
+    }
+    return build_extension_packet("lobby.join_game",-1,data)
+
+def build_game_reserve_seat_packet(room_id:int,seat_id:int,*,reserve:bool=True)->bytes:
+    return build_extension_packet(
+        "game.reserve_Seat",
+        room_id,
+        {"seatId":int(seat_id),"reserveAnySeat":False,"reserve":bool(reserve)},
+    )
+
+def build_game_take_seat_packet(room_id:int,seat_id:int,buyin:float)->bytes:
+    return build_extension_packet(
+        "game.take_Seat",
+        room_id,
+        {"seatId":int(seat_id),"buyinAmount":json_wire_number(buyin)},
+    )
+
 def build_game_leave_seat_packet(room_id:int)->bytes:
     return build_extension_packet('game.leave_Seat',room_id)
 

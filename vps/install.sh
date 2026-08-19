@@ -101,9 +101,9 @@ token=sys.argv[1]
 url="http://127.0.0.1:19100/health?token=" + token
 with urllib.request.urlopen(url, timeout=4) as r:
     data=json.load(r)
-if data.get("web") != "console-nuxt-v5":
+if data.get("web") != "console-nuxt-v6":
     raise SystemExit(f"[ERROR] wrong web runtime after restart: {data!r}")
-print("[OK] Web runtime: console-nuxt-v5")
+print("[OK] Web runtime: console-nuxt-v6")
 PY
 
 echo

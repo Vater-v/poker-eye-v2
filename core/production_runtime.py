@@ -32,6 +32,7 @@ from .logging import SessionLogger
 from .coin_capture import RawCoinCaptureManager
 from .v6router.accounts import AccountPool
 from .v6router.action_arbiter import ActionArbiter
+from .v6router.automation import AutomationStore
 from .v6router.router import (
     DeviceIngressRouter,
     LiveTableSession,
@@ -918,6 +919,23 @@ class OperatorConsole:
                     "operator.action_cancelled", severity="WARN",
                     device_id=device, table_id=table, reason=detail.get("reason"),
                 )
+            elif tag == "sitout_detected":
+                self._line(
+                    f"{label}: ситаут — выходим и сядем снова по правилам auto",
+                    "operator.sitout", severity="WARN",
+                    device_id=device, table_id=table,
+                )
+            elif tag == "cc_streak_standup":
+                self._line(
+                    f"{label}: PokerEYE молчит 3 руки подряд — встаём",
+                    "operator.cc_streak_standup", severity="ERROR",
+                    device_id=device, table_id=table, streak=detail.get("streak"),
+                )
+                self.logger.error(
+                    "cc_streak_standup",
+                    message="PokerEYE produced no CC for 3 consecutive hero hands",
+                    device_id=device, table_id=table, streak=detail.get("streak"),
+                )
             elif tag == "cc_timeout":
                 self._line(
                     f"{label}: ⚠ PokerEYE не ответил — включаем CHECK/FOLD страховку",
@@ -1029,6 +1047,13 @@ class OperatorConsole:
             self.technical("forced_exit.stage", device_id=device, table_id=table or None, kind=kind, **detail)
         elif kind == "error":
             self._line(f"{label}: ошибка — {_short(observation.reason, 120)}", "operator.error", severity="ERROR", device_id=device, table_id=table or None)
+        elif str(kind).startswith("automation"):
+            self._line(
+                f"{label}: {_short(observation.reason, 160)}",
+                f"operator.{kind}",
+                severity="WARN" if str(observation.status).lower() == "yellow" else "INFO",
+                device_id=device, table_id=table or None,
+            )
 
 class RouterService:
     """Own the exact v6 device routers on one asyncio thread."""
@@ -1077,6 +1102,7 @@ class RouterService:
         self._last_seen: dict[str, float] = {}
         self._device_labels: dict[str, str] = {}
         self.fleet_provider = None
+        self.automation_store = AutomationStore()
         self._reaper = asyncio.run_coroutine_threadsafe(self._reaper_loop(), self.loop)
 
     def _run(self) -> None:
@@ -1086,6 +1112,21 @@ class RouterService:
     async def _router(self, device_id: str) -> DeviceIngressRouter:
         router = self._routers.get(device_id)
         if router is None:
+            from .v6router.automation import DeviceAutomation
+
+            automation = DeviceAutomation(
+                device_id,
+                store=self.automation_store,
+                sink=lambda event, text="", severity="INFO": self.observation_sink(
+                    RouterObservation(
+                        kind=str(event),
+                        device_id=device_id,
+                        status="green" if severity == "INFO" else "yellow",
+                        reason=str(text or ""),
+                        detail={"automation": True},
+                    )
+                ),
+            )
             router = DeviceIngressRouter(
                 device_id,
                 self.factory,
@@ -1106,8 +1147,10 @@ class RouterService:
                 startup_backoff_max=1.0,
                 startup_attempt_timeout=35.0,
                 startup_stale_seconds=90.0,
+                automation=automation,
             )
             self._routers[device_id] = router
+            router.start_watchdog()
         return router
 
     async def _handle(self, device_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1300,6 +1343,39 @@ class RouterService:
         )
         return bool(future.result(timeout=8.0))
 
+    async def _control_auto(self, device_id: str, policy: dict[str, Any], *, apply: bool) -> dict[str, Any]:
+        router = await self._router(str(device_id))
+        auto = router.automation
+        if auto is None:
+            return {"ok": False, "error": "no automation"}
+        enable = True if apply else policy.get("enabled")
+        saved = auto.apply_policy(policy, enable=enable if apply or "enabled" in policy else None)
+        if apply:
+            await router._watchdog_tick()
+        return {"ok": True, "policy": saved.public(), "automation": auto.snapshot()}
+
+    def control_auto(self, device_id: str, policy: dict[str, Any], *, apply: bool = False) -> dict[str, Any]:
+        future = asyncio.run_coroutine_threadsafe(
+            self._control_auto(device_id, dict(policy or {}), apply=apply), self.loop
+        )
+        return dict(future.result(timeout=5.0))
+
+    async def _control_leave_all(self, device_id: str, *, gradual: bool) -> dict[str, Any]:
+        router = self._routers.get(str(device_id))
+        if router is None or router.automation is None:
+            return {"ok": False, "error": "device offline"}
+        async with router._lock:
+            table_ids = [int(table_id) for table_id in router._sessions]
+        queued = router.automation.schedule_leave_all(table_ids, gradual=gradual)
+        await router._watchdog_tick()
+        return {"ok": True, "queued": queued, "gradual": bool(gradual)}
+
+    def control_leave_all(self, device_id: str, *, gradual: bool = False) -> dict[str, Any]:
+        future = asyncio.run_coroutine_threadsafe(
+            self._control_leave_all(device_id, gradual=gradual), self.loop
+        )
+        return dict(future.result(timeout=5.0))
+
     async def _close_all(self) -> None:
         routers = list(self._routers.values())
         self._routers.clear()
@@ -1392,6 +1468,21 @@ class TrainerControlServer:
                         ok = owner.router_service.control_reset_device(
                             str(body.get("device_id") or "")
                         )
+                    elif path == "/device/auto":
+                        value = owner.router_service.control_auto(
+                            str(body.get("device_id") or ""),
+                            dict(body.get("policy") or body),
+                            apply=bool(body.get("apply")),
+                        )
+                        self._reply(200 if value.get("ok") else 404, value)
+                        return
+                    elif path == "/device/leave-all":
+                        value = owner.router_service.control_leave_all(
+                            str(body.get("device_id") or ""),
+                            gradual=bool(body.get("gradual")),
+                        )
+                        self._reply(200 if value.get("ok") else 404, value)
+                        return
                     else:
                         self._reply(404, {"ok": False, "error": "not_found"})
                         return

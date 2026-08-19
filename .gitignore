@@ -14,6 +14,7 @@ secrets/
 config.local.toml
 config/*.local.*
 config/backend_accounts.local.json
+config/device_automation.json
 *.agent
 *.token
 *.jsonl

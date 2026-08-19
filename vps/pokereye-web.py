@@ -20,7 +20,7 @@ CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 19101
 HOST = "127.0.0.1"
 PORT = 19100
-WEB_ID = "console-nuxt-v5"
+WEB_ID = "console-nuxt-v6"
 
 
 def token_value() -> str:
@@ -252,6 +252,10 @@ class Handler(BaseHTTPRequestHandler):
             "/pokereye/api/control/table/restart": "/table/restart",
             "/api/control/device/reset": "/device/reset",
             "/pokereye/api/control/device/reset": "/device/reset",
+            "/api/control/device/auto": "/device/auto",
+            "/pokereye/api/control/device/auto": "/device/auto",
+            "/api/control/device/leave-all": "/device/leave-all",
+            "/pokereye/api/control/device/leave-all": "/device/leave-all",
         }
         target = mapping.get(path)
         if target is None:

@@ -219,6 +219,24 @@ class LiveCoinBridge:
         self.last_eye_rx=time.monotonic(); self.last_hook_rx=time.monotonic()
         self._prefold_config=None
         self._prefold_config_loaded=False
+        self.cc_miss_streak=0
+        self._hand_cc_failed=False
+        self._hero_turn_this_hand=False
+        self.hero_sitting_out=False
+
+    def _is_hero_turn(self, data: dict) -> bool:
+        """Hero turn is the Coin actor matching login name or numeric uid."""
+        if not isinstance(data, dict):
+            return False
+        hero_name=str(self.state.get("user_name") or self.identity.get("user_name") or "").strip()
+        whose=str(data.get("whoseTurn") or data.get("userName") or "").strip()
+        if hero_name and whose and whose.casefold()==hero_name.casefold():
+            return True
+        try:hero_id=int(self.state.get("user_id") or self.identity.get("user_id") or 0)
+        except (TypeError,ValueError):hero_id=0
+        try:whose_id=int(data.get("userId") or data.get("whoseTurnUserId") or 0)
+        except (TypeError,ValueError):whose_id=0
+        return bool(hero_id and whose_id and hero_id==whose_id)
 
     def _hand_in_progress(self) -> bool:
         """True while Coin still has us in the current hand.
@@ -1195,6 +1213,22 @@ class LiveCoinBridge:
                         continue
                     await self.eye_send_cmd("pb.SitDownBRC",b._sitdown_brc(z,wait_blind=False,in_game=bool(z.get("isPlaying"))))
                     self.announced_seats[seat]=zu; log("SEAT",f"seat={seat} uid={zu} {z.get('userName','')} joined")
+        hero_row=next((row for row in new.values() if int(row.get("userId") or 0)==hero_id),None)
+        sitout_flag=False
+        if hero_row:
+            flag=hero_row.get("isSittingOut") or hero_row.get("sittingOut") or hero_row.get("sitOut")
+            sitout_flag=flag is True or str(flag).lower() in {"true","1"}
+            playing=hero_row.get("isPlaying") is True
+            if sitout_flag or (self.hero_sitting and self.wait_blind_cancelled and not playing and not self.current_hand and self.cc_miss_streak>0):
+                if not self.hero_sitting_out:
+                    self._diagnostic("sitout_detected","hero is sitting out of hands",{
+                        "isPlaying":playing,"flag":sitout_flag,"streak":self.cc_miss_streak,
+                    })
+                self.hero_sitting_out=True
+            else:
+                self.hero_sitting_out=False
+        else:
+            self.hero_sitting_out=False
 
     def _cancel_leave_timeout(self):
         task=self.leave_timeout_task; self.leave_timeout_task=None
@@ -1826,6 +1860,7 @@ class LiveCoinBridge:
                 message=f"timeout {timeout_s:.1f}s; PokerEYE produced no CC"
                 log("CC",message)
                 snapshot=self._error_snapshot(reason="CC_TIMEOUT")
+                self._hand_cc_failed=True
                 self._diagnostic("cc_timeout",message,{
                     "timeout_s":timeout_s,
                     "telemetry":snapshot,
@@ -1863,6 +1898,8 @@ class LiveCoinBridge:
                 mapping=self._quantize_pending_cc_amount(d,profile)
                 log("CC",msg+(f"; {mapping}" if mapping else ""))
                 pending=dict(self.autoplay.pending or {})
+                self._hand_cc_failed=False
+                self.cc_miss_streak=0
                 self._diagnostic("action_ready","PokerEYE action mapped and queued for device arbiter",{
                     "action":str(pending.get("action") or ""),
                     "amount":pending.get("display_amount"),
@@ -1878,6 +1915,7 @@ class LiveCoinBridge:
                 message=f"cannot map action; pending cancelled: {e}"
                 snapshot=self._error_snapshot(reason="CC_MAPPING_ERROR")
                 log("CC",message)
+                self._hand_cc_failed=True
                 self._diagnostic("cc_mapping_error",message,{"telemetry":snapshot})
                 try:
                     fb=self.autoplay.schedule_failsafe(self.state,reason="CC_MAPPING_ERROR")
@@ -2155,6 +2193,22 @@ class LiveCoinBridge:
                 self.winner_fragments_seen.clear(); self.winner_pot_gross={}; self.winner_rsp_sent=False; self.show_hole_cards={}; self.show_hand_sent=False; self.is_doing_evchop=False
                 self.rabbit_cards=[]; self.rabbit_second_board=[]; self.rabbit_finish_stage=None
                 log("RESULT","hand reset; next hero hand will rebuild DealerInfo/positions/cards")
+                if self._hero_turn_this_hand and self._hand_cc_failed:
+                    self.cc_miss_streak=int(self.cc_miss_streak or 0)+1
+                    self._diagnostic("cc_miss_hand",f"PokerEYE silent hand streak={self.cc_miss_streak}",{
+                        "streak":self.cc_miss_streak,
+                    })
+                    if self.cc_miss_streak>=3:
+                        self._diagnostic(
+                            "cc_streak_standup",
+                            "PokerEYE silent 3 hands; standup and leave",
+                            {"streak":self.cc_miss_streak},
+                        )
+                        self.hero_departing=True
+                elif self._hero_turn_this_hand:
+                    self.cc_miss_streak=0
+                self._hero_turn_this_hand=False
+                self._hand_cc_failed=False
                 if self.deferred_seat_snapshot is not None:
                     snap=self.deferred_seat_snapshot; self.deferred_seat_snapshot=None
                     await self.apply_seat_snapshot(snap)
@@ -2596,7 +2650,8 @@ class LiveCoinBridge:
 
         if cmd=="game.user_turn" and isinstance(data,dict):
             whose=str(data.get("whoseTurn") or "")
-            if whose and whose==self.state.get("user_name"):
+            if self._is_hero_turn(data):
+                self._hero_turn_this_hand=True
                 if event.get("_hmuriy_duplicate_turn"):
                     self._diagnostic(
                         "turn_refresh",
