@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hmac
 import inspect
+import os
 import secrets
 import socket
 import threading
@@ -102,6 +103,32 @@ class BootstrapServer:
         self._callback_connections: Dict[int, set[socket.socket]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._thread_lock = threading.Lock()
+        self._threads: set[threading.Thread] = set()
+
+    def _spawn(self, target, *args, name: str) -> threading.Thread:
+        """Start a tracked daemon and remove it from the registry on exit."""
+        def runner() -> None:
+            try:
+                target(*args)
+            finally:
+                with self._thread_lock:
+                    self._threads.discard(threading.current_thread())
+
+        thread = threading.Thread(target=runner, daemon=True, name=name)
+        with self._thread_lock:
+            self._threads.add(thread)
+        thread.start()
+        return thread
+
+    @staticmethod
+    def _configure_listener(sock: socket.socket) -> None:
+        # Windows production listeners must have one owner.  POSIX test/restart
+        # listeners need SO_REUSEADDR to rebind after a clean close.
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     def _emit(self, event: str, **fields: Any) -> None:
         if self.on_event:
@@ -111,12 +138,13 @@ class BootstrapServer:
                 pass
 
     def start(self) -> int:
+        self._stop.clear()
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._configure_listener(self._server)
         self._server.bind((self.host, self.bootstrap_port))
         self._server.listen(128)
         self.bootstrap_port = self._server.getsockname()[1]
-        threading.Thread(target=self._accept_bootstrap, daemon=True, name="bootstrap-accept").start()
+        self._spawn(self._accept_bootstrap, name="bootstrap-accept")
         self._emit("bootstrap.listening", port=self.bootstrap_port, callback_start=self.allocator.start,
                    callback_end=self.allocator.end)
         return self.bootstrap_port
@@ -131,7 +159,7 @@ class BootstrapServer:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle_bootstrap, args=(conn, addr), daemon=True).start()
+            self._spawn(self._handle_bootstrap, conn, addr, name="bootstrap-client")
 
     def _handle_bootstrap(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
         device_id = None
@@ -213,7 +241,7 @@ class BootstrapServer:
                 return
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._configure_listener(sock)
                 sock.bind((self.host, lease.callback_port))
                 sock.listen(16)
             except BaseException:
@@ -224,8 +252,9 @@ class BootstrapServer:
                 raise
             self._callback_servers[lease.callback_port] = sock
             self._callback_connections.setdefault(lease.callback_port, set())
-        threading.Thread(target=self._accept_callback, args=(sock, lease), daemon=True,
-                         name=f"callback-{lease.callback_port}").start()
+        self._spawn(
+            self._accept_callback, sock, lease, name=f"callback-{lease.callback_port}"
+        )
 
     def _accept_callback(self, server: socket.socket, lease: CallbackLease) -> None:
         server.settimeout(.2)
@@ -238,7 +267,10 @@ class BootstrapServer:
                 return
             with self._lock:
                 self._callback_connections.setdefault(lease.callback_port, set()).add(conn)
-            threading.Thread(target=self._handle_callback, args=(conn, addr, lease), daemon=True).start()
+            self._spawn(
+                self._handle_callback, conn, addr, lease,
+                name=f"callback-client-{lease.callback_port}",
+            )
 
     def _handle_callback(self, conn: socket.socket, addr: Tuple[str, int], lease: CallbackLease) -> None:
         authenticated = False
@@ -315,9 +347,14 @@ class BootstrapServer:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._server:
+        server, self._server = self._server, None
+        if server is not None:
             try:
-                self._server.close()
+                server.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                server.close()
             except OSError:
                 pass
         with self._lock:
@@ -327,6 +364,10 @@ class BootstrapServer:
             self._callback_servers.clear()
             self._callback_connections.clear()
         for sock in listeners:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 sock.close()
             except OSError:
@@ -342,3 +383,17 @@ class BootstrapServer:
                 pass
         for lease in leases:
             self.allocator.release(lease.device_id, lease.generation)
+
+        # Deterministic shutdown prevents the next test/process from racing an
+        # old accept/handler thread that still owns the callback port.
+        deadline = __import__("time").monotonic() + 2.0
+        while True:
+            with self._thread_lock:
+                threads = [t for t in self._threads if t is not threading.current_thread()]
+            if not threads:
+                break
+            remaining = deadline - __import__("time").monotonic()
+            if remaining <= 0:
+                break
+            for thread in threads:
+                thread.join(min(0.2, remaining))

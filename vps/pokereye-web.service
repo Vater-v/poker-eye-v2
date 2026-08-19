@@ -1,0 +1,21 @@
+[Unit]
+Description=PokerEye token-protected log web
+After=pokereye.service
+
+[Service]
+Type=simple
+User=pokereye
+Group=pokereye
+WorkingDirectory=/opt/pokereye
+Environment=POKEREYE_ROOT=/opt/pokereye
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/pokereye/vps/pokereye-web.py
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

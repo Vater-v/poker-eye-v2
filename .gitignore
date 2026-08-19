@@ -1,6 +1,11 @@
 .dist/
 coin/
 *.apk
+*.zip
+web/console/node_modules/
+web/console/.nuxt/
+web/console/.output/
+web/console/dist
 *.apks
 *.aab
 *.keystore
@@ -25,3 +30,5 @@ inject_classes_dex.py
 __pycache__/
 .pytest_cache/
 .venv/
+.deploy-backup/
+audit-output/

@@ -96,8 +96,16 @@ class SessionLogger:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.run_events = _JsonlWriter(self.directory / "events.jsonl")
         self.operator_path = self.directory / "operator.txt"
+        self.technical_path = self.directory / "technical.log"
+        self.error_path = self.directory / "error.log"
+        # Create the canonical files immediately.  Monitoring and tests must not
+        # interpret a quiet run as a missing/broken logging pipeline.
+        for path in (self.operator_path, self.technical_path, self.error_path):
+            path.touch(exist_ok=True)
         self.manifest_path = self.directory / "manifest.json"
         self._operator_lock = threading.Lock()
+        self._technical_lock = threading.Lock()
+        self._error_lock = threading.Lock()
         self._closed = False
         self._devices: dict[str, DeviceLogger] = {}
         self._device_lock = threading.Lock()
@@ -126,7 +134,7 @@ class SessionLogger:
 
     # ---- emit (run-scoped) -----------------------------------------------
     def emit(self, event: str, *, severity: str = "INFO", message: str | None = None,
-             flush: bool = False, **fields: Any) -> dict[str, Any]:
+             operator: bool = False, flush: bool = False, **fields: Any) -> dict[str, Any]:
         record = {"schema_version": 1, "ts": datetime.now(timezone.utc).isoformat(),
                   "event": event, "severity": severity, "run_id": self.run_id,
                   **{k: v for k, v in fields.items() if v is not None}}
@@ -135,12 +143,58 @@ class SessionLogger:
             raise RuntimeError("session logger is closed")
         flush_io = flush or severity in {"WARN", "ERROR"}
         self.run_events.write(record, flush=flush_io)
-        with self._operator_lock:
-            with self.operator_path.open("a", encoding="utf-8", newline="\n") as fh:
-                fh.write(f"{record['ts']} [{severity}] {text}\n")
+        # Every event has a compact plain-text technical twin, but the operator
+        # file is reserved strictly for the same human Russian lines shown in console.
+        with self._technical_lock:
+            with self.technical_path.open("a", encoding="utf-8", newline="\n") as fh:
+                field_text = " ".join(
+                    f"{k}={json.dumps(v, ensure_ascii=False, default=str)}"
+                    for k, v in fields.items() if v is not None
+                )
+                fh.write(f"{record['ts']} [{severity}] {event}{(' ' + field_text) if field_text else ''}\n")
                 if flush_io:
                     fh.flush()
                     os.fsync(fh.fileno())
+        # A supplied human-readable message is operator-facing by definition.
+        if operator or message is not None:
+            with self._operator_lock:
+                with self.operator_path.open("a", encoding="utf-8", newline="\n") as fh:
+                    fh.write(f"{record['ts']} {text}\n")
+                    if flush_io:
+                        fh.flush()
+                        os.fsync(fh.fileno())
+        return record
+
+    def error(self, event: str, *, message: str = "", **fields: Any) -> dict[str, Any]:
+        """Append one self-contained diagnostic incident beside the session logs.
+
+        ``error.log`` is intentionally line-delimited JSON.  It contains enough
+        state to diagnose a missed/failed action without scraping console output;
+        raw Coin bytes remain in the always-on PCAP instead of being duplicated here.
+        """
+        record = {
+            "schema_version": 1,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": str(event),
+            "run_id": self.run_id,
+            "message": str(message or ""),
+            **{k: v for k, v in fields.items() if v is not None},
+        }
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
+        with self._error_lock:
+            with self.error_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+        # Keep the canonical structured event stream in sync with the incident file.
+        self.run_events.write({
+            "schema_version": 1,
+            "ts": record["ts"],
+            "event": f"error.{event}",
+            "severity": "ERROR",
+            "run_id": self.run_id,
+            **{k: v for k, v in fields.items() if v is not None},
+        }, flush=True)
         return record
 
     # ---- close -----------------------------------------------------------

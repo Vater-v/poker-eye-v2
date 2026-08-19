@@ -10,11 +10,14 @@ class FakeEyeServer:
 
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(1)
         self.port = self.sock.getsockname()[1]
         self.received = []
         self._stop = threading.Event()
+        self._connections = set()
+        self._connection_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -27,7 +30,13 @@ class FakeEyeServer:
                 continue
             except OSError:
                 return
-            self._serve(conn)
+            with self._connection_lock:
+                self._connections.add(conn)
+            try:
+                self._serve(conn)
+            finally:
+                with self._connection_lock:
+                    self._connections.discard(conn)
 
     def _serve(self, conn):
         try:
@@ -61,6 +70,18 @@ class FakeEyeServer:
             self.sock.close()
         except OSError:
             pass
+        with self._connection_lock:
+            connections = list(self._connections)
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        self.thread.join(timeout=1.0)
 
 
 class EyeChannelTests(unittest.TestCase):

@@ -1,0 +1,125 @@
+{
+  "source": "sanitized from ready_v6 capture 20260816_102939 table 1125959",
+  "room": 187725,
+  "lobby_doubleboard_capability": {
+    "tablesToJoin": [
+      {
+        "tableName": "NL bombpot capable",
+        "roomProperties": {
+          "id": 201367,
+          "isDoubleBoard": false,
+          "isBombpot": true,
+          "isFixedHandBombpot": false,
+          "handsInBombpot": 16,
+          "isPreflopStart": false,
+          "bombpotInducesDoubleBoard": true
+        }
+      }
+    ]
+  },
+  "ordinary_bombpot_hand": {
+    "ante": null,
+    "isBombpotHand": false,
+    "totalHandCount": null,
+    "currentHandNumber": null,
+    "bombpotInducesDoubleBoard": false,
+    "initTimeStamp": "1786901393791"
+  },
+  "active_doubleboard_bombpot": {
+    "ante": 4,
+    "isBombpotHand": true,
+    "totalHandCount": null,
+    "currentHandNumber": null,
+    "bombpotInducesDoubleBoard": true,
+    "initTimeStamp": "1786902777729"
+  },
+  "second_board_cards": {
+    "dealerCards": {
+      "FLOP": [
+        {
+          "suit": "DIAMONDS",
+          "value": "THREE"
+        },
+        {
+          "suit": "CLUBS",
+          "value": "ACE"
+        },
+        {
+          "suit": "HEARTS",
+          "value": "SEVEN"
+        }
+      ]
+    },
+    "dealerCardsDoubleBoard": {
+      "FLOP": [
+        {
+          "suit": "DIAMONDS",
+          "value": "FIVE"
+        },
+        {
+          "suit": "HEARTS",
+          "value": "THREE"
+        },
+        {
+          "suit": "DIAMONDS",
+          "value": "FOUR"
+        }
+      ]
+    }
+  },
+  "villain_open_bet": {
+    "seatId": 6,
+    "caption": "Raise",
+    "newCaption": "Bet",
+    "userChips": 4.22,
+    "betAmout": 0.16,
+    "userName": "Villain",
+    "userId": 1761576,
+    "lastAction": "Raise",
+    "isAutoAction": false,
+    "isPlaying": true,
+    "initTimeStamp": "1786901444200"
+  },
+  "stale_raise_refresh": {
+    "seatId": 1,
+    "caption": "Inuse",
+    "newCaption": "Inuse",
+    "userChips": 2.95,
+    "betAmout": 0,
+    "userName": "Villain2",
+    "userId": 1534883,
+    "lastAction": "Raise",
+    "isAutoAction": true,
+    "isPlaying": true,
+    "initTimeStamp": "1786901388884"
+  },
+  "advance_options": {
+    "advanceActionId": null,
+    "userTurnOptions": {
+      "3": null,
+      "8": null,
+      "9": null,
+      "10": null
+    },
+    "initTimeStamp": "1786901395636"
+  },
+  "hero_turn_without_options": {
+    "whoseTurn": "Hero",
+    "turnTime": 14,
+    "timerName": "playerHandTimer",
+    "initTimeStamp": "1786901395637"
+  },
+  "villain_pot_bet": {
+    "seatId": 4,
+    "caption": "Raise",
+    "newCaption": "Pot",
+    "userChips": 3.63,
+    "betAmout": 0.37,
+    "userName": "VillainPot",
+    "userId": 2000004,
+    "lastAction": "Raise",
+    "isAutoAction": false,
+    "isPlaying": true,
+    "initTimeStamp": "1786900000000"
+  }
+}

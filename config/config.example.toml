@@ -1,14 +1,23 @@
-# v2 local-only runtime configuration
-# Copy `secrets/eye.agent` from the operator-managed PokerEYE credential when
-# the direct backend integration is enabled. This file is intentionally ignored.
+# Production v2: one public native device ingress, verified v6 multitable router.
 [trainer]
-secret_env = "POKEREYE_V2_SECRET"
+host = "0.0.0.0"
+port = 19037
+public_host = "37.192.228.101"
 secret_file = "secrets/trainer.secret"
 
-[eye]
-host = "127.0.0.1"
-port = 17770
+[pokereye]
+backend_host = "gs.eye-panel.com"
+backend_port = 443
 credential_file = "secrets/eye.agent"
+account_registry = "config/backend_accounts.local.json"
+chip_scale = 100
 
-[device]
-# Runtime is UDP broadcast + authenticated TCP only. ADB is lab control only.
+[transport]
+mode = "native-hmn1"
+one_tcp_per_device = true
+passive_frames_one_way = true
+
+[routing]
+mode = "verified-v6-device-ingress"
+admission = "game.game_init"
+action_arbiter = "per-device"

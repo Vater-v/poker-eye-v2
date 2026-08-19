@@ -1,0 +1,28 @@
+[Unit]
+Description=PokerEye HMN1 Trainer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pokereye
+Group=pokereye
+WorkingDirectory=/opt/pokereye
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=POKEREYE_ACCOUNT_AUTOGROW=0
+Environment=POKEREYE_ACCOUNT_AUTOPROVISION=1
+Environment=POKEREYE_ACCOUNT_MAX_SUFFIX=150
+Environment=POKEREYE_ACCOUNT_AUTOREGISTER=0
+Environment=POKEREYE_LOGIN_REJECT_QUARANTINE_SECONDS=900
+ExecStart=/usr/bin/python3 /opt/pokereye/main.py --host 0.0.0.0 --port 19037 --public-host 5.42.124.216 --account-file /opt/pokereye/config/backend_accounts.local.json --credential-file /opt/pokereye/secrets/eye.agent --log-dir /opt/pokereye/logs
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/pokereye/logs /opt/pokereye/config
+
+[Install]
+WantedBy=multi-user.target

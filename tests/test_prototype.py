@@ -6,15 +6,15 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from discovery import SlotPool
-from protocol import frame, recv_frame, proof
-from transport import TrainerServer
+from core.discovery import SlotPool
+from core.protocol import frame, recv_frame, proof
+from core.transport import TrainerServer
 from core.discovery import DEFAULT_INTERVAL
 
 
 class PrototypeTests(unittest.TestCase):
     def test_default_interval_and_advertisements_do_not_reserve_slots(self):
-        from discovery import Broadcaster, DEFAULT_INTERVAL
+        from core.discovery import Broadcaster, DEFAULT_INTERVAL
         self.assertEqual(DEFAULT_INTERVAL, 1.25)
         b = Broadcaster("127.0.0.1", 1234, b"x", slots=1)
         self.assertEqual(b.advertisement()["metadata"]["available"], 1)
@@ -43,7 +43,7 @@ class PrototypeTests(unittest.TestCase):
         port = server.start()
         def connect():
             sock = socket.create_connection(("127.0.0.1", port))
-            from protocol import send_frame
+            from core.protocol import send_frame
             send_frame(sock, {"type":"hello", "version":2, "device_id":"device", "table_id":"table", "proof":proof(secret, nonce, "table", session)})
             return sock, recv_frame(sock)
         first, welcome = connect(); self.assertEqual(welcome["slot"], 1)

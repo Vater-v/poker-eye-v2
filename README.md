@@ -1,19 +1,18 @@
-# poker-eye-v2 repair pack
+# poker-eye-v2 — production native runtime
 
-Targets v2 around commit `3f4f372`.
+Runtime path only:
 
-- `0002-readable-trainer-status.patch`: unified diff for a clean checkout.
-- `0003-chip-scale-100.patch`: repairs an accidental local `default=10`.
-  Clean upstream already has `default=100`, so this patch is already satisfied there.
-- `apply_v2_repair.py`: preferred for a checkout with local edits. It performs
-  semantic edits and makes a timestamped backup before writing.
+`Coin RealWebSocket → libhmuriy.so → TCP/19037 → verified v6 DeviceIngressRouter → verified v1 Coin/PPP/PokerEYE bridge`.
 
-Recommended:
+Properties:
 
-```bat
-python apply_v2_repair.py --repo C:\projects\pokereye\poker-eye-v2 --check
-python apply_v2_repair.py --repo C:\projects\pokereye\poker-eye-v2
-git diff -- main.py core\bootstrap.py core\trainer.py
-```
+- one persistent authenticated TCP connection per physical Android process;
+- Coin WebSocket thread never waits for Trainer/network and does no Base64/JSON;
+- real SmartFox room/table routing is performed before mutable table state;
+- `game.game_init` is the table-admission edge; waitlist/preview rooms do not lease accounts;
+- one backend account per admitted table;
+- one v6 `ActionArbiter` per physical device serializes actions across tables;
+- passive frames are one-way; Trainer only sends heartbeat ACK, action, or cancel;
+- native `Hmuriy` perf counters and Perfetto profiling are available.
 
-The Android readable-status patch from the previous pack is independent and can stay applied.
+Production secrets remain local under `secrets/` and are not committed or packaged by the installer.
