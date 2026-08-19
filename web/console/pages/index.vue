@@ -98,9 +98,6 @@ function handsText(device: DeviceRow) {
     if (!order.includes(name) && Number(count) > 0) parts.push(`${name}: ${count}`);
   }
   if (parts.length) return parts.join(" | ");
-  if (device.session_hands) {
-    return device.session_hands.replace(/ · /g, " | ").replace(/: 0/g, "").replace(/\| $/g, "");
-  }
   return "—";
 }
 
@@ -384,7 +381,7 @@ const modes: Array<[LogMode, string]> = [
                   <div v-for="t in d.tables || []" :key="t.table_id" class="grid grid-cols-1 xl:grid-cols-[220px_1fr_auto] gap-3 items-start py-3 border-t border-[#1c232c] first:border-0">
                     <div>
                       <div class="font-semibold">Стол {{ t.table_no || "?" }} <span class="text-[#8b95a3] font-normal">{{ t.game_type || "—" }}</span></div>
-                      <div class="text-[11px] text-[#8b95a3]">{{ t.hero_name || deviceName(d) }} · {{ t.connected ? "online" : "offline" }}</div>
+                      <div class="text-[11px] text-[#8b95a3]">{{ t.hero_name || deviceName(d) }} · {{ d.connected ? "online" : "offline" }}</div>
                       <div class="text-[11px] mt-1">{{ t.hero_sitting ? "сидим" : "наблюдаем" }}<span v-if="t.standup_queued" class="text-[#e7bb55]"> · стендап после руки</span></div>
                     </div>
                     <div class="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1 text-[11px] min-w-0">

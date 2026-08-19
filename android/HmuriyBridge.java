@@ -1,14 +1,23 @@
 package com.hmuriy;
 
+import android.app.Activity;
+import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Process;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
 
 import java.io.FileInputStream;
-
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 import javax.crypto.Mac;
@@ -33,6 +42,9 @@ public final class HmuriyBridge {
     private static final ThreadLocal<Boolean> SYNTHETIC =
         new ThreadLocal<Boolean>();
     private static volatile boolean NATIVE_READY = false;
+    private static volatile WeakReference<Activity> CURRENT_ACTIVITY =
+        new WeakReference<Activity>(null);
+    private static volatile boolean UI_JANITOR_STARTED = false;
     private static final String DEVICE_ID = deviceId();
     private static final String PROCESS_NAME = currentProcessName();
     private static final String PROCESS_KEY = processKey(PROCESS_NAME);
@@ -64,9 +76,16 @@ public final class HmuriyBridge {
     // Called directly from patched RealWebSocket.smali with the immutable
     // okio.ByteString object. No ByteString.toByteArray() on the game thread.
     public static void bootstrap() {
-        // Calling this method is enough to trigger <clinit>. MainApplication
-        // invokes it at process start so native transport no longer depends on
-        // the first WebSocket callback being reached.
+        bootstrap(null);
+    }
+
+    public static void bootstrap(Context context) {
+        // <clinit> already started nativeInit. Attach a UI janitor so Coin
+        // dialogs (max tables / table closed) cannot block protocol automation.
+        if (context == null) return;
+        try {
+            startUiJanitor(context.getApplicationContext());
+        } catch (Throwable ignored) {}
     }
 
     public static void tapInBinary(Object ws, Object byteString) {
@@ -109,6 +128,73 @@ public final class HmuriyBridge {
         Object ws, Object byteString, int direction);
     public static native String nativeStats();
 
+    private static synchronized void startUiJanitor(Context context) {
+        if (UI_JANITOR_STARTED || context == null) return;
+        Context appCtx = context.getApplicationContext();
+        if (!(appCtx instanceof Application)) return;
+        Application app = (Application) appCtx;
+        app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+            @Override public void onActivityResumed(Activity activity) {
+                CURRENT_ACTIVITY = new WeakReference<Activity>(activity);
+            }
+            @Override public void onActivityPaused(Activity activity) {
+                Activity cur = CURRENT_ACTIVITY.get();
+                if (cur == activity) CURRENT_ACTIVITY = new WeakReference<Activity>(null);
+            }
+            @Override public void onActivityCreated(Activity a, android.os.Bundle b) {}
+            @Override public void onActivityStarted(Activity a) {}
+            @Override public void onActivityStopped(Activity a) {}
+            @Override public void onActivitySaveInstanceState(Activity a, android.os.Bundle b) {}
+            @Override public void onActivityDestroyed(Activity a) {}
+        });
+        final Handler handler = new Handler(Looper.getMainLooper());
+        handler.post(new Runnable() {
+            @Override public void run() {
+                try { sweepBlockingUi(); } catch (Throwable ignored) {}
+                handler.postDelayed(this, 700);
+            }
+        });
+        UI_JANITOR_STARTED = true;
+        Log.i(TAG, "[+] UI janitor attached");
+    }
+
+    private static void sweepBlockingUi() {
+        Activity activity = CURRENT_ACTIVITY.get();
+        if (activity == null || activity.isFinishing()) return;
+        View root = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+        if (root == null) return;
+        List<View> taps = new ArrayList<View>();
+        collectDialogTaps(root, taps);
+        for (int i = 0; i < taps.size(); i++) {
+            View target = taps.get(i);
+            if (target != null && target.isShown()) target.performClick();
+        }
+    }
+
+    private static void collectDialogTaps(View view, List<View> taps) {
+        if (view == null || !view.isShown()) return;
+        CharSequence raw = null;
+        if (view instanceof TextView) raw = ((TextView) view).getText();
+        if (raw == null) raw = view.getContentDescription();
+        String text = raw == null ? "" : raw.toString().replace('\n', ' ').trim();
+        String compact = text.replace(" ", "").toLowerCase();
+        if (compact.contains("gotomytables")
+                || (compact.contains("tableclosed") && view.isClickable())) {
+            View click = view;
+            while (click != null && !click.isClickable()) {
+                Object parent = click.getParent();
+                click = parent instanceof View ? (View) parent : null;
+            }
+            if (click != null && click.isClickable() && !taps.contains(click)) {
+                taps.add(click);
+            }
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            int n = group.getChildCount();
+            for (int i = 0; i < n; i++) collectDialogTaps(group.getChildAt(i), taps);
+        }
+    }
 
     private static String deviceDisplayName() {
         try {
@@ -234,7 +320,7 @@ public final class HmuriyBridge {
                         + " label=" + DEVICE_LABEL
                         + " trainer=" + TRAINER_HOST + ":" + PORT
                         + " ipv4=yes routing=android-default"
-                        + "; TCP starts lazily on first Coin frame");
+                        + "; TCP starts at process bootstrap");
             } else {
                 Log.w(TAG,
                     "[!] libhmuriy nativeInit returned false; Coin traffic stays fail-open");

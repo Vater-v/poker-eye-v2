@@ -381,10 +381,15 @@ class OperatorConsole:
     def _table(self, device_id: str, table_id: int) -> int:
         key = (str(device_id), int(table_id))
         with self._lock:
-            if key not in self._tables:
-                self._next_table[str(device_id)] += 1
-                self._tables[key] = self._next_table[str(device_id)]
-            return self._tables[key]
+            existing = self._tables.get(key)
+            if existing is not None:
+                return int(existing)
+            used = {int(number) for (owner, _tid), number in self._tables.items() if owner == str(device_id)}
+            number = 1
+            while number in used:
+                number += 1
+            self._tables[key] = number
+            return number
 
     def _label(self, device_id: str, table_id: int) -> str:
         d = self._device(device_id)
@@ -755,6 +760,8 @@ class OperatorConsole:
             )
             self._seated.discard((device, table))
             self._latest_by_table.pop((device, table), None)
+            with self._lock:
+                self._tables.pop((device, table), None)
         elif kind == "hand_started" and table > 0:
             hand = str(observation.hand_id or "?")
             self._line(f"◆ {label}: новая раздача #{hand}", "operator.hand_started", device_id=device, table_id=table, hand_id=hand)

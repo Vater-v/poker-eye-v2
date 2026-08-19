@@ -242,6 +242,16 @@ class V2RegressionTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertIn("Стол 1: вышли со стола", rows[-1])
 
+    def test_operator_reuses_human_table_numbers_after_close(self):
+        logger = _Logger()
+        console = OperatorConsole(logger, 7, accounts_dynamic=True)
+        device = "dev-recycle"
+        console.device_up(device)
+        console.observation(RouterObservation("hand_completed", device, 10, game_type="NLH", hand_id="a"))
+        console.observation(RouterObservation("table_close", device, 10, reason="left", detail={"crashed": False}))
+        console.observation(RouterObservation("hand_completed", device, 11, game_type="NLH", hand_id="b"))
+        self.assertEqual(console._table(device, 11), 1)
+
     def test_ingress_meter_never_decodes_coin_payload_inline(self):
         emitted = []
         meter = TrafficMeter(lambda **row: emitted.append(row), window_seconds=0.25)

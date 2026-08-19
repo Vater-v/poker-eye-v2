@@ -2193,22 +2193,22 @@ class DeviceIngressRouter:
         auto = self.automation
         if auto is None:
             return
+        rows: list[dict[str, Any]] = []
         async with self._lock:
             live = [int(table_id) for table_id in self._sessions]
-            seated = []
-            for table_id, slot in self._sessions.items():
+            for table_id, slot in list(self._sessions.items()):
                 session = slot.session
                 if not isinstance(session, LiveTableSession):
                     continue
                 bridge = session._bridge
-                players = 0
-                stack_bb = 0.0
-                sitout = False
                 try:
                     snap = session._snapshot()
                     coin_bb = float(snap.coin_bb or 0.0)
                     seats = getattr(bridge, "seat_map", {}) or {}
-                    players = len([row for row in seats.values() if isinstance(row, dict) and (row.get("userId") or row.get("userName"))])
+                    players = len([
+                        row for row in seats.values()
+                        if isinstance(row, dict) and (row.get("userId") or row.get("userName"))
+                    ])
                     hero_id = int(bridge.state.get("user_id") or 0)
                     hero_name = str(bridge.state.get("user_name") or "")
                     hero_row = None
@@ -2222,48 +2222,58 @@ class DeviceIngressRouter:
                         if (hero_id and uid == hero_id) or (hero_name and str(row.get("userName") or "") == hero_name):
                             hero_row = row
                             break
+                    stack_bb = 0.0
                     if hero_row is not None and coin_bb > 0:
                         try:
                             stack_bb = float(hero_row.get("userChips") or 0.0) / coin_bb
                         except (TypeError, ValueError):
                             stack_bb = 0.0
                     sitting_out = bool(getattr(bridge, "hero_sitting_out", False))
-                    is_playing = True
-                    if hero_row is not None:
-                        is_playing = hero_row.get("isPlaying") is True
+                    is_playing = hero_row.get("isPlaying") is True if hero_row is not None else True
                     sitout = sitting_out or (
                         bool(getattr(bridge, "hero_sitting", False))
                         and not is_playing
                         and not getattr(bridge, "current_hand", None)
                         and int(getattr(bridge, "cc_miss_streak", 0) or 0) > 0
                     )
-                    auto.mark_stack(int(table_id), stack_bb, players, bool(getattr(bridge, "hero_sitting", False)))
-                    auto.mark_sitout(int(table_id), sitout)
-                    if sitout:
-                        seated.append(int(table_id))
-                    elif getattr(bridge, "hero_sitting", False):
-                        seated.append(int(table_id))
-                    streak = int(getattr(bridge, "cc_miss_streak", 0) or 0)
-                    if streak >= 3:
-                        self._queue_policy_leave_locked(
-                            int(table_id),
-                            room=int(bridge.context_hook_room or bridge.active_hook_room or 0),
-                            ws_id=str(self.game_ws_for(int(table_id))),
-                            kind="cc_streak",
-                            reason="PokerEYE silent 3 hands",
-                        )
+                    rows.append({
+                        "table_id": int(table_id),
+                        "stack_bb": stack_bb,
+                        "players": players,
+                        "seated": bool(getattr(bridge, "hero_sitting", False)),
+                        "sitout": sitout,
+                        "hand": bool(getattr(bridge, "current_hand", None)),
+                        "bb": coin_bb,
+                        "streak": int(getattr(bridge, "cc_miss_streak", 0) or 0),
+                        "room": int(bridge.context_hook_room or bridge.active_hook_room or 0),
+                        "ws": str(auto.game_ws.get(int(table_id)) or self.game_ws_for(int(table_id))),
+                    })
                 except Exception:
                     continue
-            auto.tick(seated_tables=len(seated), live_table_ids=live)
-            for table_id, reason in auto.drain_leaves():
-                slot = self._sessions.get(int(table_id))
-                session = slot.session if slot is not None else None
-                room = 0
-                ws_id = ""
-                if isinstance(session, LiveTableSession):
-                    room = int(session._bridge.context_hook_room or session._bridge.active_hook_room or 0)
-                    ws_id = str(auto.game_ws.get(int(table_id)) or "")
-                self._queue_policy_leave_locked(int(table_id), room=room, ws_id=ws_id, kind="policy", reason=reason)
+        for row in rows:
+            auto.mark_stack(row["table_id"], row["stack_bb"], row["players"], row["seated"])
+            auto.mark_sitout(row["table_id"], row["sitout"])
+            auto.mark_hand(row["table_id"], row["hand"])
+            if row["bb"]:
+                auto.mark_bb(row["table_id"], row["bb"])
+        auto.tick(seated_tables=len(rows), live_table_ids=live)
+        leaves = auto.drain_leaves()
+        extra = [
+            (int(row["table_id"]), "PokerEYE silent 3 hands")
+            for row in rows if int(row["streak"]) >= 3
+        ]
+        async with self._lock:
+            for table_id, reason in list(leaves) + extra:
+                if int(table_id) not in self._sessions:
+                    auto.note_table_closed(int(table_id), "already-gone")
+                    continue
+                match = next((row for row in rows if int(row["table_id"]) == int(table_id)), None)
+                room = int((match or {}).get("room") or 0)
+                ws_id = str((match or {}).get("ws") or "")
+                kind = "cc_streak" if "silent 3" in reason else "policy"
+                self._queue_policy_leave_locked(
+                    int(table_id), room=room, ws_id=ws_id, kind=kind, reason=reason,
+                )
 
     def game_ws_for(self, table_id: int) -> str:
         owners = [ws for ws, tables in self._ws_to_tables.items() if int(table_id) in tables]
@@ -2271,32 +2281,39 @@ class DeviceIngressRouter:
 
     def _queue_policy_leave_locked(
         self, table_id: int, *, room: int, ws_id: str, kind: str, reason: str,
-    ) -> None:
+    ) -> bool:
         if int(table_id) in self._unsupported_exit:
-            return
+            return False
+        if int(room) <= 0:
+            return False
         event = {"id": f"auto-leave-{table_id}", "ws_id": ws_id}
         routed = RoutedEvent(
             event=event, payload=None, raw=b"", command="game.leave_Seat",
             direction="out", room_id=int(room) or None, table_ids=(int(table_id),),
             websocket_id=str(ws_id or ""), data={},
         )
+        before = int(table_id) in self._unsupported_exit
         self._ensure_unsupported_exit_locked(
             int(table_id), routed, reset=True, exit_kind=str(kind or "policy"),
             detail={"reason": reason},
         )
+        if int(table_id) not in self._unsupported_exit:
+            return False
         self._action_arbiter.cancel_table(int(table_id), "POLICY_LEAVE")
         if table_id not in self._unsupported_close_tasks:
             self._unsupported_close_tasks[int(table_id)] = asyncio.create_task(
                 self._close_unsupported_after(int(table_id)),
                 name=f"policy-close-{self.device_id}-{table_id}",
             )
-        self._sink(
-            RouterObservation(
-                "automation_leave", self.device_id, int(table_id), status="yellow",
-                reason=str(reason or "policy leave"),
-                detail={"kind": kind, "reason": reason},
+        if not before:
+            self._sink(
+                RouterObservation(
+                    "automation_leave", self.device_id, int(table_id), status="yellow",
+                    reason=str(reason or "policy leave"),
+                    detail={"kind": kind, "reason": reason},
+                )
             )
-        )
+        return True
 
     def _ensure_unsupported_exit_locked(
         self, table_id: int, routed: RoutedEvent, *, reset: bool = False,
@@ -3073,11 +3090,12 @@ class DeviceIngressRouter:
         tables = []
         hero_name = ""
         now = time.monotonic()
-        for slot in sorted(rows, key=lambda item: item.created_order):
+        ordered = sorted(rows, key=lambda item: item.created_order)
+        for index, slot in enumerate(ordered, 1):
             session = slot.session
             row: dict[str, Any] = {
                 "table_id": int(slot.table_id),
-                "table_no": int(slot.created_order),
+                "table_no": int(index),
                 "state": "ready" if session is not None else ("failed" if slot.failed else "starting"),
                 "startup_attempts": int(slot.startup_attempts),
                 "startup_error": str(slot.startup_error or ""),

@@ -24,11 +24,15 @@ from .router import RoutedEvent, _decode_event, _forward
 ALLOWED_BB = (0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
 DEFAULT_BB = 0.02
 DEFAULT_TABLES = 5
+COIN_MAX_TABLES = 5
 LEAVE_BELOW_BB = 79.0
 OPEN_IF_FREE_BB = 100.0
 MIN_PLAYERS = 3
 JOIN_GAP_SECONDS = 8.0
 WATCHDOG_SECONDS = 2.0
+EMPTY_GRACE_SECONDS = 25.0
+TAB_COOLDOWN_SECONDS = 25.0
+JOIN_REJECT_COOLDOWN = 20.0
 
 
 def _policy_path() -> Path:
@@ -70,7 +74,7 @@ class AutoPolicy:
     def from_mapping(cls, raw: Any) -> "AutoPolicy":
         data = dict(raw or {}) if isinstance(raw, dict) else {}
         tables = int(data.get("table_count") or DEFAULT_TABLES)
-        tables = max(1, min(8, tables))
+        tables = max(1, min(COIN_MAX_TABLES, tables))
         min_players = int(data.get("min_players") or MIN_PLAYERS)
         min_players = max(2, min(9, min_players))
         leave_below = _finite(data.get("leave_below_bb")) or LEAVE_BELOW_BB
@@ -145,6 +149,12 @@ class DeviceAutomation:
         self._stack_bb: dict[int, float] = {}
         self._sitout: set[int] = set()
         self._want_seat: set[int] = set()
+        self._seated_at: dict[int, float] = {}
+        self._hand_live: dict[int, bool] = {}
+        self._table_bb: dict[int, float] = {}
+        self._leave_inflight: set[int] = set()
+        self._tabs: dict[int, float] = {}
+        self._join_block_until = 0.0
         self._status = "idle"
         self._counter = 0
         if store is not None:
@@ -167,6 +177,8 @@ class DeviceAutomation:
             "joining": self._joining,
             "gradual_leave": len(self._gradual),
             "sitout_tables": sorted(self._sitout),
+            "coin_tabs": len(self._tabs),
+            "coin_tab_cap": COIN_MAX_TABLES,
         }
 
     def apply_policy(self, raw: dict[str, Any], *, enable: Optional[bool] = None) -> AutoPolicy:
@@ -210,10 +222,18 @@ class DeviceAutomation:
         table_id = int(table_id)
         why = str(self._leave_reasons.pop(table_id, "") or reason or "closed")
         self._closed_reasons[table_id] = why
+        stack_bb = self._stack_bb.pop(table_id, None)
+        bb = self._table_bb.pop(table_id, self.policy.bb)
+        if stack_bb and bb and self.wallet_cash is not None:
+            self.wallet_cash = float(self.wallet_cash) + float(stack_bb) * float(bb)
         self._seated.discard(table_id)
         self._sitout.discard(table_id)
         self._players.pop(table_id, None)
-        self._stack_bb.pop(table_id, None)
+        self._seated_at.pop(table_id, None)
+        self._hand_live.pop(table_id, None)
+        self._leave_inflight.discard(table_id)
+        self._want_seat.discard(table_id)
+        self._tabs[table_id] = time.monotonic() + TAB_COOLDOWN_SECONDS
         self._gradual = [row for row in self._gradual if row[0] != table_id]
         self._queue = [item for item in self._queue if item.table_id != table_id]
         if self.policy.enabled:
@@ -225,11 +245,27 @@ class DeviceAutomation:
         self._gradual = [row for row in self._gradual if row[1] > now]
         out: list[tuple[int, str]] = []
         for table_id, _when, reason in due:
-            out.append((int(table_id), reason))
+            table_id = int(table_id)
+            if table_id in self._leave_inflight:
+                continue
+            self._leave_inflight.add(table_id)
+            out.append((table_id, reason))
         for table_id, reason in list(self._leave_reasons.items()):
-            if table_id not in {row[0] for row in out}:
-                out.append((int(table_id), reason))
+            table_id = int(table_id)
+            if table_id in self._leave_inflight:
+                continue
+            self._leave_inflight.add(table_id)
+            out.append((table_id, reason))
         return out
+
+    def coin_tab_count(self) -> int:
+        now = time.monotonic()
+        keep: dict[int, float] = {}
+        for table_id, expiry in self._tabs.items():
+            if expiry == 0 or expiry > now:
+                keep[int(table_id)] = float(expiry)
+        self._tabs = keep
+        return len(keep)
 
     def handle(self, event: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -248,30 +284,47 @@ class DeviceAutomation:
         return _forward(event)
 
     def tick(self, *, seated_tables: int, live_table_ids: Optional[list[int]] = None) -> None:
+        now = time.monotonic()
         live = set(int(item) for item in (live_table_ids or self._seated))
-        self._seated &= live | self._seated
+        self._seated = {tid for tid in self._seated if tid in live}
         if not self.policy.enabled:
             return
         pending_joins = sum(1 for item in self._queue if item.command == "lobby.join_game")
-        open_count = len(live) + pending_joins + (1 if self._joining else 0)
-        if open_count < int(self.policy.table_count) and self._can_open():
+        tabs = self.coin_tab_count()
+        open_count = max(len(live), tabs) + pending_joins + (1 if self._joining else 0)
+        target = min(int(self.policy.table_count), COIN_MAX_TABLES)
+        if open_count < target and self._can_open(open_count=open_count):
             self._queue_join()
         for table_id in list(live):
-            if self.policy.watch_players:
-                players = int(self._players.get(table_id) or 0)
-                if players and players < int(self.policy.min_players):
-                    self._request_leave(table_id, f"игроков {players} < {self.policy.min_players}")
+            players = int(self._players.get(table_id) or 0)
+            in_hand = bool(self._hand_live.get(table_id))
+            age = now - float(self._seated_at.get(table_id) or now)
+            if self.policy.watch_players and players and players < int(self.policy.min_players):
+                if in_hand:
+                    self._request_leave(table_id, f"мало игроков в раздаче ({players})")
+                elif age >= EMPTY_GRACE_SECONDS:
+                    self._request_leave(table_id, f"пусто {players} игроков после {int(age)}с")
             if self.policy.watch_balance:
                 stack = self._stack_bb.get(table_id)
-                if stack is not None and stack < float(self.policy.leave_below_bb):
+                if stack is not None and stack < float(self.policy.leave_below_bb) and not in_hand:
                     self._request_leave(table_id, f"стек {stack:.1f} BB < {self.policy.leave_below_bb:g}")
-            if table_id in self._sitout:
+            if table_id in self._sitout and not in_hand:
                 self._request_leave(table_id, "sitout")
 
-    def _can_open(self) -> bool:
+    def _can_open(self, *, open_count: int = 0) -> bool:
+        now = time.monotonic()
         if self._joining:
             return False
-        if time.monotonic() - self._last_join_at < JOIN_GAP_SECONDS:
+        if now < float(self._join_block_until or 0.0):
+            self._status = "join-cooldown"
+            return False
+        if now - self._last_join_at < JOIN_GAP_SECONDS:
+            return False
+        if open_count >= min(int(self.policy.table_count), COIN_MAX_TABLES):
+            self._status = f"cap {open_count}/{COIN_MAX_TABLES}"
+            return False
+        if self.coin_tab_count() >= COIN_MAX_TABLES:
+            self._status = "coin 5 tabs"
             return False
         if not self._pick_config():
             self._status = "waiting-catalog"
@@ -355,10 +408,13 @@ class DeviceAutomation:
             failed = data.get("isSuccess") is False or int(data.get("errorCode") or 0) != 0
             if failed:
                 self._joining = False
+                self._join_block_until = time.monotonic() + JOIN_REJECT_COOLDOWN
                 self._status = "join-rejected"
-                self._note("automation.join_rejected", "Coin отклонил поиск стола", severity="WARN")
+                self._note("automation.join_rejected", "Coin отклонил поиск стола · пауза", severity="WARN")
         if routed.command == "lobby.join_game_table" and routed.direction == "in":
             self._joining = False
+            for tid in routed.table_ids:
+                self._tabs[int(tid)] = 0.0
             for row in data.get("tablesToJoin") or ():
                 if not isinstance(row, dict):
                     continue
@@ -574,9 +630,20 @@ class DeviceAutomation:
         if players:
             self._players[table_id] = int(players)
         if seated:
+            if table_id not in self._seated:
+                self._seated_at.setdefault(table_id, time.monotonic())
             self._seated.add(table_id)
+            self._tabs.setdefault(table_id, 0.0)
         else:
             self._seated.discard(table_id)
+
+    def mark_hand(self, table_id: int, live: bool) -> None:
+        self._hand_live[int(table_id)] = bool(live)
+
+    def mark_bb(self, table_id: int, bb: float) -> None:
+        value = _finite(bb)
+        if value:
+            self._table_bb[int(table_id)] = float(value)
 
     def mark_wallet(self, cash: float) -> None:
         value = _finite(cash)

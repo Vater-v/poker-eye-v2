@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -19,7 +20,7 @@ class AutoPolicyTests(unittest.TestCase):
             "watch_balance": False,
         })
         self.assertTrue(policy.enabled)
-        self.assertEqual(policy.table_count, 8)
+        self.assertEqual(policy.table_count, 5)
         self.assertEqual(policy.bb, 0.05)
         self.assertFalse(policy.watch_balance)
         self.assertTrue(policy.watch_players)
@@ -88,6 +89,33 @@ class WatchdogJoinTests(unittest.TestCase):
         delays = [row[1] for row in auto._gradual]
         self.assertGreater(delays[1], delays[0])
         self.assertGreater(delays[2], delays[1])
+
+    def test_empty_table_waits_grace_then_leaves(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": True, "table_count": 1, "watch_players": True})
+        auto.mark_stack(11, 100.0, 1, True)
+        auto.tick(seated_tables=1, live_table_ids=[11])
+        self.assertNotIn(11, auto._leave_reasons)
+        auto._seated_at[11] = time.monotonic() - 30
+        auto.tick(seated_tables=1, live_table_ids=[11])
+        self.assertIn(11, auto._leave_reasons)
+        first = auto.drain_leaves()
+        second = auto.drain_leaves()
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+
+    def test_coin_five_tab_cap_blocks_join(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": True, "table_count": 5, "bb": 0.02})
+        auto.lobby_ws = "aabbccdd"
+        auto._remember_config({
+            "configId": 200588, "bigBlind": 0.02, "miniGameTypeId": 1,
+            "minbuyin": 0.8, "maxbuyin": 2.0, "tableSize": 6,
+        })
+        for table_id in range(1, 6):
+            auto._tabs[table_id] = 0.0
+        auto.tick(seated_tables=0, live_table_ids=[])
+        self.assertFalse(auto._joining)
 
 
 class HeroTurnTests(unittest.TestCase):

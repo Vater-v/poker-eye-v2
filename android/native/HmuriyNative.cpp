@@ -1061,11 +1061,12 @@ Java_com_hmuriy_HmuriyBridge_nativeInit(
     }
 
     g_initialized.store(true, std::memory_order_release);
+    const bool worker = ensure_worker_started();
 
     HLOGI(
-        "[+] libhmuriy initialized build=%s device=%s transport=%s protocol=HMN1 action_result=1 lazy_transport=1 trainer=%s:%d ipv4=1 routing=android-default label=%s",
+        "[+] libhmuriy initialized build=%s device=%s transport=%s protocol=HMN1 action_result=1 eager_transport=%d trainer=%s:%d ipv4=1 routing=android-default label=%s",
         POKEREYE_BUILD_ID, g_device_id.c_str(), g_transport_id.c_str(),
-        g_trainer_host.c_str(), g_port, g_device_label.c_str());
+        worker ? 1 : 0, g_trainer_host.c_str(), g_port, g_device_label.c_str());
     return JNI_TRUE;
 }
 
