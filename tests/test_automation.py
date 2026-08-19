@@ -136,6 +136,44 @@ class WatchdogJoinTests(unittest.TestCase):
         auto.tick(seated_tables=0, live_table_ids=[])
         self.assertTrue(auto._joining)
 
+    def test_auto_off_does_not_join(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": True, "table_count": 5, "bb": 0.02})
+        auto.lobby_ws = "aabbccdd"
+        auto._remember_config({
+            "configId": 200588, "bigBlind": 0.02, "miniGameTypeId": 1,
+            "minbuyin": 0.8, "maxbuyin": 2.0, "tableSize": 6,
+        })
+        auto.apply_policy(auto.policy.public(), enable=False)
+        auto.tick(seated_tables=0, live_table_ids=[])
+        self.assertFalse(auto.policy.enabled)
+        self.assertFalse(auto._joining)
+        self.assertEqual(auto._queue, [])
+
+    def test_leave_all_disables_joins(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": True, "table_count": 5, "bb": 0.02})
+        auto.lobby_ws = "aabbccdd"
+        auto._remember_config({
+            "configId": 200588, "bigBlind": 0.02, "miniGameTypeId": 1,
+            "minbuyin": 0.8, "maxbuyin": 2.0, "tableSize": 6,
+        })
+        n = auto.schedule_leave_all([11, 22], gradual=False)
+        self.assertEqual(n, 2)
+        self.assertTrue(auto._leaving_all)
+        self.assertFalse(auto.policy.enabled)
+        auto.tick(seated_tables=0, live_table_ids=[])
+        self.assertFalse(auto._joining)
+        self.assertTrue(all(item.command != "lobby.join_game" for item in auto._queue))
+
+    def test_short_handed_first_deal_does_not_leave(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": True, "table_count": 1, "watch_players": True})
+        auto.mark_stack(11, 100.0, 2, True)
+        auto.mark_hand(11, True)
+        auto.tick(seated_tables=1, live_table_ids=[11])
+        self.assertNotIn(11, auto._leave_reasons)
+
     def test_join_rejected_extends_ghost_tabs_not_live_ones(self):
         auto = DeviceAutomation("dev")
         auto.note_table_closed(11, "quit")

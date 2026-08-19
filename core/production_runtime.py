@@ -1355,8 +1355,13 @@ class RouterService:
         auto = router.automation
         if auto is None:
             return {"ok": False, "error": "no automation"}
-        enable = True if apply else policy.get("enabled")
-        saved = auto.apply_policy(policy, enable=enable if apply or "enabled" in policy else None)
+        # apply means "take this policy now", not "force auto on". The console
+        # already puts the intended enabled flag in the body; overwriting it
+        # with True is why toggling auto off still opened tables.
+        enable = None
+        if isinstance(policy, dict) and "enabled" in policy:
+            enable = bool(policy.get("enabled"))
+        saved = auto.apply_policy(policy, enable=enable)
         if apply:
             await router._watchdog_tick()
         return {"ok": True, "policy": saved.public(), "automation": auto.snapshot()}
@@ -1371,11 +1376,14 @@ class RouterService:
         router = self._routers.get(str(device_id))
         if router is None or router.automation is None:
             return {"ok": False, "error": "device offline"}
+        auto = router.automation
         async with router._lock:
-            table_ids = [int(table_id) for table_id in router._sessions]
-        queued = router.automation.schedule_leave_all(table_ids, gradual=gradual)
+            table_ids = set(int(table_id) for table_id in router._sessions)
+        table_ids.update(int(tid) for tid in auto._tabs)
+        table_ids.update(int(tid) for tid in auto._seated)
+        queued = auto.schedule_leave_all(sorted(tid for tid in table_ids if tid > 0), gradual=gradual)
         await router._watchdog_tick()
-        return {"ok": True, "queued": queued, "gradual": bool(gradual)}
+        return {"ok": True, "queued": queued, "gradual": bool(gradual), "status": auto._status}
 
     def control_leave_all(self, device_id: str, *, gradual: bool = False) -> dict[str, Any]:
         future = asyncio.run_coroutine_threadsafe(
@@ -1889,6 +1897,8 @@ class NativeIngressServer:
                     # Compatibility with test/legacy router shims that predate
                     # the optional human device label argument.
                     self.router_service.transport_up(device_id)
+                if self.operator is not None:
+                    self.operator.device_up(device_id)
             if self.operator is not None:
                 self.operator.technical(
                     "transport.channel_up",

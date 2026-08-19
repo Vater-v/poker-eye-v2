@@ -19,6 +19,7 @@ import android.widget.TextView;
 
 import java.io.FileInputStream;
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -189,14 +190,38 @@ public final class HmuriyBridge {
         return LEAVE_STEP >= minStep && now - LEAVE_STEP_MS < 5000L;
     }
 
-    private static void sweepBlockingUi() {
+    @SuppressWarnings("unchecked")
+    private static List<View> allWindowRoots() {
+        List<View> roots = new ArrayList<View>();
+        try {
+            Class<?> wmg = Class.forName("android.view.WindowManagerGlobal");
+            Object inst = wmg.getMethod("getInstance").invoke(null);
+            Field field = wmg.getDeclaredField("mViews");
+            field.setAccessible(true);
+            Object raw = field.get(inst);
+            if (raw instanceof List) {
+                List<?> list = (List<?>) raw;
+                for (int i = 0; i < list.size(); i++) {
+                    Object row = list.get(i);
+                    if (row instanceof View) roots.add((View) row);
+                }
+            }
+        } catch (Throwable ignored) {}
         Activity activity = CURRENT_ACTIVITY.get();
-        if (activity == null || activity.isFinishing()) return;
-        View root = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
-        if (root == null) return;
+        if (activity != null && !activity.isFinishing() && activity.getWindow() != null) {
+            View decor = activity.getWindow().getDecorView();
+            if (decor != null && !roots.contains(decor)) roots.add(decor);
+        }
+        return roots;
+    }
+
+    private static void sweepBlockingUi() {
+        List<View> roots = allWindowRoots();
+        if (roots.isEmpty()) return;
         List<UiNode> nodes = new ArrayList<UiNode>();
-        collectUiNodes(root, nodes);
+        for (int r = 0; r < roots.size(); r++) collectUiNodes(roots.get(r), nodes);
         if (nodes.isEmpty()) return;
+        View root = roots.get(roots.size() - 1);
 
         long now = SystemClock.uptimeMillis();
         if (now - JANITOR_LAST_TAP_MS < 650L) return;
@@ -209,6 +234,7 @@ public final class HmuriyBridge {
         UiNode closedChip = null;
         UiNode overflowGlyph = null;
         UiNode turnTab = null;
+        float turnTabSeconds = 9999f;
         boolean closedOverlay = false;
         boolean maxTablesVisible = false;
         boolean dangerousConfirm = false;
@@ -216,9 +242,14 @@ public final class HmuriyBridge {
         int screenW = root.getWidth();
         int screenH = root.getHeight();
         if (screenW <= 0 || screenH <= 0) {
-            screenW = activity.getResources().getDisplayMetrics().widthPixels;
-            screenH = activity.getResources().getDisplayMetrics().heightPixels;
+            Activity activity = CURRENT_ACTIVITY.get();
+            if (activity != null) {
+                screenW = activity.getResources().getDisplayMetrics().widthPixels;
+                screenH = activity.getResources().getDisplayMetrics().heightPixels;
+            }
         }
+        if (screenW <= 0) screenW = 1080;
+        if (screenH <= 0) screenH = 1920;
 
         for (int i = 0; i < nodes.size(); i++) {
             UiNode node = nodes.get(i);
@@ -235,7 +266,11 @@ public final class HmuriyBridge {
                     && overflowGlyph == null) {
                 overflowGlyph = node;
             }
-            if (isTurnTimerTab(node, screenW, screenH) && turnTab == null) turnTab = node;
+            float wait = turnTimerSeconds(node, screenW, screenH);
+            if (wait > 0f && wait < turnTabSeconds) {
+                turnTabSeconds = wait;
+                turnTab = node;
+            }
         }
 
         // Overlay button on a dead felt, not the Maximum Tables modal.
@@ -244,13 +279,17 @@ public final class HmuriyBridge {
             closedOverlay = true;
         }
 
+        // RN Modal lives in another window. Always dismiss it first, even if
+        // Fold/Call/Raise is visible on the table behind the dialog.
+        if (goToTables != null && maxTablesVisible) {
+            tapView(clickableOf(goToTables.view), "go-to-my-tables");
+            return;
+        }
+
         // A live table is never left. Overflow/menu/confirm act on the focused
         // felt; if FOLD/CHECK/CALL/RAISE is on screen, that felt is live.
         if (liveTable) {
             clearLeave("live-table");
-            if (goToTables != null && maxTablesVisible) {
-                tapView(clickableOf(goToTables.view), "go-to-my-tables");
-            }
             return;
         }
 
@@ -408,18 +447,23 @@ public final class HmuriyBridge {
         return !isClosedChip(node, screenW, screenH);
     }
 
+    private static float turnTimerSeconds(UiNode node, int screenW, int screenH) {
+        if (node == null || node.bounds == null) return -1f;
+        if (node.bounds.centerY() > screenH * 24 / 100) return -1f;
+        if (node.bounds.height() > screenH * 16 / 100) return -1f;
+        if (isTableClosed(node.compact) || isOverflowGlyph(node.text, node.compact)) return -1f;
+        String t = node.text == null ? "" : node.text.trim().toLowerCase().replace(" ", "");
+        if (!t.endsWith("s") || t.length() < 2 || t.length() > 6) return -1f;
+        String num = t.substring(0, t.length() - 1).replace(',', '.');
+        try {
+            float value = Float.parseFloat(num);
+            if (value > 0f && value <= 120f) return value;
+        } catch (Throwable ignored) {}
+        return -1f;
+    }
+
     private static boolean isTurnTimerTab(UiNode node, int screenW, int screenH) {
-        if (node == null || node.bounds == null) return false;
-        if (node.bounds.centerY() > screenH * 22 / 100) return false;
-        if (node.bounds.height() > screenH * 16 / 100) return false;
-        if (isTableClosed(node.compact) || isOverflowGlyph(node.text, node.compact)) return false;
-        String t = node.text == null ? "" : node.text.trim().toLowerCase();
-        if (t.length() < 2 || t.length() > 5) return false;
-        if (t.endsWith("s")) {
-            String num = t.substring(0, t.length() - 1);
-            return num.length() > 0 && num.length() <= 2 && isAllDigits(num);
-        }
-        return false;
+        return turnTimerSeconds(node, screenW, screenH) > 0f;
     }
 
     private static boolean isAllDigits(String s) {
@@ -556,28 +600,26 @@ public final class HmuriyBridge {
         JANITOR_LAST_TAP_MS = SystemClock.uptimeMillis();
         boolean clicked = false;
         try { clicked = target.performClick(); } catch (Throwable ignored) {}
-        if (!clicked) {
-            try {
-                int[] loc = new int[2];
-                target.getLocationOnScreen(loc);
-                float x = loc[0] + Math.max(1, target.getWidth()) / 2f;
-                float y = loc[1] + Math.max(1, target.getHeight()) / 2f;
-                View root = target.getRootView();
-                long t = SystemClock.uptimeMillis();
-                MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
-                MotionEvent up = MotionEvent.obtain(t, t + 40L, MotionEvent.ACTION_UP, x, y, 0);
-                if (root != null) {
-                    root.dispatchTouchEvent(down);
-                    root.dispatchTouchEvent(up);
-                } else {
-                    target.dispatchTouchEvent(down);
-                    target.dispatchTouchEvent(up);
-                }
-                down.recycle();
-                up.recycle();
-                clicked = true;
-            } catch (Throwable ignored) {}
-        }
+        try {
+            int[] loc = new int[2];
+            target.getLocationOnScreen(loc);
+            float x = loc[0] + Math.max(1, target.getWidth()) / 2f;
+            float y = loc[1] + Math.max(1, target.getHeight()) / 2f;
+            View root = target.getRootView();
+            long t = SystemClock.uptimeMillis();
+            MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
+            MotionEvent up = MotionEvent.obtain(t, t + 50L, MotionEvent.ACTION_UP, x, y, 0);
+            if (root != null) {
+                root.dispatchTouchEvent(down);
+                root.dispatchTouchEvent(up);
+            } else {
+                target.dispatchTouchEvent(down);
+                target.dispatchTouchEvent(up);
+            }
+            down.recycle();
+            up.recycle();
+            clicked = true;
+        } catch (Throwable ignored) {}
         if (clicked) {
             Log.i(TAG, "[+] UI janitor tap " + why);
         }

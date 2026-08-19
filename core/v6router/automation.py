@@ -29,10 +29,12 @@ LEAVE_BELOW_BB = 79.0
 OPEN_IF_FREE_BB = 100.0
 MIN_PLAYERS = 3
 JOIN_GAP_SECONDS = 8.0
+JOIN_GAP_MIN_SECONDS = 25.0
+JOIN_GAP_MAX_SECONDS = 40.0
 WATCHDOG_SECONDS = 2.0
-EMPTY_GRACE_SECONDS = 25.0
-TAB_COOLDOWN_SECONDS = 18.0
-JOIN_REJECT_COOLDOWN = 25.0
+EMPTY_GRACE_SECONDS = 8.0
+TAB_COOLDOWN_SECONDS = 45.0
+JOIN_REJECT_COOLDOWN = 30.0
 
 
 def _policy_path() -> Path:
@@ -155,6 +157,8 @@ class DeviceAutomation:
         self._leave_inflight: set[int] = set()
         self._tabs: dict[int, float] = {}
         self._join_block_until = 0.0
+        self._next_join_gap = JOIN_GAP_MIN_SECONDS
+        self._leaving_all = False
         self._status = "idle"
         self._counter = 0
         if store is not None:
@@ -175,9 +179,10 @@ class DeviceAutomation:
             ),
             "catalog_bb": bbs or list(ALLOWED_BB),
             "joining": self._joining,
+            "leaving_all": self._leaving_all,
             "gradual_leave": len(self._gradual),
             "sitout_tables": sorted(self._sitout),
-            "coin_tabs": len(self._tabs),
+            "coin_tabs": self.coin_tab_count(),
             "coin_tab_cap": COIN_MAX_TABLES,
         }
 
@@ -188,23 +193,47 @@ class DeviceAutomation:
         self.policy = policy
         if not policy.enabled:
             self._joining = False
-            self._queue = [item for item in self._queue if item.command not in {"lobby.join_game", "game.reserve_Seat", "game.take_Seat"}]
-            self._status = "paused"
+            self._queue = [
+                item for item in self._queue
+                if item.command not in {"lobby.join_game", "game.reserve_Seat", "game.take_Seat"}
+            ]
+            if not self._leaving_all:
+                self._status = "paused"
         else:
+            self._leaving_all = False
             self._status = "armed"
         if self._store is not None:
             self._store.put(self.device_id, policy)
-        self._note("automation.policy", f"auto {'on' if policy.enabled else 'off'} · {policy.table_count}×{policy.bb:g}")
+        self._note(
+            "automation.policy",
+            f"auto {'on' if policy.enabled else 'off'} · {policy.table_count}×{policy.bb:g}",
+            severity="INFO" if policy.enabled else "WARN",
+        )
         return policy
 
+    def _halt_joins(self) -> bool:
+        return (not self.policy.enabled) or self._leaving_all
+
     def schedule_leave_all(self, table_ids: list[int], *, gradual: bool) -> int:
+        self._leaving_all = True
+        self._joining = False
+        self._queue = [
+            item for item in self._queue
+            if item.command not in {"lobby.join_game", "game.reserve_Seat", "game.take_Seat"}
+        ]
+        if self.policy.enabled:
+            self.policy = AutoPolicy.from_mapping({**self.policy.public(), "enabled": False})
+            if self._store is not None:
+                self._store.put(self.device_id, self.policy)
         now = time.monotonic()
         delay = 0.0
         queued = 0
+        seen: set[int] = set()
         for table_id in table_ids:
             table_id = int(table_id)
-            if table_id <= 0:
+            if table_id <= 0 or table_id in seen:
                 continue
+            seen.add(table_id)
             if gradual:
                 delay += random.uniform(120.0, 600.0)
             self._gradual.append((table_id, now + delay, "operator leave-all"))
@@ -214,7 +243,8 @@ class DeviceAutomation:
         self._status = "leaving"
         self._note(
             "automation.leave_all",
-            f"покинуть все столы · {'постепенно' if gradual else 'сразу'} · {queued}",
+            f"покидаем все столы · join выключен · {'постепенно' if gradual else 'сразу'} · {queued}",
+            severity="WARN",
         )
         return queued
 
@@ -236,8 +266,12 @@ class DeviceAutomation:
         self._tabs[table_id] = time.monotonic() + TAB_COOLDOWN_SECONDS
         self._gradual = [row for row in self._gradual if row[0] != table_id]
         self._queue = [item for item in self._queue if item.table_id != table_id]
-        if self.policy.enabled:
+        if self._leaving_all:
+            self._status = "leaving"
+        elif self.policy.enabled:
             self._status = "refill"
+        else:
+            self._status = "paused"
 
     def _extend_ghost_tabs(self, extra_seconds: float) -> None:
         """Keep protocol-closed Coin tabs occupying the 5-slot cap.
@@ -302,7 +336,7 @@ class DeviceAutomation:
         now = time.monotonic()
         live = set(int(item) for item in (live_table_ids or self._seated))
         self._seated = {tid for tid in self._seated if tid in live}
-        if not self.policy.enabled:
+        if self._halt_joins():
             return
         pending_joins = sum(1 for item in self._queue if item.command == "lobby.join_game")
         tabs = self.coin_tab_count()
@@ -314,10 +348,11 @@ class DeviceAutomation:
             players = int(self._players.get(table_id) or 0)
             in_hand = bool(self._hand_live.get(table_id))
             age = now - float(self._seated_at.get(table_id) or now)
+            # Sit → cards → immediate leave is the short-handed first-deal bug.
             if self.policy.watch_players and players and players < int(self.policy.min_players):
                 if in_hand:
-                    self._request_leave(table_id, f"мало игроков в раздаче ({players})")
-                elif age >= EMPTY_GRACE_SECONDS:
+                    continue
+                if age >= EMPTY_GRACE_SECONDS:
                     self._request_leave(table_id, f"пусто {players} игроков после {int(age)}с")
             if self.policy.watch_balance:
                 stack = self._stack_bb.get(table_id)
@@ -328,12 +363,15 @@ class DeviceAutomation:
 
     def _can_open(self, *, open_count: int = 0) -> bool:
         now = time.monotonic()
+        if self._halt_joins():
+            self._status = "leaving" if self._leaving_all else "paused"
+            return False
         if self._joining:
             return False
         if now < float(self._join_block_until or 0.0):
             self._status = "join-cooldown"
             return False
-        if now - self._last_join_at < JOIN_GAP_SECONDS:
+        if now - self._last_join_at < float(self._next_join_gap or JOIN_GAP_MIN_SECONDS):
             return False
         if open_count >= min(int(self.policy.table_count), COIN_MAX_TABLES):
             self._status = f"cap {open_count}/{COIN_MAX_TABLES}"
@@ -372,6 +410,8 @@ class DeviceAutomation:
         return amount
 
     def _queue_join(self) -> None:
+        if self._halt_joins():
+            return
         config = self._pick_config()
         if config is None:
             return
@@ -394,8 +434,12 @@ class DeviceAutomation:
         ))
         self._joining = True
         self._last_join_at = time.monotonic()
+        self._next_join_gap = random.uniform(JOIN_GAP_MIN_SECONDS, JOIN_GAP_MAX_SECONDS)
         self._status = f"join {config.big_blind:g}"
-        self._note("automation.join", f"ищем стол NLH {config.big_blind:g} · buyin {buyin:g}")
+        self._note(
+            "automation.join",
+            f"ищем стол NLH {config.big_blind:g} · buyin {buyin:g} · пауза {self._next_join_gap:.0f}с",
+        )
 
     def _request_leave(self, table_id: int, reason: str) -> None:
         table_id = int(table_id)
@@ -408,7 +452,11 @@ class DeviceAutomation:
         if routed.is_dummy:
             url = str(routed.event.get("url") or "")
             ws = str(routed.websocket_id or "")
-            if ws and ("mainlobby" in url.lower() or routed.room_id in {None, -1, 0}):
+            if ws and (
+                "mainlobby" in url.lower()
+                or "lobby" in url.lower()
+                or routed.room_id in {None, -1, 0}
+            ):
                 self.lobby_ws = ws
                 self.lobby_url = url
             if ws and routed.room_id:
@@ -599,6 +647,12 @@ class DeviceAutomation:
     def _inject(self, routed: RoutedEvent) -> Optional[dict[str, Any]]:
         now = time.monotonic()
         ws = str(routed.websocket_id or "")
+        if self._halt_joins():
+            self._queue = [
+                item for item in self._queue
+                if item.command not in {"lobby.join_game", "game.reserve_Seat", "game.take_Seat"}
+            ]
+            self._joining = False
         for index, item in enumerate(self._queue):
             if item.due_at > now:
                 continue

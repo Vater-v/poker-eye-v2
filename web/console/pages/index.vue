@@ -42,7 +42,7 @@ async function toggleAutoPanel(device: DeviceRow, on: boolean) {
   if (on && !autoDraft.value[device.device_id]) {
     setDraft(device, { enabled: device.automation?.enabled || false });
   }
-  if (!on && device.automation?.enabled) {
+  if (!on) {
     await control("device/auto", {
       device_id: device.device_id,
       policy: { ...policyOf(device), enabled: false },
@@ -67,7 +67,10 @@ async function leaveAll(device: DeviceRow) {
   const gradual = !!gradualLeave.value[device.device_id];
   const label = gradual ? "Покинуть все столы постепенно (2–10 мин на стол)?" : "Покинуть все столы сразу?";
   if (!confirm(label)) return;
-  await control("device/leave-all", { device_id: device.device_id, gradual });
+  const result = await control("device/leave-all", { device_id: device.device_id, gradual });
+  if (!result || (result as { ok?: boolean }).ok === false) {
+    window.alert("Не удалось поставить выход со всех столов. Устройство offline?");
+  }
 }
 onMounted(() => {
   const tick = () => { clock.value = new Date().toLocaleTimeString(); };
@@ -176,7 +179,8 @@ function isLiveAction(e: ConsoleEvent) {
     "operator.action_ready", "operator.action_sent", "operator.action_confirmed",
     "operator.hero_turn", "operator.cards", "operator.hand_started",
     "operator.hand_completed", "operator.prefold_ready", "operator.seated",
-    "operator.standup_queued", "v6.bridge_diag",
+    "operator.standup_queued", "operator.automation.leave_all", "operator.automation.policy",
+    "operator.automation.join_rejected", "v6.bridge_diag",
   ].includes(ev) || ["action_ready", "hero_turn", "cards", "prefold_ready", "seated"].includes(tag);
 }
 
@@ -367,11 +371,11 @@ const modes: Array<[LogMode, string]> = [
                     <button class="px-2 py-1 rounded border border-[#2c3644]" @click="cancelAuto(d)">Отмена</button>
                     <span class="text-[11px] text-[#8b95a3]">{{ d.automation?.status || "idle" }}<span v-if="d.automation?.wallet_bb != null"> · кошелёк {{ d.automation.wallet_bb }} BB</span></span>
                     <div class="flex-1" />
-                    <label v-if="(d.tables || []).length" class="flex items-center gap-1 text-[11px] text-[#8b95a3]">
+                    <label class="flex items-center gap-1 text-[11px] text-[#8b95a3]">
                       <input type="checkbox" :checked="!!gradualLeave[d.device_id]" @change="gradualLeave = { ...gradualLeave, [d.device_id]: ($event.target as HTMLInputElement).checked }" />
                       постепенно
                     </label>
-                    <button v-if="(d.tables || []).length" class="px-2 py-1 rounded border border-[#2c3644] hover:border-[#ff6b73]" @click="leaveAll(d)">Покинуть все столы</button>
+                    <button class="px-2 py-1 rounded border border-[#2c3644] hover:border-[#ff6b73]" @click="leaveAll(d)">Покинуть все столы</button>
                   </div>
                 </td>
               </tr>

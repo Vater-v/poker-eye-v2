@@ -2265,7 +2265,10 @@ class DeviceIngressRouter:
         async with self._lock:
             for table_id, reason in list(leaves) + extra:
                 if int(table_id) not in self._sessions:
-                    auto.note_table_closed(int(table_id), "already-gone")
+                    # Unrecognized Coin tabs still occupy the 5-slot cap. Do not
+                    # pretend they closed — that used to refill into a 6th join.
+                    if not auto._leaving_all:
+                        auto.note_table_closed(int(table_id), "already-gone")
                     continue
                 match = next((row for row in rows if int(row["table_id"]) == int(table_id)), None)
                 room = int((match or {}).get("room") or 0)
@@ -2412,7 +2415,7 @@ class DeviceIngressRouter:
         try:
             # Give the native FOLD/STANDUP/LEAVE sequence time to receive local
             # send ACKs and the Coin quit ACK.  The account lease is still bounded.
-            await asyncio.sleep(6.0)
+            await asyncio.sleep(0.8)
             if int(table_id) in self._sessions:
                 state = self._unsupported_exit.get(int(table_id)) or {}
                 kind = str(state.get("kind") or "unsupported")
