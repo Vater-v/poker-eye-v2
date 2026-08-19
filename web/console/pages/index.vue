@@ -64,7 +64,7 @@ async function cancelAuto(device: DeviceRow) {
 }
 
 async function leaveAll(device: DeviceRow) {
-  const gradual = !!gradualLeave.value[device.device_id];
+  const gradual = gradualLeave.value[device.device_id] !== false;
   const label = gradual ? "Покинуть все столы постепенно (2–10 мин на стол)?" : "Покинуть все столы сразу?";
   if (!confirm(label)) return;
   const result = await control("device/leave-all", { device_id: device.device_id, gradual });
@@ -159,7 +159,7 @@ const stats = computed(() => {
   const issues = events.value.filter((e) => isIssue(e)).length;
   return {
     devices: devices.length,
-    online: snapshot.value?.connected_devices || devices.filter((d) => d.connected).length,
+    online: devices.filter((d) => d.connected).length,
     tables: tables.length,
     ready: tables.filter((t) => t.state === "ready").length,
     fuel: fuels.length ? fuels.reduce((a, b) => a + b, 0) : null,
@@ -180,7 +180,7 @@ function isLiveAction(e: ConsoleEvent) {
     "operator.hero_turn", "operator.cards", "operator.hand_started",
     "operator.hand_completed", "operator.prefold_ready", "operator.seated",
     "operator.standup_queued", "operator.automation.leave_all", "operator.automation.policy",
-    "operator.automation.join_rejected", "v6.bridge_diag",
+    "operator.automation.join_rejected", "operator.table_observing", "v6.bridge_diag",
   ].includes(ev) || ["action_ready", "hero_turn", "cards", "prefold_ready", "seated"].includes(tag);
 }
 
@@ -372,7 +372,7 @@ const modes: Array<[LogMode, string]> = [
                     <span class="text-[11px] text-[#8b95a3]">{{ d.automation?.status || "idle" }}<span v-if="d.automation?.wallet_bb != null"> · кошелёк {{ d.automation.wallet_bb }} BB</span></span>
                     <div class="flex-1" />
                     <label class="flex items-center gap-1 text-[11px] text-[#8b95a3]">
-                      <input type="checkbox" :checked="!!gradualLeave[d.device_id]" @change="gradualLeave = { ...gradualLeave, [d.device_id]: ($event.target as HTMLInputElement).checked }" />
+                      <input type="checkbox" :checked="gradualLeave[d.device_id] !== false" @change="gradualLeave = { ...gradualLeave, [d.device_id]: ($event.target as HTMLInputElement).checked }" />
                       постепенно
                     </label>
                     <button class="px-2 py-1 rounded border border-[#2c3644] hover:border-[#ff6b73]" @click="leaveAll(d)">Покинуть все столы</button>
@@ -386,7 +386,7 @@ const modes: Array<[LogMode, string]> = [
                     <div>
                       <div class="font-semibold">Стол {{ t.table_no || "?" }} <span class="text-[#8b95a3] font-normal">{{ t.game_type || "—" }}</span></div>
                       <div class="text-[11px] text-[#8b95a3]">{{ t.hero_name || deviceName(d) }} · {{ d.connected ? "online" : "offline" }}</div>
-                      <div class="text-[11px] mt-1">{{ t.hero_sitting ? "сидим" : "наблюдаем" }}<span v-if="t.standup_queued" class="text-[#e7bb55]"> · стендап после руки</span></div>
+                      <div class="text-[11px] mt-1">{{ t.hero_sitting ? "сидим" : "наблюдаем" }}<span v-if="t.state === 'observing'" class="text-[#8b95a3]"> · лобби</span><span v-if="t.standup_queued" class="text-[#e7bb55]"> · стендап после руки</span></div>
                     </div>
                     <div class="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1 text-[11px] min-w-0">
                       <div><span class="text-[#8b95a3]">игроки</span> {{ t.players ?? "—" }}<span v-if="t.max_seats"> / {{ t.max_seats }}</span></div>

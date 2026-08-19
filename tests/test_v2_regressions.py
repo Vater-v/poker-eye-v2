@@ -118,6 +118,20 @@ class V2RegressionTests(unittest.TestCase):
             self.assertEqual(reloaded.state_for("base-9"), AccountState.QUARANTINED)
             self.assertEqual(reloaded.acquire("b").account_id, "base-10")
 
+    def test_operator_shows_table_from_observing_not_only_seat(self):
+        logger = _Logger()
+        console = OperatorConsole(logger, 1)
+        device = "dev-obs"
+        console.device_up(device)
+        console.observation(RouterObservation(
+            "table_pending", device, 1148030, status="yellow",
+            reason="allocated; waiting for game_init",
+            pending=True,
+            detail={"provisional": True},
+        ))
+        messages = [str(fields.get("message") or "") for _event, fields in logger.rows]
+        self.assertTrue(any("наблюдаем" in text for text in messages))
+
     def test_operator_counts_hands_by_game_type_per_device_session(self):
         logger = _Logger()
         console = OperatorConsole(logger, 7, accounts_dynamic=True)

@@ -1496,7 +1496,7 @@ class DeviceIngressRouter:
         max_inflight: int = 128,
         close_grace_seconds: float = 15.0,
         closing_tombstone_seconds: float = 15.0,
-        provisional_timeout: float = 30.0,
+        provisional_timeout: float = 900.0,
         startup_max_attempts: int = 3,
         startup_backoff_base: float = 0.25,
         startup_backoff_max: float = 2.0,
@@ -3185,6 +3185,33 @@ class DeviceIngressRouter:
                     hero_seat=int(bridge.state.get("hero_seat") or 0),
                 )
             tables.append(row)
+        session_ids = {int(slot.table_id) for slot in ordered}
+        async with self._lock:
+            pending_rows = [
+                (int(table_id), dict(meta))
+                for table_id, meta in self._provisional.items()
+                if int(table_id) not in session_ids
+            ]
+        for table_id, meta in pending_rows:
+            tables.append({
+                "table_id": int(table_id),
+                "table_no": len(tables) + 1,
+                "state": "observing",
+                "hero_sitting": False,
+                "phase": "observe",
+                "game_type": str(meta.get("game_type") or ""),
+                "account_id": "",
+                "startup_attempts": 0,
+                "startup_error": "",
+                "age_seconds": max(0.0, now - float(meta.get("updated") or now)),
+                "seen_seconds": 0.0,
+                "players": 0,
+                "max_seats": 0,
+                "seats": [],
+                "hole_cards": [],
+                "last_action": "",
+                "pending_action": False,
+            })
         auto = self.automation.snapshot() if self.automation is not None else {}
         return {
             "device_id": self.device_id,

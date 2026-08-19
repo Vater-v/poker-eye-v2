@@ -741,6 +741,17 @@ class OperatorConsole:
                             self._line(f"{label}: PokerEYE ошибка{(' — ' + message) if message else ''}", "operator.eye_error", severity="WARN", device_id=device, table_id=table)
                     elif health == "green" and previous in {"red", "yellow"}:
                         self._line(f"{label}: PokerEYE восстановлен", "operator.eye_recovered", device_id=device, table_id=table)
+        elif kind in {"table_pending", "table_open"} and table > 0:
+            self._line(
+                f"◆ {label}: стол в Coin · наблюдаем",
+                "operator.table_observing",
+                device_id=device, table_id=table, pending=True,
+            )
+        elif kind == "table_close" and table > 0 and detail.get("provisional"):
+            self.technical(
+                "operator.table_pending_gone", device_id=device, table_id=table,
+                reason=observation.reason,
+            )
         elif kind == "table_close" and table > 0:
             crashed = bool(detail.get("crashed")) or str(observation.status).lower() == "red"
             unsupported="DOUBLE BOARD" in str(observation.reason or "").upper()
@@ -1224,6 +1235,9 @@ class RouterService:
             self._last_seen[device_id] = time.monotonic()
             if str(device_label or "").strip():
                 self._device_labels[device_id] = str(device_label).strip()
+            # Device must exist in the fleet snapshot from TCP hello, not from
+            # the first Coin table packet. Otherwise the header shows 1/0.
+            self.loop.create_task(self._router(str(device_id)))
         self.loop.call_soon_threadsafe(mark)
 
     def transport_down(self, device_id: str) -> None:
@@ -1270,6 +1284,7 @@ class RouterService:
                 fleet = dict(provider() or {})
             except Exception:
                 fleet = {}
+        listed: set[str] = set()
         for device_id, router in sorted(self._routers.items()):
             row = await router.control_snapshot()
             stats = fleet.get(device_id) or {}
@@ -1283,6 +1298,24 @@ class RouterService:
             row["hands_by_type"] = dict(stats.get("hands_by_type") or {})
             row["session_hands"] = str(stats.get("session_hands") or "")
             devices.append(row)
+            listed.add(device_id)
+        for device_id in sorted(self._connected):
+            if device_id in listed:
+                continue
+            stats = fleet.get(device_id) or {}
+            devices.append({
+                "device_id": device_id,
+                "connected": True,
+                "tables": [],
+                "device_label": self._device_labels.get(device_id, ""),
+                "device_no": stats.get("device_no"),
+                "hero_name": str(stats.get("nick") or ""),
+                "display_name": str(stats.get("nick") or self._device_labels.get(device_id, "") or f"Устройство {stats.get('device_no') or '?'}"),
+                "hands": int(stats.get("hands") or 0),
+                "hands_by_type": dict(stats.get("hands_by_type") or {}),
+                "session_hands": str(stats.get("session_hands") or ""),
+                "automation": {},
+            })
         accounts = [
             {
                 "account_id": row.account_id,
@@ -1302,7 +1335,7 @@ class RouterService:
             "patch": "MTABLE-20260818-A",
             "devices": devices,
             "accounts": accounts,
-            "connected_devices": len(self._connected),
+            "connected_devices": sum(1 for row in devices if row.get("connected")),
             "max_tables_per_device": MAX_TABLES_PER_DEVICE,
         }
 
