@@ -52,9 +52,12 @@ public final class HmuriyBridge {
     private static volatile boolean UI_JANITOR_STARTED = false;
     // Coin keeps TABLE CLOSED tabs after protocol quit_table. Janitor walks
     // overflow ("...") -> leave-table -> confirm. One tap per 700ms sweep.
-    private static long JANITOR_CLOSED_SEEN_MS = 0L;
+    // LEAVE_STEP is armed only while the focused felt is a closed table.
+    // It must never survive a switch onto a live table (that would sit us out).
     private static long JANITOR_LAST_TAP_MS = 0L;
     private static int JANITOR_OVERFLOW_ROT = 0;
+    private static int LEAVE_STEP = 0;
+    private static long LEAVE_STEP_MS = 0L;
     private static final String DEVICE_ID = deviceId();
     private static final String PROCESS_NAME = currentProcessName();
     private static final String PROCESS_KEY = processKey(PROCESS_NAME);
@@ -168,6 +171,24 @@ public final class HmuriyBridge {
         Log.i(TAG, "[+] UI janitor attached");
     }
 
+    private static void clearLeave(String why) {
+        if (LEAVE_STEP != 0) {
+            Log.i(TAG, "[~] UI janitor abort leave step=" + LEAVE_STEP + " " + why);
+        }
+        LEAVE_STEP = 0;
+        LEAVE_STEP_MS = 0L;
+        JANITOR_OVERFLOW_ROT = 0;
+    }
+
+    private static void armLeave(int step, long now) {
+        LEAVE_STEP = step;
+        LEAVE_STEP_MS = now;
+    }
+
+    private static boolean leaveArmed(int minStep, long now) {
+        return LEAVE_STEP >= minStep && now - LEAVE_STEP_MS < 5000L;
+    }
+
     private static void sweepBlockingUi() {
         Activity activity = CURRENT_ACTIVITY.get();
         if (activity == null || activity.isFinishing()) return;
@@ -179,16 +200,19 @@ public final class HmuriyBridge {
 
         long now = SystemClock.uptimeMillis();
         if (now - JANITOR_LAST_TAP_MS < 650L) return;
+        if (LEAVE_STEP != 0 && now - LEAVE_STEP_MS > 5000L) clearLeave("timeout");
 
         UiNode confirmTitle = null;
         UiNode yesBtn = null;
         UiNode leaveTable = null;
         UiNode goToTables = null;
-        UiNode closedTab = null;
+        UiNode closedChip = null;
         UiNode overflowGlyph = null;
-        boolean closedEvidence = false;
+        UiNode turnTab = null;
+        boolean closedOverlay = false;
         boolean maxTablesVisible = false;
         boolean dangerousConfirm = false;
+        boolean liveTable = false;
         int screenW = root.getWidth();
         int screenH = root.getHeight();
         if (screenW <= 0 || screenH <= 0) {
@@ -204,52 +228,84 @@ public final class HmuriyBridge {
             if (isLeaveTableMenu(node.compact) && leaveTable == null) leaveTable = node;
             if (isGoToMyTables(node.compact) && goToTables == null) goToTables = node;
             if (isMaxTables(node.compact)) maxTablesVisible = true;
-            if (isMaxTables(node.compact) || isTableClosed(node.compact)) closedEvidence = true;
-            if (isTableClosed(node.compact) && closedTab == null) closedTab = node;
+            if (isLiveActionButton(node, screenH)) liveTable = true;
+            if (isClosedChip(node, screenW, screenH) && closedChip == null) closedChip = node;
+            if (isClosedOverlay(node, screenW, screenH)) closedOverlay = true;
             if (isOverflowGlyph(node.text, node.compact) && isTopLeft(node, screenW, screenH)
                     && overflowGlyph == null) {
                 overflowGlyph = node;
             }
+            if (isTurnTimerTab(node, screenW, screenH) && turnTab == null) turnTab = node;
         }
 
-        // TABLE CLOSED felt is often an image; the overlay still exposes
-        // "Go to my tables" as Text. That is closed-tab evidence, not a leave.
-        if (goToTables != null && !maxTablesVisible) closedEvidence = true;
-        if (closedEvidence) JANITOR_CLOSED_SEEN_MS = now;
-        boolean wantClose = closedEvidence || (now - JANITOR_CLOSED_SEEN_MS) < 12000L;
+        // Overlay button on a dead felt, not the Maximum Tables modal.
+        if (goToTables != null && !maxTablesVisible
+                && goToTables.bounds.centerY() > screenH * 22 / 100) {
+            closedOverlay = true;
+        }
 
-        // Never confirm logout / exit-app / KYC. Table-exit confirm is the
-        // last step of overflow -> leave table -> yes.
-        if (confirmTitle != null && !dangerousConfirm) {
-            View tap = yesBtn != null ? clickableOf(yesBtn.view) : rightConfirmButton(nodes, screenW, screenH);
-            if (tapView(tap, "confirm-exit-table")) {
-                JANITOR_CLOSED_SEEN_MS = 0L;
-                JANITOR_OVERFLOW_ROT = 0;
+        // A live table is never left. Overflow/menu/confirm act on the focused
+        // felt; if FOLD/CHECK/CALL/RAISE is on screen, that felt is live.
+        if (liveTable) {
+            clearLeave("live-table");
+            if (goToTables != null && maxTablesVisible) {
+                tapView(clickableOf(goToTables.view), "go-to-my-tables");
             }
             return;
         }
-        if (leaveTable != null) {
-            tapView(clickableOf(leaveTable.view), "leave-table");
+
+        if (confirmTitle != null && !dangerousConfirm && leaveArmed(2, now)) {
+            View tap = yesBtn != null ? clickableOf(yesBtn.view)
+                    : rightConfirmButton(nodes, screenW, screenH);
+            if (tapView(tap, "confirm-exit-table")) {
+                clearLeave("confirmed");
+            }
             return;
         }
-        // Only the Maximum Tables Opened modal. TABLE CLOSED overlays also
-        // show Go to my tables and tapping it would starve the leave path.
+        if (confirmTitle != null && !leaveArmed(2, now)) {
+            return;
+        }
+
+        if (leaveTable != null && (closedOverlay || leaveArmed(1, now))) {
+            if (tapView(clickableOf(leaveTable.view), "leave-table")) {
+                armLeave(2, now);
+            }
+            return;
+        }
+        if (leaveTable != null && !closedOverlay) {
+            clearLeave("leave-menu-without-overlay");
+            return;
+        }
+
         if (goToTables != null && maxTablesVisible) {
             tapView(clickableOf(goToTables.view), "go-to-my-tables");
             return;
         }
-        if (closedTab != null && clickableOf(closedTab.view) != null
-                && (now - JANITOR_LAST_TAP_MS) > 1200L) {
-            tapView(clickableOf(closedTab.view), "focus-closed-tab");
-            return;
-        }
-        if (wantClose && overflowGlyph != null) {
-            tapView(clickableOf(overflowGlyph.view), "overflow-glyph");
-            return;
-        }
-        if (wantClose) {
+
+        // Dead felt is focused: overflow is safe. Do not use a stale timer.
+        if (closedOverlay) {
+            if (overflowGlyph != null) {
+                if (tapView(clickableOf(overflowGlyph.view), "overflow-glyph")) {
+                    armLeave(1, now);
+                }
+                return;
+            }
             View overflow = pickTopLeftOverflow(nodes, screenW, screenH);
-            if (overflow != null) tapView(overflow, "overflow-topleft");
+            if (overflow != null && tapView(overflow, "overflow-topleft")) {
+                armLeave(1, now);
+            }
+            return;
+        }
+
+        // Show the acting table first. Never open overflow off a live felt.
+        if (turnTab != null && !leaveArmed(1, now)) {
+            tapView(clickableOf(turnTab.view), "focus-turn-tab");
+            return;
+        }
+
+        // Another tab is dead while this felt is not: only switch onto it.
+        if (closedChip != null) {
+            tapView(clickableOf(closedChip.view), "focus-closed-tab");
         }
     }
 
@@ -323,6 +379,56 @@ public final class HmuriyBridge {
                 || c.contains("\u044d\u0442\u043e\u0442\u0441\u0442\u043e\u043b\u0437\u0430\u043a\u0440\u044b\u0442")
                 || c.contains("\u0441\u0442\u043e\u043b\u0437\u0430\u043a\u0440\u044b\u0442")
                 || c.contains("thistableisclosed");
+    }
+
+    private static boolean isActionLabel(String c) {
+        return c.equals("fold") || c.equals("check") || c.equals("call")
+                || c.equals("raise") || c.equals("bet") || c.equals("allin")
+                || c.equals("all-in") || c.equals("check/fold") || c.equals("checkfold")
+                || c.equals("\u0444\u043e\u043b\u0434") || c.equals("\u0447\u0435\u043a")
+                || c.equals("\u043a\u043e\u043b\u043b") || c.equals("\u0440\u0435\u0439\u0437")
+                || c.equals("\u0431\u0435\u0442");
+    }
+
+    private static boolean isLiveActionButton(UiNode node, int screenH) {
+        if (node == null || node.bounds == null) return false;
+        if (node.bounds.centerY() < screenH * 48 / 100) return false;
+        return isActionLabel(node.compact);
+    }
+
+    private static boolean isClosedChip(UiNode node, int screenW, int screenH) {
+        if (node == null || node.bounds == null || !isTableClosed(node.compact)) return false;
+        return node.bounds.centerY() <= screenH * 22 / 100
+                && node.bounds.height() < screenH * 18 / 100
+                && node.bounds.width() < screenW * 42 / 100;
+    }
+
+    private static boolean isClosedOverlay(UiNode node, int screenW, int screenH) {
+        if (node == null || node.bounds == null || !isTableClosed(node.compact)) return false;
+        return !isClosedChip(node, screenW, screenH);
+    }
+
+    private static boolean isTurnTimerTab(UiNode node, int screenW, int screenH) {
+        if (node == null || node.bounds == null) return false;
+        if (node.bounds.centerY() > screenH * 22 / 100) return false;
+        if (node.bounds.height() > screenH * 16 / 100) return false;
+        if (isTableClosed(node.compact) || isOverflowGlyph(node.text, node.compact)) return false;
+        String t = node.text == null ? "" : node.text.trim().toLowerCase();
+        if (t.length() < 2 || t.length() > 5) return false;
+        if (t.endsWith("s")) {
+            String num = t.substring(0, t.length() - 1);
+            return num.length() > 0 && num.length() <= 2 && isAllDigits(num);
+        }
+        return false;
+    }
+
+    private static boolean isAllDigits(String s) {
+        if (s == null || s.length() == 0) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch < '0' || ch > '9') return false;
+        }
+        return true;
     }
 
     private static boolean isDangerousConfirm(String c) {
