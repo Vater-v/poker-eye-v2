@@ -649,6 +649,19 @@ class MidHandStandupTests(unittest.TestCase):
         self.assertTrue(bridge._is_active_room(57953))
         self.assertFalse(bridge._is_active_room(1))
 
+    def test_immediate_sit_ack_without_uid_is_still_hero(self):
+        from core.verified_v1.coin_bridge_live import LiveCoinBridge
+
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="HeroNick", user_id=42)
+        bridge.identity.update(user_name="HeroNick", user_id=42)
+        self.assertTrue(bridge._is_hero_row({"userName": "HeroNick", "userId": 0, "seatId": 3}))
+        self.assertTrue(bridge._is_hero_row({"userId": 42, "seatId": 3}))
+        bridge.active_hook_room = 100
+        self.assertTrue(bridge._is_hero_row({"seatId": 2, "buyinAmount": 2}, room=100))
+        self.assertFalse(bridge._is_hero_row({"userName": "Villain", "userId": 9, "seatId": 1}))
+        self.assertTrue(bridge._is_hero_turn({"whoseTurn": "HeroNick"}))
+
     def test_operator_fleet_snapshot_counts_hands_by_type(self):
         logger = _Logger()
         console = OperatorConsole(logger, 7, accounts_dynamic=True)

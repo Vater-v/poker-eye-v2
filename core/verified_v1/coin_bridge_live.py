@@ -224,19 +224,46 @@ class LiveCoinBridge:
         self._hero_turn_this_hand=False
         self.hero_sitting_out=False
 
-    def _is_hero_turn(self, data: dict) -> bool:
-        """Hero turn is the Coin actor matching login name or numeric uid."""
-        if not isinstance(data, dict):
-            return False
-        hero_name=str(self.state.get("user_name") or self.identity.get("user_name") or "").strip()
-        whose=str(data.get("whoseTurn") or data.get("userName") or "").strip()
-        if hero_name and whose and whose.casefold()==hero_name.casefold():
-            return True
+    def _hero_identity(self) -> tuple[int, str]:
         try:hero_id=int(self.state.get("user_id") or self.identity.get("user_id") or 0)
         except (TypeError,ValueError):hero_id=0
-        try:whose_id=int(data.get("userId") or data.get("whoseTurnUserId") or 0)
-        except (TypeError,ValueError):whose_id=0
-        return bool(hero_id and whose_id and hero_id==whose_id)
+        hero_name=str(self.state.get("user_name") or self.identity.get("user_name") or "").strip()
+        return hero_id, hero_name
+
+    def _is_hero_row(self, data: dict, *, room: Optional[int] = None) -> bool:
+        """Match a Coin seat/sit/turn row to this session's hero.
+
+        Immediate sit often ACKs with userId=0. Name, then uid, then 'this
+        table's sit ACK' are all valid; 0==0 is not.
+        """
+        if not isinstance(data, dict):
+            return False
+        hero_id, hero_name = self._hero_identity()
+        name=str(data.get("userName") or data.get("whoseTurn") or "").strip()
+        if hero_name and name and name.casefold()==hero_name.casefold():
+            return True
+        try:uid=int(data.get("userId") or data.get("whoseTurnUserId") or 0)
+        except (TypeError,ValueError):uid=0
+        if hero_id and uid and uid==hero_id:
+            return True
+        if data.get("seatId") and not uid and room is not None:
+            active=self.context_hook_room if self.context_active else self.active_hook_room
+            if active is not None and int(room)==int(active):
+                return True
+        return False
+
+    def _is_hero_turn(self, data: dict) -> bool:
+        """Hero turn is the Coin actor matching login name or numeric uid."""
+        if self._is_hero_row(data):
+            return True
+        if not self.hero_sitting:
+            return False
+        whose=str(data.get("whoseTurn") or data.get("userName") or "").strip()
+        try:seat=int(self.state.get("hero_seat") or 0)
+        except (TypeError,ValueError):seat=0
+        row=self.seat_map.get(seat) if seat else None
+        seat_name=str((row or {}).get("userName") or "").strip()
+        return bool(seat_name and whose and whose.casefold()==seat_name.casefold())
 
     def _hand_in_progress(self) -> bool:
         """True while Coin still has us in the current hand.
@@ -953,7 +980,10 @@ class LiveCoinBridge:
             if room is not None and ce.table_id:
                 self.room_to_table[room]=int(ce.table_id); self.table_to_room[int(ce.table_id)]=room
                 tid=tid or int(ce.table_id)
-            if room is not None and tid and cmd in ("game.wait_list_data","game.game_init","game.game_alldata"):
+            if room is not None and tid and cmd in (
+                "game.wait_list_data","game.game_init","game.game_alldata",
+                "game.take_Seat","game.pre_hand_start_info","game.user_turn",
+            ):
                 self.room_to_table[room]=tid; self.table_to_room[tid]=room
                 try:
                     stamp=int(str(data.get("initTimeStamp") or 0))
@@ -989,7 +1019,9 @@ class LiveCoinBridge:
                     except (TypeError,ValueError):
                         seat=0
                     if seat>0:self.state["hero_seat"]=seat
-                    if (room is not None and float(hero.get("userChips") or 0)>0
+                    try:chips=float(hero.get("userChips") or hero.get("buyinAmount") or 0)
+                    except (TypeError,ValueError):chips=0.0
+                    if (room is not None and (chips>0 or seat>0)
                             and room not in self.closing_rooms):
                         self.active_hook_room=room
                         if not self.state.get("_operator_seated"):
@@ -2633,9 +2665,12 @@ class LiveCoinBridge:
                         async with self.context_lock:self._abort_leave_table_context(room)
             return
 
-        if direction=="in" and cmd in ("game.wait_list_data","game.game_alldata"):
-            if room==self.active_hook_room:await self.ensure_observer_context()
-            return
+        if direction=="in" and cmd in ("game.wait_list_data","game.game_alldata","game.game_init"):
+            if room==self.active_hook_room or self.active_hook_room is None:
+                self._claim_hook_room(room)
+                await self.ensure_observer_context()
+            if cmd in ("game.wait_list_data","game.game_alldata"):
+                return
 
         if room==self.active_hook_room and self.context_active and self.context_hook_room!=room and cmd in ("game.seatInfo","game.pre_hand_start_info","game.user_turn"):
             await self.ensure_observer_context()
@@ -2646,11 +2681,18 @@ class LiveCoinBridge:
         if direction=="in" and cmd=="game.seatInfo" and isinstance(data,dict):
             await self.apply_seat_snapshot(data)
         elif direction=="in" and cmd=="game.take_Seat" and isinstance(data,dict):
-            # seatInfo usually arrives first; this is a fallback if it did not.
+            # Immediate sit often has userId=0 and chips in buyinAmount only.
             self.hero_departing=False; self.deferred_seat_snapshot=None
-            uid=int(data.get("userId") or self.state.get("user_id") or 0)
-            if uid==int(self.state.get("user_id") or 0) and data.get("seatId"):
-                row=dict(data); row.setdefault("userName",self.state.get("user_name")); row.setdefault("userChips",data.get("buyinAmount",0))
+            if self._is_hero_row(data, room=room) and data.get("seatId"):
+                self._promote_identity(
+                    data.get("userName") or self.state.get("user_name"),
+                    data.get("userId"),
+                    "take_Seat",
+                )
+                row=dict(data)
+                row.setdefault("userName",self.state.get("user_name"))
+                if row.get("userChips") in (None, "", 0, 0.0):
+                    row["userChips"]=data.get("buyinAmount") or 0
                 await self._send_hero_sit(row)
         elif direction=="in" and cmd=="game.leave_Seat" and isinstance(data,dict):
             self.hero_departing=True
