@@ -28,6 +28,61 @@ def log(tag: str, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
 
 
+def format_action_hint(action: Any, amount: Any = None, delay_ms: Any = 0) -> str:
+    """Operator/HUD line shown BEFORE the Coin send: ACTION amount delay_ms."""
+    name = str(action or "FOLD").strip().upper() or "FOLD"
+    if name.endswith(" ACK"):
+        name = name[:-4].strip() or "FOLD"
+    try:
+        amt = float(amount if amount is not None else 0.0)
+    except (TypeError, ValueError):
+        amt = 0.0
+    if abs(amt) < 1e-9:
+        amt_s = "0.0"
+    else:
+        amt_s = f"{amt:.2f}".rstrip("0").rstrip(".")
+        if "." not in amt_s:
+            amt_s += ".0"
+    try:
+        delay = max(0, int(round(float(delay_ms or 0))))
+    except (TypeError, ValueError):
+        delay = 0
+    return f"{name} {amt_s} {delay}"
+
+
+def hud_action(
+    action: Any,
+    amount: Any = None,
+    delay_ms: Any = 0,
+    *,
+    sticky: bool = True,
+    leave: bool = False,
+    source: str = "cc",
+) -> dict[str, Any]:
+    text = format_action_hint(action, amount, delay_ms)
+    try:
+        delay = max(0, int(round(float(delay_ms or 0))))
+    except (TypeError, ValueError):
+        delay = 0
+    src = str(source or "cc").strip().lower() or "cc"
+    name = str(action or "FOLD").strip().upper() or "FOLD"
+    if src == "prefold" and name == "FOLD":
+        name = "PREFOLD"
+        text = format_action_hint("PREFOLD", amount, delay_ms)
+    tone = "red" if leave else ("red" if delay == 0 and src != "cc" else "green")
+    return {
+        "text": text,
+        "sticky": bool(sticky),
+        "leave": bool(leave),
+        "tone": tone,
+        "action": name,
+        "amount": amount,
+        "delay_ms": delay,
+        "source": src,
+        "from_cc": src == "cc",
+    }
+
+
 def lp_pack(obj: dict) -> bytes:
     raw=json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()
     return struct.pack(">I",len(raw))+raw
@@ -222,6 +277,7 @@ class LiveCoinBridge:
         self.cc_miss_streak=0
         self._hand_cc_failed=False
         self._hero_turn_this_hand=False
+        self.cc_failsafe_standup=False
         self.hero_sitting_out=False
 
     def _hero_identity(self) -> tuple[int, str]:
@@ -246,14 +302,17 @@ class LiveCoinBridge:
         except (TypeError,ValueError):uid=0
         if hero_id and uid and uid==hero_id:
             return True
+        # take_Seat ACK may have userId=0. Never treat a random seat/cards
+        # packet without uid as hero — that copied another table's hole cards.
         if data.get("seatId") and not uid and room is not None:
-            active=self.context_hook_room if self.context_active else self.active_hook_room
-            if active is not None and int(room)==int(active):
-                return True
+            if data.get("isSeated") is True or data.get("buyinAmount") not in (None, "", 0, 0.0):
+                active=self.context_hook_room if self.context_active else self.active_hook_room
+                if active is not None and int(room)==int(active):
+                    return True
         return False
 
     def _is_hero_turn(self, data: dict) -> bool:
-        """Hero turn is the Coin actor matching login name or numeric uid."""
+        """Hero turn is the Coin actor matching login name, uid, or our seat+options."""
         if self._is_hero_row(data):
             return True
         if not self.hero_sitting:
@@ -263,7 +322,45 @@ class LiveCoinBridge:
         except (TypeError,ValueError):seat=0
         row=self.seat_map.get(seat) if seat else None
         seat_name=str((row or {}).get("userName") or "").strip()
-        return bool(seat_name and whose and whose.casefold()==seat_name.casefold())
+        if seat_name and whose and whose.casefold()==seat_name.casefold():
+            return True
+        try:turn_seat=int(data.get("seatId") or 0)
+        except (TypeError,ValueError):turn_seat=0
+        opts=data.get("userTurnOptions") or {}
+        if opts and seat and turn_seat==seat:
+            return True
+        return False
+
+    def _note_mapped_eye_action(self) -> None:
+        """A real Eye-mapped action clears the failsafe streak."""
+        self._hand_cc_failed=False
+        self.cc_miss_streak=0
+        self.cc_failsafe_standup=False
+
+    def _arm_failsafe_standup(self) -> None:
+        if self.cc_failsafe_standup:
+            return
+        self.cc_failsafe_standup=True
+        self.hero_departing=True
+        self._diagnostic(
+            "cc_streak_standup",
+            f"PokerEYE failsafe {self.cc_miss_streak} hero turns; standup",
+            {"streak":self.cc_miss_streak},
+        )
+
+    def _account_hero_hand_cc(self) -> None:
+        """Count CHECK/FOLD failsafe hero turns. Stand up after more than three."""
+        if self._hero_turn_this_hand and self._hand_cc_failed:
+            self.cc_miss_streak=int(self.cc_miss_streak or 0)+1
+            self._diagnostic("cc_miss_hand",f"PokerEYE failsafe hero-turn streak={self.cc_miss_streak}",{
+                "streak":self.cc_miss_streak,
+            })
+            if self.cc_miss_streak>3:
+                self._arm_failsafe_standup()
+        elif self._hero_turn_this_hand:
+            self._note_mapped_eye_action()
+        self._hero_turn_this_hand=False
+        self._hand_cc_failed=False
 
     def _hand_in_progress(self) -> bool:
         """True while Coin still has us in the current hand.
@@ -1098,10 +1195,13 @@ class LiveCoinBridge:
         hero_id=int(model.hero_id or self.identity.get("user_id") or self.state.get("user_id") or 0); hero_name=str(model.hero_name or self.identity.get("user_name") or self.state.get("user_name") or "HERO")
         hero_row=next((r for r in roster if int(r.get("userId") or 0)==hero_id or r.get("userName")==hero_name),None)
         hero_seat=int((hero_row or {}).get("seatId") or 1)
+        try: straddle_seat=int(game_init.get("straddleSeatId") or 0)
+        except (TypeError,ValueError): straddle_seat=0
         pre={
             "dealerSeatId":int(game_init.get("dealerSeatId") or 1),
             "sbSeatId":int(game_init.get("smallBlindSeatId") or 1),
             "bbSeatId":int(game_init.get("bigBlindSeatId") or 1),
+            "straddleSeatId":straddle_seat,
             "sbAmount":game_init.get("smallBlind", room.props.get("smallBlind",0)),
             "bbAmount":game_init.get("bigBlind", room.props.get("bigBlind",0)),
             "anteAmount":game_init.get("ante", room.props.get("ante",0)),
@@ -1174,22 +1274,44 @@ class LiveCoinBridge:
         h=self.context_hand or self._build_context_hand()
         if not h:return
         self._activate_money_profile(h,"sit")
-        seat=int(row.get("seatId") or 0); uid=int(row.get("userId") or h.hero_id)
+        try:seat=int(row.get("seatId") or 0)
+        except (TypeError,ValueError):seat=0
         if not seat:return
-        # Refresh context hero seat immediately; no hard-coded seat identity.
-        h.hero_seat=seat; h.hero_id=uid; h.hero_name=str(row.get("userName") or h.hero_name)
+        try:uid=int(row.get("userId") or 0)
+        except (TypeError,ValueError):uid=0
+        if uid<=0:
+            try:uid=int(h.hero_id or 0)
+            except (TypeError,ValueError):uid=0
+        if uid<=0:
+            try:uid=int(self.state.get("user_id") or self.identity.get("user_id") or 0)
+            except (TypeError,ValueError):uid=0
+        chips_src=row.get("userChips")
+        if chips_src in (None,"",0,0.0):
+            chips_src=row.get("buyinAmount")
+        chips=core.money(chips_src or 0,self.scale)
+        # uid=0 / 0 chips SitDown is what made Eye timeout the first hand.
+        if uid<=0 or chips<=0:
+            log("SEAT",f"hero sit deferred seat={seat} uid={uid} chips={chips}")
+            return
+        h.hero_seat=seat; h.hero_id=uid
+        h.hero_name=str(row.get("userName") or h.hero_name or self.state.get("user_name") or "")
         self.state.update(hero_seat=seat,user_id=uid,user_name=h.hero_name)
-        b=core.PPPBuilder(h,self.scale); chips=core.money(row.get("userChips",0),self.scale)
+        sit_row=dict(row)
+        sit_row["userId"]=uid
+        sit_row["userChips"]=chips_src
+        sit_row.setdefault("userName",h.hero_name)
+        b=core.PPPBuilder(h,self.scale)
         sit_req=b"".join([core.p_int(1,seat-1),core.p_int(2,chips),core.p_str(3,core.PPP_CLIENT_IP),
                            core.p_int(4,0),core.p_int(5,0),core.p_int(6,0),
                            core.p_str(7,core.PPP_SIT_EMAIL),core.p_int(8,1)])
         await self.eye_send_cmd("pb.SitDownREQ",sit_req)
         if self.announced_seats.get(seat)!=uid:
-            await self.eye_send_cmd("pb.SitDownBRC",b._sitdown_brc(row,wait_blind=True,in_game=False)); self.announced_seats[seat]=uid
+            await self.eye_send_cmd("pb.SitDownBRC",b._sitdown_brc(sit_row,wait_blind=True,in_game=False)); self.announced_seats[seat]=uid
         await self.eye_send_cmd("pb.SitDownRSP",core.p_int(1,0)+core.p_int(3,seat-1)+core.p_int(4,chips)+core.p_int(5,10))
         pending_room=self.context_hook_room or self.table_to_room.get(h.table_id) or self.active_hook_room
         pending=self.pending_buyin_by_room.pop(pending_room,None)
-        total=core.money(pending if pending is not None else row.get("userChips",0),self.scale)
+        total=core.money(pending if pending is not None else chips_src or 0,self.scale)
+        if total<=0:total=chips
         await self.eye_send_cmd("pb.TotalBuyinBRC",core.p_int(1,uid)+core.p_int(2,total)+core.p_int(3,0))
         self.hero_sitting=True; self.hero_total_buyin=total; self.wait_blind_cancelled=False; self.stand_request_sent=False
         log("TABLE",f"hero sat uid={uid} coinSeat={seat}->ppp={seat-1} chips={chips} buyin={total}")
@@ -1542,6 +1664,22 @@ class LiveCoinBridge:
         )
         return True
 
+    def confirm_pending_action(self,*,source:str,action:str="") -> bool:
+        ack=self.pending_action_ack
+        if not ack:
+            return False
+        name=str(action or ack.get("action") or "")
+        # Coin/native ACK is post-factum. The HUD is the pre-send hint only.
+        self._diagnostic("action_confirmed",f"action confirmed via {source}",{
+            "action":name,
+            "amount":ack.get("display_amount"),
+            "attempt":1+int(ack.get("retries") or 0),
+            "token":str(ack.get("token") or ""),
+            "source":str(source or ""),
+        })
+        self.pending_action_ack=None
+        return True
+
     async def _maybe_inject_async(self,event,payload,raw):
         """Claim one dummy and ask hook v3 to send on the same RealWebSocket.
 
@@ -1658,16 +1796,28 @@ class LiveCoinBridge:
         try:mini=int(props.get("miniGameTypeId") or 0)
         except (TypeError,ValueError):mini=0
         label=str(props.get("_gameTypeLabel") or {1:"NLH"}.get(mini,"") or props.get("gameType") or "")
-        occupied=[int(r.get("seatId") or 0) for r in (h.roster or []) if int(r.get("seatId") or 0)]
+        occupied=[]
+        for r in (h.roster or []):
+            try: seat=int(r.get("seatId") or 0)
+            except (TypeError,ValueError): seat=0
+            if seat and r.get("isPlaying") is not False:
+                occupied.append(seat)
         if h.hero_seat: occupied.append(int(h.hero_seat))
         occupied=sorted({seat for seat in occupied if seat})
         dealer=int((h.pre or {}).get("dealerSeatId") or 0)
         position=position_from_seats(int(h.hero_seat or 0), dealer, occupied)
         bb=int(self._wire_big_blind(h) or 0)
         facing=facing_from_street(self.street_contrib, hero_ppp_seat=int(h.ppp_hero_seat), bb_chips=bb)
-        put=self.street_contrib.get(int(h.ppp_hero_seat),0)
-        current=max(self.street_contrib.values(),default=0)
-        can_check=max(0,current-put)<=0
+        can_check=self._hero_can_check(h)
+        room=self.state.get("_hook_room") or self.context_hook_room or self.active_hook_room
+        turn={}
+        if room is not None:
+            turn=self.autoplay.turn_by_room.get(int(room),{}) or {}
+        opts=turn.get("userTurnOptions") or {}
+        has_call=str(4) in opts or 4 in opts
+        has_check=str(3) in opts or 3 in opts
+        if has_call and not has_check and facing in {"UNOPENED", "LIMPED"}:
+            facing="RAISE"
         cards=tuple(h.cards or ())
         street="PREFLOP"
         if any(name in self.emitted_primary_stages for name in ("FLOP","TURN","RIVER")):
@@ -1683,28 +1833,87 @@ class LiveCoinBridge:
             can_check=can_check,
             state_complete=len(cards)==2,
             bombpot=bool(bp.is_bombpot_hand),
-            straddle=bool(props.get("straddle") or props.get("isStraddle")),
+            straddle=self._live_straddle(h),
         )
+
+    def _live_straddle(self, h=None) -> bool:
+        """True only when this hand posted a straddle seat, not catalog isStraddle:1."""
+        blobs = []
+        if h is not None:
+            blobs.append(getattr(h, "pre", None) or {})
+        blobs.append(self.state)
+        for blob in blobs:
+            if not isinstance(blob, dict):
+                continue
+            for key in ("straddleSeatId", "straddle_seat_id"):
+                try:
+                    seat = int(blob.get(key) or 0)
+                except (TypeError, ValueError):
+                    seat = 0
+                if seat > 0:
+                    return True
+        return False
+
+    def _hero_can_check(self,h=None) -> bool:
+        """Free check only from Coin options or a real street ledger, never an empty map."""
+        room=self.state.get("_hook_room") or self.context_hook_room or self.active_hook_room
+        turn={}
+        if room is not None:
+            turn=self.autoplay.turn_by_room.get(int(room),{}) or {}
+        opts=turn.get("userTurnOptions") or {}
+        if opts:
+            return str(3) in opts or 3 in opts
+        if not self.street_contrib:
+            return False
+        hero=0
+        if h is not None:
+            try:hero=int(getattr(h,"ppp_hero_seat",0) or 0)
+            except (TypeError,ValueError):hero=0
+        put=self.street_contrib.get(hero,0)
+        current=max(self.street_contrib.values(),default=0)
+        return max(0,current-put)<=0
+
+    def _announce_prefold_intent(self,h) -> None:
+        """Show a sticky HUD as soon as hole cards match the live chart."""
+        config=self._nlh_prefold_config()
+        if config is None or not config.enabled:
+            return
+        try:
+            from .prefold import evaluate_prefold
+            context=self._nlh_prefold_context(h)
+            decision=evaluate_prefold(config,context)
+        except Exception:
+            return
+        if not decision.matched or not decision.bypass_ai or decision.audit_only:
+            return
+        self._diagnostic("prefold_intent",f"will PREFOLD {decision.canonical_hand}",{
+            "action":"FOLD","hand":decision.canonical_hand,
+            "position":getattr(context,"position",""),"facing":getattr(context,"facing",""),
+            "hud":hud_action("FOLD", 0.0, 0),
+        })
 
     async def _try_nlh_prefold(self,h) -> bool:
         """Fold from an NLH chart without asking Eye. Never send a RoundHint on success."""
         config=self._nlh_prefold_config()
         if config is None or not config.enabled:
+            self._diagnostic("prefold_skipped","chart disabled or missing",{"reason":"PREFOLD_DISABLED"})
             return False
         try:
             from .prefold import evaluate_prefold
             context=self._nlh_prefold_context(h)
             decision=evaluate_prefold(config,context)
         except Exception as exc:
-            self._diagnostic("prefold_skipped",f"chart context failed: {type(exc).__name__}: {exc}")
+            self._diagnostic("prefold_skipped",f"chart context failed: {type(exc).__name__}: {exc}",{
+                "reason":"PREFOLD_CONTEXT_FAILED",
+            })
             return False
         if not decision.matched:
-            if decision.canonical_hand:
-                self._diagnostic("prefold_miss",f"{decision.canonical_hand} {decision.reason_code}",{
-                    "hand":decision.canonical_hand,"reason":decision.reason_code,
-                    "position":getattr(context,"position",""),"facing":getattr(context,"facing",""),
-                    "players":getattr(context,"dealt_in_players",0),
-                })
+            self._diagnostic("prefold_miss",f"{decision.canonical_hand or '-'} {decision.reason_code}",{
+                "hand":decision.canonical_hand,"reason":decision.reason_code,
+                "position":getattr(context,"position",""),"facing":getattr(context,"facing",""),
+                "players":getattr(context,"dealt_in_players",0),
+                "can_check":bool(getattr(context,"can_check",False)),
+            })
             return False
         if decision.audit_only or not decision.bypass_ai:
             self._diagnostic("prefold_audit",f"{decision.canonical_hand} would FOLD",{
@@ -1712,6 +1921,9 @@ class LiveCoinBridge:
                 "reason":decision.reason_code,
             })
             return False
+        room=self.context_hook_room or self.active_hook_room
+        if room is not None:
+            self.state["_hook_room"]=int(room)
         try:
             scheduled=self.autoplay.schedule_chart_fold(self.state,reason=str(decision.reason_code or "PREFOLD"))
         except Exception as exc:
@@ -1726,6 +1938,8 @@ class LiveCoinBridge:
             "position":context.position,"facing":context.facing,
             "players":context.dealt_in_players,
             "coin_action":scheduled.get("action"),
+            "delay_ms":int(scheduled.get("delay_ms") or 0),
+            "hud":hud_action("FOLD", 0.0, scheduled.get("delay_ms") or 0, source="prefold"),
         })
         return True
 
@@ -1752,6 +1966,7 @@ class LiveCoinBridge:
                         )
                     try:
                         fb=self.autoplay.schedule_failsafe(self.state,reason="MID_HAND_NO_SEED")
+                        self._hand_cc_failed=True
                         self._diagnostic("fallback_ready","mid-hand snapshot incomplete; safety action queued",{
                             "action":fb.get("action"),"attempt":1,
                             "max_attempts":self.action_max_attempts,
@@ -1798,6 +2013,7 @@ class LiveCoinBridge:
                     self.cold_hands.add(hid); self.state["_pending_finish_hint"]=None
                     log("HAND",f"prefold hand={hid} hero={h.hero_name} cards={h.cards}")
                     self._diagnostic("cards","hero hole cards captured",{"cards":h.cards,"hand_id":str(hid)})
+                    self._announce_prefold_intent(h)
                     return
                 frames=core.PPPBuilder(h,self.scale).synthesize_until_first_hero_turn()
                 finish=None
@@ -1825,7 +2041,11 @@ class LiveCoinBridge:
                 self.state["_pending_finish_hint"]=h.table_id
                 log("HAND",f"hint hand={hid} hero={h.hero_name} coinSeat={h.hero_seat}->ppp={h.ppp_hero_seat} cards={h.cards}")
                 self._diagnostic("cards","hero hole cards captured",{"cards":h.cards,"hand_id":str(hid)})
+                self._announce_prefold_intent(h)
                 self._diagnostic("hint_sent",f"cold hint sent table={h.table_id} room={self.active_hook_room}")
+                if getattr(self, "play_enabled", True) is False:
+                    await self._close_open_hint("play-off")
+                    return
                 await self._wait_cc_and_schedule()
             except Exception as e:
                 log("HAND",f"cold hint error: {type(e).__name__}: {e}")
@@ -1846,6 +2066,10 @@ class LiveCoinBridge:
             if not self.current_hand:return
             # Refresh autoplay turn info and build notify from live Coin options.
             self.autoplay.observe(event,payload,raw,self.state)
+            if await self._try_nlh_prefold(self.current_hand):
+                self.state["_pending_finish_hint"]=None
+                log("HAND",f"prefold incremental hand={self.state.get('hand_id')}")
+                return
             h=self.current_hand; hero=h.ppp_hero_seat
             put=self.street_contrib.get(hero,0); current=max(self.street_contrib.values(),default=0)
             call=max(0,current-put)
@@ -1876,6 +2100,9 @@ class LiveCoinBridge:
             self.state["_pending_finish_hint"]=h.table_id
             log("HAND",f"incremental hint hand={self.state.get('hand_id')} call={call} min={mn} max={mx}")
             self._diagnostic("hint_sent",f"incremental hint sent table={h.table_id} room={self.context_hook_room or self.active_hook_room}")
+            if getattr(self, "play_enabled", True) is False:
+                await self._close_open_hint("play-off")
+                return
             await self._wait_cc_and_schedule()
 
     async def _wait_cc_and_schedule(self):
@@ -1927,7 +2154,9 @@ class LiveCoinBridge:
                         "PokerEYE did not answer; timeout safety action queued",
                         {"action":fb.get("action"),"attempt":1,
                          "max_attempts":self.action_max_attempts,
-                         "reason":"CC_TIMEOUT"},
+                         "reason":"CC_TIMEOUT",
+                         "delay_ms":int(fb.get("delay_ms") or 0),
+                         "hud":hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0)},
                     )
                 except Exception as e:
                     self._diagnostic(
@@ -1948,14 +2177,18 @@ class LiveCoinBridge:
                 mapping=self._quantize_pending_cc_amount(d,profile)
                 log("CC",msg+(f"; {mapping}" if mapping else ""))
                 pending=dict(self.autoplay.pending or {})
-                self._hand_cc_failed=False
-                self.cc_miss_streak=0
+                self._note_mapped_eye_action()
                 self._diagnostic("action_ready","PokerEYE action mapped and queued for device arbiter",{
                     "action":str(pending.get("action") or ""),
                     "amount":pending.get("display_amount"),
                     "delay_ms":int(pending.get("delay_ms") or 0),
                     "attempt":1,
                     "max_attempts":self.action_max_attempts,
+                    "hud":hud_action(
+                        pending.get("action") or "FOLD",
+                        pending.get("display_amount"),
+                        pending.get("delay_ms") or 0,
+                    ),
                 })
                 if self.broadcast:
                     b={"data":"","msg":json.dumps({"action":"show_message","message":str(d.get("message") or ""),"time":int(d.get("lifetime") or 4000)},separators=(",",":")),"packageName":core.PPP_PACKAGE,"tag":"broadcast"}
@@ -1973,6 +2206,8 @@ class LiveCoinBridge:
                         "action":fb.get("action"),"attempt":1,
                         "max_attempts":self.action_max_attempts,
                         "reason":"CC_MAPPING_ERROR",
+                        "delay_ms":int(fb.get("delay_ms") or 0),
+                        "hud":hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0),
                     })
                 except Exception as fallback_error:
                     self._diagnostic("failsafe_unavailable",f"mapping failed and no CHECK/FOLD failsafe is legal: {fallback_error}",{"telemetry":snapshot})
@@ -1980,6 +2215,21 @@ class LiveCoinBridge:
             self.awaiting_cc=False
             for t in (cc_task,manual_task):
                 if not t.done():t.cancel()
+
+    async def _close_open_hint(self, why: str = "") -> bool:
+        """FinishRoundHintRSP before the next street. Open hint + RoundStart = GAME_IS_BROKEN."""
+        pending = self.state.get("_pending_finish_hint")
+        if pending is None:
+            return False
+        try:
+            return bool(await self.finish_hint(pending))
+        except Exception as exc:
+            self._diagnostic(
+                "finish_hint_error",
+                f"finish ({why or 'street'}) failed: {exc}",
+            )
+            self.state["_pending_finish_hint"] = None
+            return False
 
     async def finish_hint(self,table_id:Optional[int]):
         if not table_id:return False
@@ -2234,6 +2484,7 @@ class LiveCoinBridge:
             # reset_data is a table/hand boundary and remains meaningful even if hero
             # stood up before the server emitted reset_data. Keep observer state coherent.
             if cmd=="game.reset_data":
+                await self._close_open_hint("reset_data")
                 self.autoplay.reset_street(self.context_hook_room or self.active_hook_room)
                 self.street_contrib.clear(); self.hand_contrib.clear(); self.forced_adjustment_by_seat.clear(); self.forced_raw_remaining_by_seat.clear(); self.remaining_stack.clear(); self.hand_participants.clear(); self.action_seen.clear(); self.notify_seen.clear(); self.last_full_raise=0; self.street_generation+=1
                 self.current_hand=None; self.active_seats.clear(); self.all_in_seats.clear(); self.last_winner_info=[]; self.state["hand_id"]=""; self.state["_pending_finish_hint"]=None
@@ -2243,22 +2494,7 @@ class LiveCoinBridge:
                 self.winner_fragments_seen.clear(); self.winner_pot_gross={}; self.winner_rsp_sent=False; self.show_hole_cards={}; self.show_hand_sent=False; self.is_doing_evchop=False
                 self.rabbit_cards=[]; self.rabbit_second_board=[]; self.rabbit_finish_stage=None
                 log("RESULT","hand reset; next hero hand will rebuild DealerInfo/positions/cards")
-                if self._hero_turn_this_hand and self._hand_cc_failed:
-                    self.cc_miss_streak=int(self.cc_miss_streak or 0)+1
-                    self._diagnostic("cc_miss_hand",f"PokerEYE silent hand streak={self.cc_miss_streak}",{
-                        "streak":self.cc_miss_streak,
-                    })
-                    if self.cc_miss_streak>=3:
-                        self._diagnostic(
-                            "cc_streak_standup",
-                            "PokerEYE silent 3 hands; standup and leave",
-                            {"streak":self.cc_miss_streak},
-                        )
-                        self.hero_departing=True
-                elif self._hero_turn_this_hand:
-                    self.cc_miss_streak=0
-                self._hero_turn_this_hand=False
-                self._hand_cc_failed=False
+                self._account_hero_hand_cc()
                 if self.deferred_seat_snapshot is not None:
                     snap=self.deferred_seat_snapshot; self.deferred_seat_snapshot=None
                     await self.apply_seat_snapshot(snap)
@@ -2277,6 +2513,7 @@ class LiveCoinBridge:
                 return
             if cmd=="game.potInfo":
                 if data.get("isRoundEnd") is True:
+                    await self._close_open_hint("round_end")
                     pools=self._pot_info_pools(data)
                     if pools:
                         await self._queue_round_over(pools,str(data.get("roundName") or "UNKNOWN"))
@@ -2311,18 +2548,19 @@ class LiveCoinBridge:
                     self.chipsback_refresh_seats.discard(seat1)
                     log("STATE",f"seat={seat1-1} post-ChipsBack refresh suppressed action={action}")
                     return
-                if seat1==int(self.state.get("hero_seat") or 0) and self.pending_action_ack:
-                    expected=str(self.pending_action_ack.get("action") or "").upper()
-                    if action==expected or {action,expected}=={"BET","RAISE"}:
-                        ack=dict(self.pending_action_ack)
+                pending=self.pending_action_ack
+                if pending:
+                    hero_seat=0
+                    pending_seat=0
+                    try:hero_seat=int(self.state.get("hero_seat") or 0)
+                    except (TypeError,ValueError):hero_seat=0
+                    try:pending_seat=int(pending.get("seat") or 0)
+                    except (TypeError,ValueError):pending_seat=0
+                    is_hero=(hero_seat and seat1==hero_seat) or (pending_seat and seat1==pending_seat) or self._is_hero_row(data)
+                    expected=str(pending.get("action") or "").upper()
+                    if is_hero and (action==expected or {action,expected}=={"BET","RAISE"} or (expected=="CHECK" and action=="CHECK")):
                         log("ACTION_ACK",f"Coin server confirmed hero {action} hand={self.state.get('hand_id')}")
-                        self._diagnostic("action_confirmed","Coin seat state confirmed action",{
-                            "action":str(ack.get("action") or action),
-                            "amount":ack.get("display_amount"),
-                            "attempt":1+int(ack.get("retries") or 0),
-                            "token":str(ack.get("token") or ""),
-                        })
-                        self.pending_action_ack=None
+                        self.confirm_pending_action(source="coin-seat",action=action)
                 fp=(str(self.state.get("hand_id")),int(self.street_generation),seat1,action,int(total),str(data.get("userChips")))
                 if fp in self.action_seen:return
                 delta=max(0,total-old) if action in ("CALL","RAISE","BET","SB","BB","ANTE","FORCE_BB","STRADDLE") else 0
@@ -2372,6 +2610,9 @@ class LiveCoinBridge:
                 self.pending_actor_seat=None
                 log("STATE",f"seat={seat} {action} +{delta} remain={remain}")
             elif cmd=="game.dealer_cards":
+                # Close the RoundHint before RoundStartBRC. An open hint here is
+                # GAME_IS_BROKEN even if the Coin table is still playing.
+                await self._close_open_hint("dealer_cards")
                 # Normal streets flush here. In an all-in/RIT runout, cached
                 # ShowHand + potInfo has already flushed the single terminal pair.
                 await self._flush_pending_round_over()
@@ -2675,6 +2916,16 @@ class LiveCoinBridge:
         if room==self.active_hook_room and self.context_active and self.context_hook_room!=room and cmd in ("game.seatInfo","game.pre_hand_start_info","game.user_turn"):
             await self.ensure_observer_context()
 
+        if direction=="in" and cmd in ("game.game_start","game.pre_hand_start_info") and isinstance(data,dict):
+            try: seat=int(data.get("straddleSeatId") or 0)
+            except (TypeError,ValueError): seat=0
+            self.state["straddleSeatId"]=seat if seat>0 else 0
+            h=self.current_hand or self.context_hand
+            if h is not None:
+                pre=getattr(h,"pre",None)
+                if isinstance(pre,dict):
+                    pre["straddleSeatId"]=self.state["straddleSeatId"]
+
         if not self._is_active_room(room):
             return
 
@@ -2710,6 +2961,8 @@ class LiveCoinBridge:
 
         if cmd=="game.user_turn" and isinstance(data,dict):
             whose=str(data.get("whoseTurn") or "")
+            if whose and not self._is_hero_turn(data):
+                await self._close_open_hint("turn-left-hero")
             if self._is_hero_turn(data):
                 self._hero_turn_this_hand=True
                 if event.get("_hmuriy_duplicate_turn"):
@@ -2840,11 +3093,13 @@ class LiveCoinBridge:
             if not (self.pending_action_ack and str(inj.log).startswith("retry")):
                 now=time.monotonic(); delay=max(0,int(inj.schedule_delay_ms or 0)) if scheduled else 0
                 token=str(inj.schedule_token or f"{self.state.get('hand_id')}:{event.get('id')}")
+                try:seat=int(self.state.get("hero_seat") or 0)
+                except (TypeError,ValueError):seat=0
                 self.pending_action_ack={"action":str(inj.action_name or name),"raw":inj.inject_raw,"at":now,"due":now+delay/1000.0,
                     "retry_at":now+delay/1000.0+self.action_retry_delay,"retries":0,"hand_id":str(self.state.get("hand_id") or ""),
                     "ws_id":str(inj.target_ws_id or event.get("ws_id") or ""),
                     "channel_id":str(inj.target_channel_id or event.get("_channel_id") or ""),
-                    "url":event.get("url"),"token":token,
+                    "url":event.get("url"),"token":token,"seat":seat,
                     "display_amount":inj.display_amount,"finish_room_id":inj.finish_room_id}
                 if scheduled:
                     task=asyncio.create_task(self._finish_hint_after(delay,inj.finish_room_id,token)); self.schedule_finish_tasks[token]=task

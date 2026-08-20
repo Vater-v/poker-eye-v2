@@ -15,6 +15,7 @@ config.local.toml
 config/*.local.*
 config/backend_accounts.local.json
 config/device_automation.json
+config/db_recent.json
 *.agent
 *.token
 *.jsonl
@@ -22,14 +23,14 @@ captures/
 logs/
 *.pcap
 *.pcapng
-# Local APK/decompiled/build workspace stays outside Git; only .dist is ignored output.
 _bridge_src/
-apktool.jar
-build_apk.ps1
-patch_coin_update_check.ps1
-inject_classes_dex.py
+/apktool.jar
+/build_apk.ps1
 __pycache__/
 .pytest_cache/
 .venv/
 .deploy-backup/
 audit-output/
+.tmp_*
+.goose/
+SHA256SUMS.txt

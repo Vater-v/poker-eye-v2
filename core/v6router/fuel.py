@@ -42,6 +42,50 @@ def fuel_reason_code(
     return reason if reason.startswith("FUEL_") else "FUEL_AVAILABLE"
 
 
+def latest_fuel_reading(rows: list) -> tuple[Optional[float], Optional[float]]:
+    """Pick the newest fuelQty. Never sum across devices or tables.
+
+    Recency is ``fuel_updated_at`` then ``fuel_sequence``. Equal recency keeps
+    the later row so two devices reporting 5000 then 5642 yield 5642.
+    """
+    best: Optional[tuple[float, int, float, Optional[float]]] = None
+    for index, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("fuel_quantity")
+        if raw is None:
+            continue
+        try:
+            quantity = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(quantity) or quantity < 0:
+            continue
+        recency = 0.0
+        for key in ("fuel_updated_at", "fuel_sequence"):
+            try:
+                recency = float(row.get(key) or 0)
+            except (TypeError, ValueError):
+                recency = 0.0
+            if recency:
+                break
+        rate: Optional[float] = None
+        raw_rate = row.get("fuel_rate_per_hand")
+        if raw_rate is not None:
+            try:
+                parsed = float(raw_rate)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and math.isfinite(parsed):
+                rate = parsed
+        cand = (recency, index, quantity, rate)
+        if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] > best[1]):
+            best = cand
+    if best is None:
+        return None, None
+    return best[2], best[3]
+
+
 def fuel_health(quantity: Optional[float], reason_code: str, threshold: float) -> str:
     reason = fuel_reason_code(quantity, reason_code, threshold)
     if reason in _FUEL_CRITICAL_CODES:
@@ -57,5 +101,6 @@ __all__ = [
     "FUEL_UNIT",
     "fuel_health",
     "fuel_reason_code",
+    "latest_fuel_reading",
     "normalize_fuel_threshold",
 ]

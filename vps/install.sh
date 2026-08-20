@@ -18,13 +18,14 @@ for f in "$SRC/config/backend_accounts.local.json" "$SRC/secrets/trainer.secret"
 done
 
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 nginx openssl >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 nginx openssl redis-server >/dev/null
+systemctl enable --now redis-server >/dev/null 2>&1 || true
 
 if ! id pokereye >/dev/null 2>&1; then
   useradd --system --home "$DST" --shell /usr/sbin/nologin pokereye
 fi
 
-mkdir -p "$DST" "$DST/config" "$DST/secrets" "$DST/logs" "$DST/vps"
+mkdir -p "$DST" "$DST/config" "$DST/secrets" "$DST/logs" "$DST/data" "$DST/vps"
 rm -rf "$DST/core"
 cp -a "$SRC/core" "$DST/core"
 install -m 0644 "$SRC/main.py" "$DST/main.py"

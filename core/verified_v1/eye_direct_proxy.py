@@ -35,6 +35,7 @@ from .eye_backend_probe import (
     login_envelope,
     normalize_packet,
     ping_envelope,
+    settings_envelope,
     reconnect_protocol_selftest,
     resilient_stream_selftest,
 )
@@ -46,6 +47,8 @@ DEFAULT_PORT = 443
 DEFAULT_ANDROID_ID = "82b990b5a48d6b10"
 DEFAULT_ROOM_VERSION = "76659f5fc0f5ad2d59469446388715a4"
 DEFAULT_BUNDLE_ID = "PPPoker"
+DEFAULT_ROOM_TYPE = "PPPoker"
+DEFAULT_WORKING_MODE = "AUTO"
 DEFAULT_DEVICE = " REL 28 034bbbf0516cc950055989f053210d5f"
 DEFAULT_CREDENTIAL_FILE = Path("secrets/eye.agent")
 
@@ -373,6 +376,37 @@ def _work_mode(value: Any) -> Optional[str]:
             if found is not None:
                 return found
     return None
+
+
+def hook_game_mode(extracted: Optional[str] = None) -> str:
+    """Always auto. Eye APK WorkModeDto ordinal 0=man, 1=auto, 2=vip.
+
+    The decompiled client only forwards SCLogin.workMode onto the hook
+    ``game_mode`` frame. There is no CS to change it. We still send ``auto``
+    so every live slot plays as auto even when the backend body says man/0.
+    """
+    return "auto"
+
+
+def hook_game_type(extracted: Optional[str] = None) -> str:
+    """Always PPPoker. Empty CSSettings.game_type is the panel '-' column."""
+    return DEFAULT_ROOM_TYPE
+
+
+def hook_working_mode(extracted: Optional[str] = None) -> str:
+    """CSSettings.working_mode uses GameMode.name(): MANUAL / AUTO / VIP."""
+    return DEFAULT_WORKING_MODE
+
+
+def hook_game_mode_frame(backend_body: Any = None) -> dict[str, str]:
+    """Length-prefixed hook payload for one login/billing cycle."""
+    extracted = _work_mode(backend_body) if backend_body is not None else None
+    return {
+        "tag": "game_mode",
+        "msg": "",
+        "data": hook_game_mode(extracted),
+        "packageName": "com.lein.pppoker.android",
+    }
 
 
 @dataclass(frozen=True)
@@ -985,6 +1019,11 @@ class DirectBackendProxy:
         sent_packets = 0
 
         async def send_local(tag: str, data: Any) -> None:
+            if tag == "game_mode":
+                frame = hook_game_mode_frame(data if isinstance(data, dict) else {"workMode": data})
+                local_writer.write(_lp_pack(frame))
+                await local_writer.drain()
+                return
             value = data if isinstance(data, str) else compact_json(data)
             local_writer.write(_lp_pack({
                 "tag": tag,
@@ -1005,9 +1044,17 @@ class DirectBackendProxy:
                     "login accepted" if accepted else self.backend_error,
                 )
                 self.backend_ready.set()
-                mode = _work_mode(body)
-                if mode:
-                    await send_local("game_mode", mode)
+                await send_local("game_mode", body if isinstance(body, dict) else {})
+                if accepted and stream is not None:
+                    asyncio.create_task(
+                        stream.send_wire(
+                            settings_envelope(
+                                game_type=hook_game_type(),
+                                working_mode=hook_working_mode(),
+                            )
+                        ),
+                        name="eye-cs-settings",
+                    )
                 self.logger(
                     "DIRECT",
                     "backend login accepted" if accepted else self.backend_error,
@@ -1039,9 +1086,7 @@ class DirectBackendProxy:
                     "FUEL",
                     f"{fuel.reason_code} quantity={quantity} rate={rate}",
                 )
-                mode = _work_mode(body)
-                if mode:
-                    await send_local("game_mode", mode)
+                await send_local("game_mode", body if isinstance(body, dict) else {})
             elif message_type == "SCStatus" and isinstance(body, dict):
                 status = str(body.get("status") or "")
                 message = str(body.get("message") or "")
@@ -1225,6 +1270,10 @@ def protocol_selftest() -> None:
     assert _work_mode({"workMode": "AUTO"}) == "auto"
     assert _work_mode({"billing": {"workingMode": 1}}) == "auto"
     assert _work_mode({"workingMode": "VIP"}) == "vip"
+    assert _work_mode({"workMode": 0}) == "man"
+    assert hook_game_mode("man") == "auto"
+    assert hook_game_mode_frame({"workMode": 0})["data"] == "auto"
+    assert hook_game_mode_frame({"workMode": "MAN"})["data"] == "auto"
     assert parse_backend_fuel({"fuelQty": 7169.6, "fuelRate": 0.25}) == (
         7169.6, 0.25, "FUEL_AVAILABLE"
     )

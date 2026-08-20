@@ -138,6 +138,10 @@ class SessionLogger:
         record = {"schema_version": 1, "ts": datetime.now(timezone.utc).isoformat(),
                   "event": event, "severity": severity, "run_id": self.run_id,
                   **{k: v for k, v in fields.items() if v is not None}}
+        if message:
+            record["message"] = message
+        if operator:
+            record["operator"] = True
         text = message or event
         if self._closed:
             raise RuntimeError("session logger is closed")

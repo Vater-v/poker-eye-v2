@@ -137,5 +137,32 @@ class VerifiedBusinessWireTests(unittest.TestCase):
         body = json.loads(decoded["p"]["p"]["data"])
         self.assertEqual(body, {"userAction": 3, "betAmount": 0})
 
+    def test_info_type_with_raise_message_maps(self):
+        from core.verified_v1.coin_action_wire import resolve_eye_cc_action
+
+        action = resolve_eye_cc_action(
+            {"type": "INFO", "message": "raise 6.0", "amount": 6.0},
+            user_turn_options={"4": [0.02], "5": [0.04, 0.20], "7": []},
+            current_street_bet=0.02,
+            chip_scale=100,
+        )
+        self.assertEqual(action.name, "RAISE")
+
+    def test_info_cc_schedules_fold(self):
+        coordinator = CoinAutoplayCoordinator(100)
+        state = {"user_name": "hero", "user_id": 1, "_hook_room": 8, "hand_id": "h3"}
+        turn = {
+            "whoseTurn": "hero",
+            "turnTime": 15,
+            "userTurnOptions": {"7": []},
+            "initTimeStamp": 1,
+        }
+        payload = {"p": {"c": "game.user_turn", "r": 8, "p": {"data": json.dumps(turn)}}}
+        coordinator.observe({"direction": "in", "ws_id": "ws3", "url": "wss://coin"}, payload, b"x", state)
+        coordinator.schedule_cc({"type": "INFO", "message": "fold", "amount": 0.0, "delay": 0}, state)
+        decoded = decode_packet(coordinator.pending["raw"])
+        body = json.loads(decoded["p"]["p"]["data"])
+        self.assertEqual(body["userAction"], 7)
+
 if __name__ == "__main__":
     unittest.main()

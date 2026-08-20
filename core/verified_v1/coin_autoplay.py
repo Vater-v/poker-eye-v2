@@ -142,6 +142,8 @@ class CoinAutoplayCoordinator:
             except (TypeError,ValueError):whose_id=0
             if (not whose or not hero or whose.casefold()!=hero.casefold()) and hero_id and whose_id==hero_id:
                 whose=hero
+            if whose and hero and whose.casefold()==hero.casefold():
+                whose=hero
             cached=self.pending_options_by_room.pop(room,None)
             if cached and now-float(cached.get('observed') or 0.0)<=3.0:
                 options=cached.get('options')
@@ -193,7 +195,20 @@ class CoinAutoplayCoordinator:
                         )
 
                 self.last_turn_owner_by_room[room]=whose
-                if whose and hero and whose==hero:
+                hero_turn=bool(whose and hero and whose.casefold()==hero.casefold())
+                if not hero_turn and hero_id and whose_id==hero_id:
+                    hero_turn=True
+                    whose=hero
+                if not hero_turn:
+                    opts=data.get('userTurnOptions') or {}
+                    try:hero_seat=int(state.get('hero_seat') or 0)
+                    except (TypeError,ValueError):hero_seat=0
+                    try:turn_seat=int(data.get('seatId') or 0)
+                    except (TypeError,ValueError):turn_seat=0
+                    if opts and hero_seat and turn_seat==hero_seat:
+                        hero_turn=True
+                        whose=hero or whose
+                if hero_turn:
                     if not duplicate:
                         self.last_hero_semantic_by_room[room]=semantic
                         self.turn_by_room[room]=dict(data)
@@ -289,16 +304,14 @@ class CoinAutoplayCoordinator:
         active=state.get('_hook_room')
         turn=None
         room=None
-        if active is not None and int(active) in self.turn_by_room:
-            room=int(active); turn=self.turn_by_room[room]
+        if active is not None:
+            room=int(active)
+            turn=self.turn_by_room.get(room) or {}
         elif self.turn_by_room:
             room,turn=max(
                 self.turn_by_room.items(),
                 key=lambda kv: float(kv[1].get('_observed_monotonic') or 0.0),
             )
-        elif active is not None:
-            room=int(active)
-            turn={}
         if room is None:
             raise RuntimeError("no Coin hero game.user_turn available for failsafe")
         if not isinstance(turn, dict):
@@ -377,11 +390,15 @@ class CoinAutoplayCoordinator:
                 key=lambda kv: float(kv[1].get('_observed_monotonic') or 0.0),
             )
         opts=turn.get('userTurnOptions') or {}
-        if not (str(7) in opts or 7 in opts):
+        has_fold=str(7) in opts or 7 in opts
+        has_check=str(3) in opts or 3 in opts
+        if opts and not has_fold:
             raise RuntimeError(
                 f"chart fold unavailable: Coin did not expose FOLD; "
                 f"options={sorted(str(k) for k in opts.keys())}"
             )
+        if has_check and not has_fold:
+            raise RuntimeError("chart fold unavailable: Coin exposes CHECK")
         now=time.monotonic()
         try:turn_seconds=max(0.0,float(turn.get('turnTime') or 0.0))
         except (TypeError,ValueError):turn_seconds=0.0

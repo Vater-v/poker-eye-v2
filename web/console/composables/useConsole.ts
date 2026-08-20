@@ -7,6 +7,7 @@ export type AccountRow = {
   attempts: number;
   retry_in: number;
   last_error: string;
+  warning?: string;
 };
 
 export type SeatRow = {
@@ -44,12 +45,17 @@ export type TableRow = {
   standup_queued?: boolean;
   last_action?: string;
   last_amount?: number | null;
+  last_action_source?: string;
+  action_delay_ms?: number | null;
   hole_cards?: unknown[];
   hero_seat?: number;
+  warning?: string;
+  warning_text?: string;
 };
 
 export type AutoPolicy = {
   enabled: boolean;
+  play_enabled?: boolean;
   table_count: number;
   bb: number;
   watch_balance: boolean;
@@ -61,6 +67,7 @@ export type AutoPolicy = {
 
 export type AutomationState = {
   enabled?: boolean;
+  play_enabled?: boolean;
   policy?: AutoPolicy;
   status?: string;
   wallet_cash?: number | null;
@@ -69,6 +76,18 @@ export type AutomationState = {
   joining?: boolean;
   gradual_leave?: number;
   sitout_tables?: number[];
+  ui?: {
+    closed?: boolean;
+    waitlist?: boolean;
+    loading?: boolean;
+    players?: number | null;
+    timer?: number | null;
+    janitor?: boolean;
+    tap?: string;
+    tap_age_ms?: number | null;
+    nodes?: number;
+    ts?: number;
+  };
 };
 
 export type DeviceRow = {
@@ -83,6 +102,7 @@ export type DeviceRow = {
   session_hands?: string;
   tables: TableRow[];
   automation?: AutomationState;
+  warning?: string;
 };
 
 export type Snapshot = {
@@ -92,6 +112,12 @@ export type Snapshot = {
   devices?: DeviceRow[];
   accounts?: AccountRow[];
   connected_devices?: number;
+  fuel_remaining?: number | null;
+  fuel_rate_per_hand?: number | null;
+  fuel_hours_remaining?: number | null;
+  fuel_per_minute?: number | null;
+  fuel_per_hour?: number | null;
+  fuel_active_tables?: number | null;
 };
 
 export type ConsoleEvent = {
@@ -130,11 +156,44 @@ export function useConsole() {
   const health = ref<"live" | "offline">("offline");
   const error = ref("");
   const tab = ref<"fleet" | "logs" | "issues" | "control">("fleet");
-  const expanded = ref<string>("");
+  const expanded = ref<Record<string, boolean>>({});
   const filter = ref("");
   const paused = ref(false);
   const logMode = ref<LogMode>("important");
   const autoScroll = ref(true);
+  const UI_KEY = "pokereye.console.ui";
+
+  function loadUi() {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = JSON.parse(localStorage.getItem(UI_KEY) || "null");
+      if (!raw || typeof raw !== "object") return;
+      if (["fleet", "logs", "issues", "control"].includes(raw.tab)) tab.value = raw.tab;
+      if (typeof raw.expanded === "string" && raw.expanded) {
+        expanded.value = { [raw.expanded]: true };
+      } else if (raw.expanded && typeof raw.expanded === "object") {
+        expanded.value = raw.expanded as Record<string, boolean>;
+      }
+      if (typeof raw.filter === "string") filter.value = raw.filter;
+      if (typeof raw.paused === "boolean") paused.value = raw.paused;
+      if (["important", "live", "verbose"].includes(raw.logMode)) logMode.value = raw.logMode;
+      if (typeof raw.autoScroll === "boolean") autoScroll.value = raw.autoScroll;
+    } catch {
+      /* keep defaults */
+    }
+  }
+
+  function saveUi() {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(UI_KEY, JSON.stringify({
+      tab: tab.value,
+      expanded: expanded.value,
+      filter: filter.value,
+      paused: paused.value,
+      logMode: logMode.value,
+      autoScroll: autoScroll.value,
+    }));
+  }
 
   async function api(path: string, init: RequestInit = {}) {
     const token = tokenFromLocation();
@@ -166,12 +225,18 @@ export function useConsole() {
   }
 
   async function control(path: string, body: Record<string, unknown>) {
-    await api("api/control/" + path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    await refresh();
+    try {
+      const data = await api("api/control/" + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      await refresh();
+      return data;
+    } catch (exc: any) {
+      try { await refresh(); } catch { /* keep previous snapshot */ }
+      return { ok: false, error: String(exc?.message || exc) };
+    }
   }
 
   function tokenUrl(path: string) {
@@ -190,10 +255,13 @@ export function useConsole() {
   }
 
   onMounted(() => {
+    loadUi();
     refresh();
     const id = setInterval(refresh, 1000);
     onUnmounted(() => clearInterval(id));
   });
+
+  watch([tab, expanded, filter, paused, logMode, autoScroll], saveUi);
 
   return {
     base,

@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import collections
 import json
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+from core.v6router.automation import DeviceAutomation
 from core.v6router.router import (
-    DeviceIngressRouter, LiveTableSession, _LiveTableSnapshot, _SessionSlot,
+    DeviceIngressRouter, LiveTableSession, RoutedEvent, _LiveTableSnapshot, _SessionSlot,
+    in_play_enough_to_lease,
+)
+from core.verified_v1.coin_action_wire import (
+    _Byte, _Int, _Obj, _Short, _Str, decode_packet, encode_packet,
 )
 from core.verified_v1 import coin_ppp_bridge as ppp
 from core.verified_v1.bombpot_support import BombpotTracker, detect_double_board
 from core.verified_v1.coin_autoplay import CoinAutoplayCoordinator
 from core.verified_v1.coin_bridge_live import (
-    LiveCoinBridge, compute_net_profits, normalized_coin_seat_action,
+    LiveCoinBridge, compute_net_profits, format_action_hint, hud_action,
+    normalized_coin_seat_action,
 )
 
 
@@ -85,6 +95,21 @@ class DoubleBoardPcapRegressionTests(unittest.TestCase):
                 None,
             ),
             "lobby.join_game_table",
+        )
+        self.assertFalse(active, reason)
+
+    def test_catalog_is_double_board_flag_does_not_eject_nlh(self):
+        active, reason = detect_double_board(
+            payload(
+                "game.game_init",
+                {
+                    "gameId": "115457300358",
+                    "isDoubleBoard": True,
+                    "doubleBoard": True,
+                    "miniGameTypeId": 1,
+                },
+            ),
+            "game.game_init",
         )
         self.assertFalse(active, reason)
 
@@ -215,6 +240,36 @@ class TurnOptionPcapRegressionTests(unittest.TestCase):
         }
         fallback = autoplay.schedule_failsafe(state, reason="NO_OPTIONS")
         self.assertEqual(fallback["action"], "FOLD")
+
+    def test_failsafe_does_not_steal_another_room_check(self):
+        autoplay = CoinAutoplayCoordinator(chip_scale=100)
+        state = {"user_name": "Hero", "user_id": 1, "_hook_room": ROOM}
+        autoplay.turn_by_room[99999] = {
+            "whoseTurn": "Other",
+            "userTurnOptions": {"3": None},
+            "_turn_id": "other-check",
+            "_observed_monotonic": time.monotonic(),
+        }
+        fallback = autoplay.schedule_failsafe(state, reason="THIS_ROOM")
+        self.assertEqual(fallback["action"], "FOLD")
+        self.assertEqual(fallback["room"], ROOM)
+
+    def test_hero_turn_name_case_still_stores_options(self):
+        autoplay = CoinAutoplayCoordinator(chip_scale=100)
+        state = {"user_name": "Weedman834", "user_id": 42, "_hook_room": ROOM, "hero_seat": 5}
+        event = {"direction": "in", "ws_id": "abcd0001"}
+        autoplay.observe(
+            event,
+            payload("game.user_turn", {
+                "whoseTurn": "weedman834",
+                "userTurnOptions": {"3": None, "7": None},
+            }),
+            b"",
+            state,
+        )
+        self.assertIn(ROOM, autoplay.turn_by_room)
+        fallback = autoplay.schedule_failsafe(state, reason="CASE")
+        self.assertEqual(fallback["action"], "CHECK")
 
     def test_failsafe_folds_when_turn_map_is_empty_but_room_is_known(self):
         autoplay = CoinAutoplayCoordinator(chip_scale=100)
@@ -393,6 +448,694 @@ class BridgeDiagnosticRegressionTests(unittest.TestCase):
         self.assertEqual(bridge.state_error_count, 7)
         self.assertEqual([row[2]["count"] for row in rows], [1, 2, 5])
         self.assertTrue(all(row[0] == "state_error" for row in rows))
+
+
+class ActionHintFormatTests(unittest.TestCase):
+    def test_fold_and_raise_layout(self):
+        self.assertEqual(format_action_hint("FOLD", 0, 3726), "FOLD 0.0 3726")
+        self.assertEqual(format_action_hint("RAISE", 9.37, 6024), "RAISE 9.37 6024")
+        self.assertEqual(format_action_hint("FOLD ACK", None, 1), "FOLD 0.0 1")
+        payload = hud_action("CHECK", 0.0, 800)
+        self.assertEqual(payload["text"], "CHECK 0.0 800")
+        self.assertTrue(payload["sticky"])
+        self.assertFalse(payload["leave"])
+
+
+class CoinTabSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_hides_sessionless_coin_leftovers(self):
+        auto = DeviceAutomation("device-test")
+        auto._tabs[1147817] = 0.0
+        auto._tabs[1149077] = time.monotonic() + 40.0
+        router = DeviceIngressRouter("device-test", object(), automation=auto)
+        snap = await router.control_snapshot()
+        ids = {int(row["table_id"]): row["state"] for row in snap["tables"]}
+        self.assertNotIn(1147817, ids)
+        self.assertNotIn(1149077, ids)
+        self.assertEqual(auto.coin_tab_count(), 2)
+
+
+def coin_hook_event(command: str, data: dict, *, room: int = 59059, mid: str = "e", direction: str = "in") -> dict:
+    """Real Coin SFS hook frame — same encoding handle_event decodes."""
+    inner = {"c": _Str(command), "p": _Obj({"data": _Str(json.dumps(data, separators=(",", ":")))})}
+    if room is not None:
+        inner["r"] = _Int(int(room))
+    raw = encode_packet({"c": _Byte(1), "a": _Short(13), "p": _Obj(inner)})
+    return {
+        "type": "ws_message",
+        "kind": "ws_message",
+        "v": 4,
+        "async": True,
+        "id": mid,
+        "direction": direction,
+        "text": False,
+        "url": "wss://coin",
+        "ws_id": "ws",
+        "payload_b64": base64.b64encode(raw).decode(),
+    }
+
+
+class _InstantEye:
+    account_id = "709393393-20"
+
+    async def close(self, crashed=False, reason=""):
+        return None
+
+
+class _InstantFactory:
+    async def create(self, device_id, table_id, seed):
+        return _InstantEye()
+
+
+class InPlayAdmitWithoutInitTests(unittest.IsolatedAsyncioTestCase):
+    def _event(self, command: str, *, table_id: int = 1155848, data: dict | None = None) -> RoutedEvent:
+        return RoutedEvent(
+            event={},
+            payload=None,
+            raw=b"",
+            command=command,
+            direction="in",
+            room_id=59059,
+            table_ids=(table_id,),
+            websocket_id="ws",
+            data=dict(data or {}),
+        )
+
+    async def _await_slot(self, router: DeviceIngressRouter, table_id: int):
+        slot = router._sessions.get(table_id)
+        self.assertIsNotNone(slot, f"no Eye slot for table {table_id}")
+        self.assertIsNotNone(slot.start_task)
+        await slot.start_task
+        return slot
+
+    def test_in_play_predicate_covers_turn_cards_seats_not_potinfo(self):
+        self.assertTrue(in_play_enough_to_lease(self._event("game.user_turn")))
+        self.assertTrue(in_play_enough_to_lease(self._event(
+            "game.hole_cards", data={"playerCards": [{"suit": "HEARTS", "value": "ACE"}]}
+        )))
+        self.assertTrue(in_play_enough_to_lease(self._event(
+            "game.seatInfo",
+            data={"seatResponseDataList": [
+                {"seatId": 1, "userName": "Weedman834", "userChips": 2.1},
+            ]},
+        )))
+        self.assertTrue(in_play_enough_to_lease(self._event(
+            "game.take_Seat", data={"seatId": 3, "buyinAmount": 2.0}
+        )))
+        self.assertFalse(in_play_enough_to_lease(self._event("game.potInfo", data={"pot": 1})))
+
+    def test_hole_cards_bind_owner_without_game_init(self):
+        router = DeviceIngressRouter("dev-a8dc8554e1cf4bddb25db98b6970679a", object())
+        routed = self._event("game.hole_cards", data={"playerCards": [{"suit": "SPADES", "value": "ACE"}]})
+        self.assertEqual(router._owner_locked(routed), 1155848)
+
+    async def test_handle_event_user_turn_without_init_leases_then_close_drops(self):
+        router = DeviceIngressRouter("dev-a8dc8554e1cf4bddb25db98b6970679a", _InstantFactory())
+        event = coin_hook_event(
+            "game.user_turn",
+            {"whoseTurn": "Weedman834", "tableId": 42},
+            mid="turn-42",
+        )
+        decision, _ = await router.handle_event(event)
+        self.assertTrue(decision.get("router_pending"))
+        self.assertNotEqual(decision.get("router_waiting_for_game_init"), True)
+        slot = await self._await_slot(router, 42)
+        self.assertEqual(slot.session.account_id, "709393393-20")
+        await router.close_table(42, reason="operator close ghost")
+        self.assertNotIn(42, router._sessions)
+
+    async def test_handle_event_real_seatinfo_after_join_leases_without_init(self):
+        router = DeviceIngressRouter("dev-a8dc8554e1cf4bddb25db98b6970679a", _InstantFactory())
+        table_id = 1155848
+        join, _ = await router.handle_event(coin_hook_event(
+            "lobby.join_game_table",
+            {"tablesToJoin": [{"tableId": table_id, "tableName": f"NLH {table_id}"}]},
+            mid="join",
+        ))
+        self.assertNotIn(table_id, router._sessions)
+        self.assertTrue(join.get("router_waiting_for_game_init") or join.get("action") == "forward")
+        pot, _ = await router.handle_event(coin_hook_event(
+            "game.potInfo",
+            {"pot": 1},
+            mid="pot",
+        ))
+        self.assertNotIn(table_id, router._sessions)
+        self.assertTrue(pot.get("router_waiting_for_game_init"))
+        seat, _ = await router.handle_event(coin_hook_event(
+            "game.seatInfo",
+            {"seatResponseDataList": [
+                {"seatId": 1, "userName": "Weedman834", "userChips": 2.1},
+            ]},
+            mid="seats",
+        ))
+        self.assertTrue(seat.get("router_pending"))
+        self.assertNotEqual(seat.get("router_waiting_for_game_init"), True)
+        slot = await self._await_slot(router, table_id)
+        self.assertEqual(slot.session.account_id, "709393393-20")
+        await router.close_table(table_id, reason="operator close ghost")
+        self.assertNotIn(table_id, router._sessions)
+
+    async def test_handle_event_take_seat_after_join_leases_without_init(self):
+        router = DeviceIngressRouter("dev-a8dc8554e1cf4bddb25db98b6970679a", _InstantFactory())
+        table_id = 42
+        await router.handle_event(coin_hook_event(
+            "lobby.join_game_table",
+            {"tablesToJoin": [{"tableId": table_id, "tableName": f"NLH {table_id}"}]},
+            mid="join-take",
+        ))
+        take, _ = await router.handle_event(coin_hook_event(
+            "game.take_Seat",
+            {"seatId": 3, "buyinAmount": 2.0},
+            mid="take",
+        ))
+        self.assertTrue(take.get("router_pending"))
+        slot = await self._await_slot(router, table_id)
+        self.assertEqual(slot.session.account_id, "709393393-20")
+        await router.close_table(table_id, reason="leave")
+        self.assertNotIn(table_id, router._sessions)
+
+
+class EmptyStartingSlotSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    """Weedman admin «Стол 5» empty card: slot exists, Eye create never returned."""
+
+    async def test_sessionless_timeout_row_omits_hand_fields(self):
+        router = DeviceIngressRouter("dev-a8dc8554e1cf4bddb25db98b6970679a", object())
+        earlier = (864838, 1154882, 1153990, 1154573)
+        for order, table_id in enumerate(earlier, 1):
+            router._sessions[table_id] = _SessionSlot(
+                table_id=table_id,
+                created_order=order,
+                buffer=collections.deque(),
+            )
+        failing = _SessionSlot(
+            table_id=1154453,
+            created_order=5,
+            buffer=collections.deque(),
+        )
+        failing.startup_error = f"{TimeoutError.__name__}: {TimeoutError()}"
+        failing.startup_attempts = 2
+        failing.buffer.append({
+            "command": "game.hole_cards",
+            "data": {"playerCards": [{"suit": "HEARTS", "value": "ACE"}]},
+        })
+        router._sessions[1154453] = failing
+
+        snap = await router.control_snapshot()
+        row = next(item for item in snap["tables"] if int(item["table_id"]) == 1154453)
+
+        self.assertEqual(int(row["table_no"]), 5)
+        self.assertEqual(row["state"], "starting")
+        self.assertEqual(row["startup_error"], "TimeoutError: ")
+        self.assertEqual(row["account_id"], "")
+        self.assertNotIn("phase", row)
+        self.assertNotIn("hand_id", row)
+        self.assertNotIn("hole_cards", row)
+        self.assertNotIn("backend_status", row)
+        self.assertNotIn("backend_health", row)
+        self.assertNotIn("backend_message", row)
+        self.assertFalse(row.get("hero_sitting"))
+        self.assertFalse(row.get("pending_action"))
+
+    async def test_restart_without_seed_drops_hung_slot(self):
+        router = DeviceIngressRouter("dev-a8dc8554e1cf4bddb25db98b6970679a", object())
+        slot = _SessionSlot(
+            table_id=1152003,
+            created_order=1,
+            buffer=collections.deque(),
+        )
+        slot.startup_error = "TimeoutError: "
+        router._sessions[1152003] = slot
+        self.assertTrue(await router.restart_table_backend(1152003))
+        self.assertNotIn(1152003, router._sessions)
+
+    def test_sessionless_slot_is_not_live_session(self):
+        router = DeviceIngressRouter("dev-a8dc8554e1cf4bddb25db98b6970679a", object())
+        slot = _SessionSlot(
+            table_id=1152003,
+            created_order=1,
+            buffer=collections.deque(),
+        )
+        router._sessions[1152003] = slot
+        self.assertEqual(router.active_table_ids, (1152003,))
+        self.assertFalse(router.table_has_live_session(1152003))
+
+    async def test_stale_reaper_drops_sessionless_startup_slot(self):
+        router = DeviceIngressRouter(
+            "dev-a8dc8554e1cf4bddb25db98b6970679a",
+            object(),
+            startup_stale_seconds=0.01,
+        )
+        slot = _SessionSlot(
+            table_id=1154453,
+            created_order=1,
+            buffer=collections.deque(),
+        )
+        slot.created_at = time.monotonic() - 1.0
+        slot.startup_error = "TimeoutError: "
+        router._sessions[1154453] = slot
+        reaped = await router.reap_stale_startups()
+        self.assertEqual(reaped, (1154453,))
+        self.assertNotIn(1154453, router._sessions)
+
+
+class OpenHintGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_open_hint_clears_pending(self):
+        sent: list[str] = []
+        bridge = LiveCoinBridge()
+        bridge.state["_pending_finish_hint"] = 42
+
+        async def fake_cmd(cmd, body, location="TABLE", envelope_uid=None):
+            sent.append(str(cmd))
+
+        async def fake_outer(frame, label=""):
+            sent.append(str(label or frame))
+
+        bridge.eye_send_cmd = fake_cmd  # type: ignore[method-assign]
+        bridge.eye_send_outer = fake_outer  # type: ignore[method-assign]
+        self.assertTrue(await bridge._close_open_hint("dealer_cards"))
+        self.assertIsNone(bridge.state["_pending_finish_hint"])
+        self.assertTrue(any("FinishRoundHint" in item for item in sent))
+
+    async def test_close_open_hint_noop_when_none(self):
+        bridge = LiveCoinBridge()
+        bridge.state["_pending_finish_hint"] = None
+        self.assertFalse(await bridge._close_open_hint("dealer_cards"))
+
+
+class ForcedExitDummyGuardTests(unittest.TestCase):
+    def test_leave_does_not_steal_other_table_dummy(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 11
+        room = 100
+        incoming = RoutedEvent(
+            event={"id": "leave"}, payload=None, raw=b"", command="game.leave_Seat",
+            direction="out", room_id=room, table_ids=(table_id,), websocket_id="game-ws",
+            data={},
+        )
+        router._ensure_unsupported_exit_locked(
+            table_id, incoming, reset=True, exit_kind="policy",
+        )
+        router._ws_to_tables["game-ws"] = {table_id}
+        other = RoutedEvent(
+            event={"id": "dummy"}, payload=None, raw=b"", command="lobby.dummy",
+            direction="out", room_id=-1, table_ids=(), websocket_id="other-ws",
+            data={},
+        )
+        skipped = router._forced_exit_decision_locked(other, table_id)
+        self.assertEqual(skipped.get("action"), "forward")
+        own = RoutedEvent(
+            event={"id": "dummy2"}, payload=None, raw=b"", command="lobby.dummy",
+            direction="out", room_id=room, table_ids=(table_id,), websocket_id="game-ws",
+            data={},
+        )
+        taken = router._forced_exit_decision_locked(own, table_id)
+        self.assertEqual(taken.get("action"), "schedule_send")
+
+    def test_policy_and_leave_all_standup_never_queue_quit_table(self):
+        router = DeviceIngressRouter("device-test", object())
+        room = 100
+        incoming = RoutedEvent(
+            event={"id": "pol"}, payload=None, raw=b"", command="game.leave_Seat",
+            direction="out", room_id=room, table_ids=(11,), websocket_id="game-ws",
+            data={},
+        )
+        router._ensure_unsupported_exit_locked(
+            11, incoming, reset=True, exit_kind="policy",
+        )
+        stages = [row.get("stage") for row in router._unsupported_exit[11]["queue"]]
+        self.assertNotIn("LEAVE", stages)
+        self.assertNotIn("QUIT", stages)
+        self.assertIn("STANDUP", stages)
+        for row in router._unsupported_exit[11]["queue"]:
+            raw = row.get("raw")
+            if not raw:
+                continue
+            packet = decode_packet(bytes(raw))
+            self.assertEqual(packet["p"]["c"], "game.leave_Seat")
+            self.assertNotEqual(packet["p"]["c"], "game.quit_table")
+        router._unsupported_exit.pop(11, None)
+        router._ensure_unsupported_exit_locked(
+            11, incoming, reset=True, exit_kind="leave_all",
+        )
+        stages = [row.get("stage") for row in router._unsupported_exit[11]["queue"]]
+        self.assertEqual(stages, ["STANDUP"])
+        standup = router._unsupported_exit[11]["queue"][0]
+        packet = decode_packet(bytes(standup["raw"]))
+        self.assertEqual(packet["p"]["c"], "game.leave_Seat")
+
+
+class SharedWsDummyGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_ws_dummy_prefers_sibling_cc_over_forced_exit(self):
+        class LiveWithCc(LiveTableSession):
+            def __init__(self, table_id: int, ws_id: str):
+                self.table_id = table_id
+                self.play_enabled = True
+                self._closed = False
+                self._lock = asyncio.Lock()
+                self._bridge = LiveCoinBridge()
+                self._arbiter_cancellations = collections.deque()
+                self._arbiter_dispatch_context = {}
+                self._bridge.autoplay.pending = {
+                    "due": time.monotonic() - 1,
+                    "raw": b"cc",
+                    "room": 100,
+                    "ws_id": ws_id,
+                    "hand_id": "h1",
+                    "turn_id": "t1",
+                }
+                self._bridge.state["hand_id"] = "h1"
+                self._bridge.autoplay.turn_by_room[100] = {"_turn_id": "t1"}
+
+            async def handle_event(self, event):
+                return {"id": event.get("id", ""), "action": "replace", "cc": True}, None
+
+            def prepare_action_dispatch(self, plan):
+                return True
+
+            def finalize_action_dispatch(self, plan, decision):
+                return True
+
+        ws = "aabbccdd"
+        router = DeviceIngressRouter("device-test", object())
+        live = LiveWithCc(11, ws)
+        router._sessions[11] = _SessionSlot(
+            table_id=11, created_order=1, buffer=collections.deque(),
+        )
+        router._sessions[11].session = live
+        router._ws_to_tables[ws] = {11, 22}
+        router._room_to_table[100] = 11
+        evidence = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=200, table_ids=(22,), websocket_id=ws,
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ensure_unsupported_exit_locked(
+            22, evidence, reset=True, exit_kind="unsupported",
+        )
+        dummy = coin_hook_event("lobby.dummy", {}, room=-1, mid="dummy-shared")
+        dummy["ws_id"] = ws
+        dummy["direction"] = "out"
+        dummy["v"] = 6
+        decision, _ = await router.handle_event(dummy)
+        op = decision.get("_operator_action") or {}
+        self.assertNotEqual(op.get("table_id"), 22)
+        self.assertNotIn(
+            str(op.get("action") or ""),
+            {"CHECK", "FOLD", "CHECKFOLD", "STANDUP", "LEAVE"},
+        )
+        self.assertNotEqual(decision.get("action"), "schedule_send")
+
+
+class PlayAndCloseGuardTests(unittest.TestCase):
+    def test_play_off_yields_no_action_offers(self):
+        session = LiveTableSession.__new__(LiveTableSession)
+        session.play_enabled = False
+        self.assertEqual(session.action_offers({}), ())
+
+    def test_policy_leave_refuses_foreign_room(self):
+        router = DeviceIngressRouter("device-test", object())
+        router._room_to_table[100] = 11
+        ok = router._queue_policy_leave_locked(22, room=100, ws_id="aabb", kind="policy", reason="x")
+        self.assertFalse(ok)
+        self.assertNotIn(22, router._unsupported_exit)
+
+    def test_policy_leave_skips_recent_closed_id(self):
+        router = DeviceIngressRouter("device-test", object())
+        router._room_to_table[100] = 11
+        router._recent_closed[11] = time.monotonic() + 60
+        ok = router._queue_policy_leave_locked(11, room=100, ws_id="aabb", kind="policy", reason="x")
+        self.assertFalse(ok)
+
+    def test_sitting_table_is_not_dead_reaped(self):
+        session = LiveTableSession.__new__(LiveTableSession)
+        session._bridge = SimpleNamespace(hero_sitting=True)
+        session._backend_red_since = 1.0
+        self.assertIsNone(session.take_dead_table_request())
+        self.assertEqual(session._backend_red_since, 0.0)
+
+    def test_live_dump_is_not_ui_leave_confirmed(self):
+        self.assertFalse(DeviceIngressRouter.ui_leave_confirmed(
+            {"closed": False, "waitlist": False, "tap": "focus-shortest-timer"}
+        ))
+        self.assertFalse(DeviceIngressRouter.ui_leave_confirmed(
+            {"closed": True, "tap": "quit_table"}
+        ))
+        self.assertFalse(DeviceIngressRouter.ui_leave_confirmed(
+            {"tap": "leave"}
+        ))
+        self.assertTrue(DeviceIngressRouter.ui_leave_confirmed(
+            {"closed": True, "tap": "confirm-exit-table"}
+        ))
+
+    def test_observer_table_is_not_dead_reaped(self):
+        session = LiveTableSession.__new__(LiveTableSession)
+        session._bridge = SimpleNamespace(hero_sitting=False, context_active=True)
+        session._backend_red_since = time.monotonic() - 121
+        session._snapshot = lambda: SimpleNamespace(
+            backend_health="red", backend_message="NO_TRAFFIC_FROM_ROOM", phase="table",
+        )
+        self.assertIsNone(session.take_dead_table_request())
+        self.assertEqual(session._backend_red_since, 0.0)
+
+    def test_live_phase_is_not_dead_reaped(self):
+        session = LiveTableSession.__new__(LiveTableSession)
+        session._bridge = SimpleNamespace(hero_sitting=False, context_active=False)
+        session._backend_red_since = time.monotonic() - 121
+        session._snapshot = lambda: SimpleNamespace(
+            backend_health="red", backend_message="NO_TRAFFIC_FROM_ROOM", phase="observe",
+        )
+        self.assertIsNone(session.take_dead_table_request())
+
+
+class DoubleBoardExitTests(unittest.TestCase):
+    def test_double_board_does_not_mark_sibling_table_on_shared_ws(self):
+        router = DeviceIngressRouter("device-test", object())
+        live = 11
+        db = 22
+        router._sessions[live] = _SessionSlot(table_id=live, created_order=1, buffer=__import__("collections").deque())
+        router._sessions[db] = _SessionSlot(table_id=db, created_order=2, buffer=__import__("collections").deque())
+        router._room_to_table[100] = live
+        router._ws_to_tables["aabbccdd"] = {live, db}
+        evidence = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=200, table_ids=(db,), websocket_id="aabbccdd",
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        definite = router._definite_table_locked(evidence)
+        self.assertEqual(definite, db)
+        guessed = router._owner_locked(evidence)
+        self.assertEqual(guessed, 0)
+
+    def test_checkfold_does_not_copy_other_table_options(self):
+        router = DeviceIngressRouter("device-test", object())
+        name, raw = router._checkfold_raw_locked(11, 200)
+        self.assertEqual(name, "FOLD")
+        self.assertTrue(raw)
+
+    def test_forced_exit_waits_for_coin_ack_before_standup(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        incoming = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ensure_unsupported_exit_locked(
+            table_id, incoming, reset=True, exit_kind="unsupported",
+        )
+        dummy = RoutedEvent(
+            event={"id": "dummy"}, payload=None, raw=b"", command="lobby.dummy",
+            direction="out", room_id=-1, table_ids=(), websocket_id="aabbccdd",
+            data={},
+        )
+        first = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(first.get("action"), "schedule_send")
+        self.assertIn(str(first.get("_operator_action", {}).get("action")), {"CHECK", "FOLD"})
+        waiting = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(waiting.get("action"), "forward")
+        ack = RoutedEvent(
+            event={"id": "ua"}, payload=None, raw=b"", command="game.user_action",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"isSuccess": True},
+        )
+        self.assertTrue(router._forced_coin_ack_locked(ack, table_id))
+        second = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(second.get("action"), "schedule_send")
+        self.assertEqual(str(second.get("_operator_action", {}).get("action")), "STANDUP")
+
+    def test_double_board_preempts_policy_standup(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        policy = RoutedEvent(
+            event={"id": "leave"}, payload=None, raw=b"", command="game.leave_Seat",
+            direction="out", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={},
+        )
+        router._ensure_unsupported_exit_locked(
+            table_id, policy, reset=True, exit_kind="policy",
+        )
+        self.assertEqual(router._unsupported_exit[table_id]["kind"], "policy")
+        evidence = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ensure_unsupported_exit_locked(
+            table_id, evidence, reset=True, exit_kind="unsupported",
+        )
+        self.assertEqual(router._unsupported_exit[table_id]["kind"], "unsupported")
+        dummy = RoutedEvent(
+            event={"id": "dummy"}, payload=None, raw=b"", command="lobby.dummy",
+            direction="out", room_id=-1, table_ids=(), websocket_id="aabbccdd",
+            data={},
+        )
+        first = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(first.get("action"), "schedule_send")
+        self.assertIn(str(first.get("_operator_action", {}).get("action")), {"CHECK", "FOLD"})
+
+    def test_policy_standup_does_not_freeze_other_tables(self):
+        router = DeviceIngressRouter("device-test", object())
+        router._unsupported_exit[11] = {
+            "kind": "policy",
+            "queue": __import__("collections").deque(),
+            "inflight": {"tok": {"stage": "STANDUP"}},
+            "awaiting_coin": True,
+            "wait_ui": False,
+        }
+        self.assertFalse(router._exit_blocks_other_play_locked())
+        router._unsupported_exit[22] = {
+            "kind": "unsupported",
+            "queue": __import__("collections").deque(),
+            "inflight": {},
+            "wait_ui": False,
+        }
+        self.assertFalse(router._exit_blocks_other_play_locked())
+
+    def test_forced_exit_stops_at_standup_without_quit_table(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        incoming = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ws_to_tables["aabbccdd"] = {table_id}
+        router._ensure_unsupported_exit_locked(
+            table_id, incoming, reset=True, exit_kind="unsupported",
+        )
+        stages = [row.get("stage") for row in router._unsupported_exit[table_id]["queue"]]
+        self.assertIn("CHECKFOLD", stages)
+        self.assertIn("STANDUP", stages)
+        self.assertNotIn("LEAVE", stages)
+        dummy = RoutedEvent(
+            event={"id": "dummy"}, payload=None, raw=b"", command="lobby.dummy",
+            direction="out", room_id=-1, table_ids=(), websocket_id="aabbccdd",
+            data={},
+        )
+        first = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(first.get("action"), "schedule_send")
+        ack = RoutedEvent(
+            event={"id": "ua"}, payload=None, raw=b"", command="game.user_action",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"isSuccess": True},
+        )
+        self.assertTrue(router._forced_coin_ack_locked(ack, table_id))
+        second = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(second.get("action"), "schedule_send")
+        self.assertEqual(str(second.get("_operator_action", {}).get("action")), "STANDUP")
+        stand = RoutedEvent(
+            event={"id": "ls"}, payload=None, raw=b"", command="game.leave_Seat",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"isSuccess": True},
+        )
+        self.assertTrue(router._forced_coin_ack_locked(stand, table_id))
+        third = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(third.get("action"), "forward")
+        self.assertFalse(router._unsupported_exit[table_id].get("wait_ui"))
+        self.assertTrue(router._unsupported_exit[table_id].get("done"))
+
+    def test_late_owner_does_not_guess_while_join_in_flight(self):
+        router = DeviceIngressRouter("device-test", object())
+        auto = DeviceAutomation("device-test")
+        auto._joining = True
+        router.automation = auto
+        router._provisional[1149459] = {"updated": time.monotonic(), "reason": "allocated"}
+        routed = RoutedEvent(
+            event={"id": "seat"}, payload=None, raw=b"", command="game.seatInfo",
+            direction="in", room_id=53789, table_ids=(), websocket_id="0d00c38f",
+            data={},
+        )
+        table_id, reason = router._late_owner_locked(routed)
+        self.assertEqual(table_id, 0)
+        self.assertEqual(reason, "")
+
+    def test_checkfold_injects_on_dummy_not_incoming(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        incoming = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ensure_unsupported_exit_locked(
+            table_id, incoming, reset=True, exit_kind="unsupported",
+        )
+        decision = router._forced_exit_decision_locked(incoming, table_id)
+        self.assertEqual(decision.get("action"), "forward")
+        dummy = RoutedEvent(
+            event={"id": "dummy"}, payload=None, raw=b"", command="lobby.dummy",
+            direction="out", room_id=-1, table_ids=(), websocket_id="aabbccdd",
+            data={},
+        )
+        decision = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(decision.get("action"), "schedule_send")
+        self.assertIn(str(decision.get("_operator_action", {}).get("action")), {"CHECK", "FOLD"})
+
+    def test_recent_db_table_standups_without_checkfold(self):
+        from core.v6router import db_recent
+        import tempfile
+        path = Path(tempfile.mkdtemp()) / "db_recent.json"
+        db_recent.configure(path)
+        self.addCleanup(lambda: db_recent.configure())
+        store = db_recent.store()
+        store.remember(1149001, device_id="device-test")
+        self.assertTrue(store.blocked(1149001))
+        router = DeviceIngressRouter("device-test", object())
+        incoming = RoutedEvent(
+            event={"id": "init"}, payload=None, raw=b"", command="game.game_init",
+            direction="in", room_id=ROOM, table_ids=(1149001,), websocket_id="aabbccdd",
+            data={},
+        )
+        router._ensure_unsupported_exit_locked(
+            1149001, incoming, reset=True, exit_kind="unsupported",
+            detail={"recent": True},
+        )
+        stages = [row.get("stage") for row in router._unsupported_exit[1149001]["queue"]]
+        self.assertEqual(stages, ["STANDUP"])
+        dummy = RoutedEvent(
+            event={"id": "dummy"}, payload=None, raw=b"", command="lobby.dummy",
+            direction="out", room_id=-1, table_ids=(), websocket_id="aabbccdd",
+            data={},
+        )
+        first = router._forced_exit_decision_locked(dummy, 1149001)
+        self.assertEqual(first.get("action"), "schedule_send")
+        self.assertEqual(str(first.get("_operator_action", {}).get("action")), "STANDUP")
+
+    def test_snapshot_marks_db_warning(self):
+        router = DeviceIngressRouter("device-test", object())
+        router._sessions[11] = _SessionSlot(table_id=11, created_order=1, buffer=__import__("collections").deque())
+        router._unsupported_tables[11] = "DOUBLE BOARD"
+
+        async def inner():
+            return await router.control_snapshot()
+
+        snap = asyncio.run(inner())
+        self.assertEqual(snap.get("warning"), "DB")
+        self.assertEqual(snap["tables"][0].get("warning"), "DB")
+        self.assertEqual(snap["tables"][0].get("warning_text"), "Warning: DB")
 
 
 class UnsupportedRoomLifecycleTests(unittest.IsolatedAsyncioTestCase):

@@ -32,7 +32,8 @@ from .logging import SessionLogger
 from .coin_capture import RawCoinCaptureManager
 from .v6router.accounts import AccountPool
 from .v6router.action_arbiter import ActionArbiter
-from .v6router.automation import AutomationStore
+from .v6router.automation import AutomationStore, parse_ui_dump
+from .v6router.fuel import latest_fuel_reading
 from .v6router.router import (
     DeviceIngressRouter,
     LiveTableSession,
@@ -51,12 +52,32 @@ MAX_TABLES_PER_DEVICE = 8
 MAX_TOTAL_TABLES = MAX_DEVICES * MAX_TABLES_PER_DEVICE
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 19101
+# APK pings every 1s. Reconnect and dump stalls used to flip a live device
+# offline because online required an unbroken TCP channel AND a fresh ping.
+# Stay online while any ping is recent. 120s → drop the router.
+HEARTBEAT_OFFLINE_SECONDS = 20.0
+HEARTBEAT_CLEANUP_SECONDS = 120.0
+# 30 949 hands in 497:05 on a live table → 1.0378 hands/min.
+CALIBRATED_HANDS_PER_MINUTE = 30949.0 / (497.0 * 60.0 + 5.0)
+
+
+def snapshot_fuel_from_devices(devices: Any) -> tuple[Optional[float], Optional[float]]:
+    """Latest fuelQty across the fleet. Never a sum of devices or tables."""
+    rows: list[dict[str, Any]] = []
+    for row in devices or []:
+        if not isinstance(row, dict):
+            continue
+        for table in row.get("tables") or []:
+            if isinstance(table, dict) and str(table.get("state") or "") != "closing":
+                rows.append(table)
+    return latest_fuel_reading(rows)
 
 NATIVE_MAGIC = b"HMN1"
 NATIVE_VERSION = 1
 NATIVE_WS_FRAME = 0x01
 NATIVE_HEARTBEAT = 0x02
 NATIVE_ACTION_RESULT = 0x03
+NATIVE_UI_DUMP = 0x04
 NATIVE_COMMAND = 0x81
 NATIVE_HEARTBEAT_ACK = 0x82
 
@@ -125,6 +146,14 @@ def parse_native_message(raw: bytes) -> tuple[str, Dict[str, Any]]:
         if len(raw) != 16:
             raise ValueError("bad native heartbeat")
         return "heartbeat", {"sequence": struct.unpack_from("!Q", raw, 8)[0]}
+
+    if typ == NATIVE_UI_DUMP:
+        if len(raw) < 12:
+            raise ValueError("bad native ui dump")
+        xml_len = struct.unpack_from("!I", raw, 8)[0]
+        if xml_len != len(raw) - 12:
+            raise ValueError("bad native ui dump length")
+        return "ui_dump", {"xml": raw[12:].decode("utf-8", errors="replace")}
 
     if typ == NATIVE_ACTION_RESULT:
         if len(raw) < 16:
@@ -352,7 +381,7 @@ class OperatorConsole:
         self._backend_state: dict[tuple[str, int], str] = {}
         self._device_down_generation: dict[str, int] = collections.defaultdict(int)
         self._device_down_announced: set[str] = set()
-        self._device_down_grace_seconds = 5.0
+        self._device_down_grace_seconds = HEARTBEAT_OFFLINE_SECONDS
         self._hands_table: dict[tuple[str, int], int] = collections.defaultdict(int)
         self._hands_device: dict[str, int] = collections.defaultdict(int)
         self._hands_by_type_device: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
@@ -369,8 +398,8 @@ class OperatorConsole:
         print(line, flush=True)
         self.logger.emit(event, severity=severity, message=line, operator=True, **fields)
 
-    def technical(self, event: str, *, severity: str = "INFO", **fields: Any) -> None:
-        self.logger.emit(event, severity=severity, **fields)
+    def technical(self, event: str, *, severity: str = "INFO", message: str | None = None, operator: bool = False, **fields: Any) -> None:
+        self.logger.emit(event, severity=severity, message=message, operator=operator, **fields)
 
     def _device(self, device_id: str) -> int:
         with self._lock:
@@ -844,6 +873,36 @@ class OperatorConsole:
                     "operator.standup_queued", device_id=device, table_id=table,
                     hand_id=detail.get("hand_id"),
                 )
+            elif tag == "prefold_miss":
+                hand = str(detail.get("hand") or "-")
+                reason = str(detail.get("reason") or "")
+                where = " · ".join(
+                    part for part in (
+                        str(detail.get("position") or ""),
+                        str(detail.get("facing") or ""),
+                        hand if hand != "-" else "",
+                        reason,
+                    ) if part
+                )
+                self.technical(
+                    "operator.prefold_miss",
+                    device_id=device, table_id=table,
+                    hand=hand, reason=reason,
+                    position=detail.get("position"), facing=detail.get("facing"),
+                    players=detail.get("players"),
+                )
+                self._line(
+                    f"{label}: префолд пропуск{(' · ' + where) if where else ''}",
+                    "operator.prefold_miss", device_id=device, table_id=table,
+                    hand=hand, reason=reason,
+                )
+            elif tag == "prefold_skipped":
+                self._line(
+                    f"{label}: префолд skip · {detail.get('reason') or observation.reason}",
+                    "operator.prefold_skipped", severity="WARN",
+                    device_id=device, table_id=table,
+                    reason=detail.get("reason"),
+                )
             elif tag == "prefold_ready":
                 meta = {
                     "table_id": table,
@@ -939,19 +998,14 @@ class OperatorConsole:
                 )
             elif tag == "sitout_detected":
                 self._line(
-                    f"{label}: ситаут — выходим и сядем снова по правилам auto",
+                    f"{label}: ситаут / wait BB — остаёмся за столом",
                     "operator.sitout", severity="WARN",
                     device_id=device, table_id=table,
                 )
             elif tag == "cc_streak_standup":
                 self._line(
-                    f"{label}: PokerEYE молчит 3 руки подряд — встаём",
-                    "operator.cc_streak_standup", severity="ERROR",
-                    device_id=device, table_id=table, streak=detail.get("streak"),
-                )
-                self.logger.error(
-                    "cc_streak_standup",
-                    message="PokerEYE produced no CC for 3 consecutive hero hands",
+                    f"{label}: PokerEYE failsafe больше 3 ходов — стендап",
+                    "operator.cc_streak_standup", severity="WARN",
                     device_id=device, table_id=table, streak=detail.get("streak"),
                 )
             elif tag == "cc_timeout":
@@ -1118,9 +1172,14 @@ class RouterService:
         self._routers: dict[str, DeviceIngressRouter] = {}
         self._connected: set[str] = set()
         self._last_seen: dict[str, float] = {}
+        self._heartbeat_at: dict[str, float] = {}
+        self._session_started = time.time()
         self._device_labels: dict[str, str] = {}
         self.fleet_provider = None
         self.automation_store = AutomationStore()
+        self._last_snapshot: dict[str, Any] = {}
+        self._ui_log_at: dict[str, float] = {}
+        self._ui_log_key: dict[str, str] = {}
         self._reaper = asyncio.run_coroutine_threadsafe(self._reaper_loop(), self.loop)
 
     def _run(self) -> None:
@@ -1163,16 +1222,94 @@ class RouterService:
                 startup_max_attempts=3,
                 startup_backoff_base=0.25,
                 startup_backoff_max=1.0,
-                startup_attempt_timeout=35.0,
-                startup_stale_seconds=90.0,
+                startup_attempt_timeout=3.0,
+                startup_stale_seconds=20.0,
                 automation=automation,
             )
             self._routers[device_id] = router
             router.start_watchdog()
         return router
 
+    def ui_dump(self, device_id: str, xml: str) -> None:
+        device_id = str(device_id or "")
+        router = self._routers.get(device_id)
+        auto = getattr(router, "automation", None) if router is not None else None
+
+        def apply() -> None:
+            stats = auto.ingest_ui_dump(xml) if auto is not None else parse_ui_dump(xml)
+            tap = str(stats.get("tap") or "")
+            closed = bool(stats.get("closed"))
+            waitlist = bool(stats.get("waitlist"))
+            janitor = bool(stats.get("janitor"))
+            key = f"{tap}|{int(closed)}|{int(waitlist)}|{int(janitor)}"
+            now = time.monotonic()
+            interesting = bool(tap or closed or waitlist or not janitor)
+            due = now - float(self._ui_log_at.get(device_id) or 0.0) >= 15.0
+            changed = self._ui_log_key.get(device_id) != key
+            if self.technical_sink is None:
+                return
+            if interesting and changed or due:
+                self._ui_log_at[device_id] = now
+                self._ui_log_key[device_id] = key
+                timer = stats.get("shortest_timer")
+                parts = ["uidump"]
+                parts.append("janitor" if janitor else "NO-JANITOR")
+                if closed:
+                    parts.append("TABLE CLOSED")
+                if waitlist:
+                    parts.append("waitlist")
+                if tap:
+                    parts.append(f"tap {tap}")
+                if timer:
+                    parts.append(f"timer {timer:g}s")
+                parts.append(f"{int(stats.get('nodes') or 0)} nodes")
+                self.technical_sink(
+                    "operator.ui.dump",
+                    device_id=device_id,
+                    table_id=int(getattr(auto, "_last_opened_table", 0) or 0) or None if auto else None,
+                    message=" ".join(parts),
+                    operator=True,
+                    players=stats.get("players"),
+                    closed=closed,
+                    waitlist=waitlist,
+                    janitor=janitor,
+                    tap=tap or None,
+                    empty_seats=stats.get("empty_seats"),
+                    shortest_timer=timer,
+                    nodes=stats.get("nodes"),
+                )
+        try:
+            self.loop.call_soon_threadsafe(apply)
+        except Exception:
+            apply()
+
+    def lobby_join_command(self, device_id: str) -> Optional[Dict[str, Any]]:
+        router = self._routers.get(str(device_id or ""))
+        auto = getattr(router, "automation", None) if router is not None else None
+        if auto is None or not hasattr(auto, "lobby_join_command"):
+            return None
+        return auto.lobby_join_command()
+
+    def note_ping(self, device_id: str) -> None:
+        now = time.monotonic()
+        device_id = str(device_id or "")
+        if not device_id:
+            return
+        self._heartbeat_at[device_id] = now
+        self._last_seen[device_id] = now
+
+    def device_online(self, device_id: str, *, now: Optional[float] = None) -> bool:
+        device_id = str(device_id or "")
+        stamp = float(self._heartbeat_at.get(device_id) or self._last_seen.get(device_id) or 0.0)
+        if stamp <= 0:
+            return False
+        age = float(now if now is not None else time.monotonic()) - stamp
+        # A 1s native reconnect used to drop `_connected` and paint the device
+        # offline even though the next hello was already on the wire.
+        return age < HEARTBEAT_OFFLINE_SECONDS
+
     async def _handle(self, device_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
-        self._last_seen[device_id] = time.monotonic()
+        self.note_ping(device_id)
         router = await self._router(device_id)
         decision, finish = await router.handle_event(event)
 
@@ -1232,7 +1369,7 @@ class RouterService:
     def transport_up(self, device_id: str, device_label: str = "") -> None:
         def mark() -> None:
             self._connected.add(device_id)
-            self._last_seen[device_id] = time.monotonic()
+            self.note_ping(device_id)
             if str(device_label or "").strip():
                 self._device_labels[device_id] = str(device_label).strip()
             # Device must exist in the fleet snapshot from TCP hello, not from
@@ -1243,13 +1380,12 @@ class RouterService:
     def transport_down(self, device_id: str) -> None:
         def mark() -> None:
             self._connected.discard(device_id)
-            self._last_seen[device_id] = time.monotonic()
         self.loop.call_soon_threadsafe(mark)
 
     async def _reaper_loop(self) -> None:
         try:
             while True:
-                await asyncio.sleep(10.0)
+                await asyncio.sleep(2.0)
                 now = time.monotonic()
                 for router in tuple(self._routers.values()):
                     reaped = await router.reap_stale_startups()
@@ -1260,17 +1396,31 @@ class RouterService:
                             device_id=router.device_id,
                             table_id=table_id,
                         )
-                stale = [
-                    device_id
-                    for device_id, seen in self._last_seen.items()
-                    if device_id not in self._connected and now - seen > 180.0
-                ]
+                stale = []
+                seen_ids = set(self._last_seen) | set(self._heartbeat_at) | set(self._routers)
+                for device_id in seen_ids:
+                    stamp = float(
+                        self._heartbeat_at.get(device_id)
+                        or self._last_seen.get(device_id)
+                        or 0.0
+                    )
+                    if stamp <= 0.0:
+                        continue
+                    if (now - stamp) >= HEARTBEAT_CLEANUP_SECONDS:
+                        stale.append(device_id)
                 for device_id in stale:
                     router = self._routers.pop(device_id, None)
                     self._last_seen.pop(device_id, None)
+                    self._heartbeat_at.pop(device_id, None)
                     self._device_labels.pop(device_id, None)
+                    self._connected.discard(device_id)
                     if router is not None:
-                        self.technical_sink("device.expired", severity="WARN", device_id=device_id)
+                        self.technical_sink(
+                            "device.expired",
+                            severity="WARN",
+                            device_id=device_id,
+                            reason="heartbeat timeout",
+                        )
                         await router.close(crashed=True)
         except asyncio.CancelledError:
             return
@@ -1285,11 +1435,14 @@ class RouterService:
             except Exception:
                 fleet = {}
         listed: set[str] = set()
+        now_mono = time.monotonic()
         for device_id, router in sorted(self._routers.items()):
             row = await router.control_snapshot()
+            for table in row.get("tables") or []:
+                table["device_id"] = device_id
             stats = fleet.get(device_id) or {}
             nick = str(row.get("hero_name") or stats.get("nick") or "")
-            row["connected"] = device_id in self._connected
+            row["connected"] = self.device_online(device_id, now=now_mono)
             row["device_label"] = self._device_labels.get(device_id, "")
             row["device_no"] = stats.get("device_no")
             row["hero_name"] = nick
@@ -1299,13 +1452,56 @@ class RouterService:
             row["session_hands"] = str(stats.get("session_hands") or "")
             devices.append(row)
             listed.add(device_id)
+        for device_id, blob in (self.automation_store.all_runtime() or {}).items():
+            seated_ids = []
+            for raw in (blob or {}).get("seated_tables") or []:
+                try:
+                    tid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if tid > 0:
+                    seated_ids.append(tid)
+            if not seated_ids:
+                continue
+            existing = next((row for row in devices if row.get("device_id") == device_id), None)
+            if existing is None:
+                stats = fleet.get(device_id) or {}
+                existing = {
+                    "device_id": device_id,
+                    "connected": self.device_online(device_id, now=now_mono),
+                    "tables": [],
+                    "device_label": self._device_labels.get(device_id, ""),
+                    "device_no": stats.get("device_no"),
+                    "hero_name": str(stats.get("nick") or ""),
+                    "display_name": str(stats.get("nick") or self._device_labels.get(device_id, "") or f"Устройство {stats.get('device_no') or '?'}"),
+                    "hands": int(stats.get("hands") or 0),
+                    "hands_by_type": dict(stats.get("hands_by_type") or {}),
+                    "session_hands": str(stats.get("session_hands") or ""),
+                    "automation": {},
+                    "persisted": True,
+                }
+                devices.append(existing)
+                listed.add(device_id)
+            have = {int(t.get("table_id") or 0) for t in (existing.get("tables") or [])}
+            for tid in seated_ids:
+                if tid in have:
+                    continue
+                existing.setdefault("tables", []).append({
+                    "device_id": device_id,
+                    "table_id": tid,
+                    "state": "ready",
+                    "hero_sitting": True,
+                    "persisted": True,
+                    "phase": "persisted",
+                })
+                have.add(tid)
         for device_id in sorted(self._connected):
             if device_id in listed:
                 continue
             stats = fleet.get(device_id) or {}
             devices.append({
                 "device_id": device_id,
-                "connected": True,
+                "connected": self.device_online(device_id, now=now_mono),
                 "tables": [],
                 "device_label": self._device_labels.get(device_id, ""),
                 "device_no": stats.get("device_no"),
@@ -1329,6 +1525,49 @@ class RouterService:
             }
             for row in self.accounts.state_snapshot()
         ]
+        db_accounts = {
+            str(table.get("account_id") or "")
+            for device in devices
+            for table in (device.get("tables") or [])
+            if str(table.get("warning") or "") == "DB" and table.get("account_id")
+        }
+        for account in accounts:
+            if str(account.get("account_id") or "") in db_accounts:
+                account["warning"] = "DB"
+        fuel_remaining = 0.0
+        fuel_have = False
+        seated = 0
+        hands = 0
+        live_tables = 0
+        for row in devices:
+            tables = list(row.get("tables") or [])
+            live = [t for t in tables if str(t.get("state") or "") != "closing"]
+            live_tables += len(live)
+            seated += sum(1 for t in live if t.get("hero_sitting") or t.get("state") == "ready")
+            hands += int(row.get("hands") or 0)
+        latest_qty, latest_rate = snapshot_fuel_from_devices(devices)
+        rate = latest_rate
+        if latest_qty is not None:
+            fuel_remaining = float(latest_qty)
+            fuel_have = True
+        if not fuel_have:
+            prev = self._last_snapshot if isinstance(getattr(self, "_last_snapshot", None), dict) else {}
+            prev_fuel = prev.get("fuel_remaining")
+            prev_rate = prev.get("fuel_rate_per_hand")
+            if prev_fuel is not None:
+                fuel_remaining = float(prev_fuel)
+                fuel_have = True
+            if rate is None and prev_rate is not None:
+                rate = float(prev_rate)
+        active_tables = int(seated or 0)
+        hands_per_min = active_tables * CALIBRATED_HANDS_PER_MINUTE
+        fuel_per_min = (float(rate) * hands_per_min) if rate is not None and active_tables else None
+        fuel_hours = None
+        fuel_per_hour = 0.0 if fuel_have else None
+        if fuel_per_min and fuel_per_min > 0:
+            fuel_per_hour = round(float(fuel_per_min) * 60.0, 1)
+        if fuel_have and fuel_per_min and fuel_per_min > 0:
+            fuel_hours = round(float(fuel_remaining) / (float(fuel_per_min) * 60.0), 1)
         return {
             "ok": True,
             "build": BUILD_ID,
@@ -1337,17 +1576,66 @@ class RouterService:
             "accounts": accounts,
             "connected_devices": sum(1 for row in devices if row.get("connected")),
             "max_tables_per_device": MAX_TABLES_PER_DEVICE,
+            "fuel_remaining": fuel_remaining if fuel_have else None,
+            "fuel_rate_per_hand": rate,
+            "hands_per_minute": round(hands_per_min, 3),
+            "fuel_per_minute": None if fuel_per_min is None else round(fuel_per_min, 3),
+            "fuel_per_hour": fuel_per_hour,
+            "fuel_hours_remaining": fuel_hours,
+            "fuel_active_tables": active_tables,
+            "seated_tables": seated,
+            "live_tables": live_tables,
         }
 
     def control_snapshot(self) -> dict[str, Any]:
         future = asyncio.run_coroutine_threadsafe(self._control_snapshot(), self.loop)
-        return dict(future.result(timeout=3.0))
+        try:
+            snap = dict(future.result(timeout=6.0))
+            self._last_snapshot = snap
+            return snap
+        except Exception as exc:
+            future.cancel()
+            if self._last_snapshot:
+                stale = dict(self._last_snapshot)
+                stale["stale"] = True
+                stale["snapshot_error"] = f"{type(exc).__name__}: {_short(exc)}"
+                return stale
+            return {
+                "ok": True,
+                "build": BUILD_ID,
+                "devices": [],
+                "accounts": [],
+                "connected_devices": 0,
+                "snapshot_error": f"{type(exc).__name__}: {_short(exc)}",
+            }
 
     async def _control_close_table(self, device_id: str, table_id: int) -> bool:
-        router = self._routers.get(str(device_id))
+        table_id = int(table_id or 0)
+        if table_id <= 0:
+            return False
+        router = self._routers.get(str(device_id or ""))
         if router is None:
             return False
-        await router.close_table(int(table_id), reason="operator console close")
+        known = set(router.active_table_ids)
+        auto = router.automation
+        if auto is not None:
+            known.update(int(tid) for tid, _kind in auto.coin_tab_ids())
+        if table_id not in known:
+            return False
+        recent = getattr(router, "_recent_closed", {})
+        if int(table_id) in recent and float(recent.get(int(table_id)) or 0) > time.monotonic():
+            return True
+        live = int(table_id) in router.active_table_ids
+        # Sessionless hung slots are in active_table_ids but Coin already left.
+        # Leave-via-hamburger is a no-op there; drop the trainer slot instead.
+        if live and auto is not None and router.table_has_live_session(int(table_id)):
+            auto._request_leave(int(table_id), "operator close")
+            try:
+                await router._watchdog_tick()
+            except Exception:
+                pass
+            return True
+        await router.close_table(int(table_id), crashed=False, reason="operator close ghost")
         return True
 
     def control_close_table(self, device_id: str, table_id: int) -> bool:
@@ -1708,6 +1996,20 @@ class NativeIngressServer:
         except (ConnectionError, OSError):
             return False
 
+    def send_json(self, device_id: str, payload: Dict[str, Any]) -> bool:
+        """Push a JSON control frame to every native channel of one device."""
+        try:
+            raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except Exception:
+            return False
+        sent = False
+        with self._lock:
+            channels = list(self._device_channels.get(str(device_id) or "") or ())
+        for channel_id in channels:
+            if self._send_channel(channel_id, raw):
+                sent = True
+        return sent
+
     def _mark_first_traffic(self, device_id: str) -> bool:
         first = False
         with self._lock:
@@ -1843,24 +2145,12 @@ class NativeIngressServer:
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            conn.settimeout(5.0)
+            conn.settimeout(20.0)
             hello = recv_json_frame(conn)
             device_id = str(hello.get("device_id") or "")
             transport_id = str(hello.get("table_id") or "")
             apk_build_id = str(hello.get("build_id") or "legacy-unversioned")
             device_label = _short(hello.get("device_label") or "", 96)
-            if self.operator is not None:
-                self.operator.technical(
-                    "transport.hello",
-                    device_id=device_id,
-                    transport_id=transport_id,
-                    peer=f"{addr[0]}:{addr[1]}",
-                    native=bool(hello.get("native_mux")),
-                    apk_build_id=apk_build_id,
-                    trainer_build_id=BUILD_ID,
-                    build_match=(apk_build_id == BUILD_ID),
-                    device_label=device_label or None,
-                )
 
             if hello.get("type") != "direct_hello" or hello.get("version") != PROTOCOL_VERSION:
                 send_json_frame(conn, {"type": "error", "error": "invalid_direct_hello"})
@@ -1880,16 +2170,6 @@ class NativeIngressServer:
                 send_json_frame(conn, {"type": "error", "error": "bad_proof"})
                 raise ValueError("bad_proof")
 
-            if apk_build_id != BUILD_ID and self.operator is not None:
-                self.operator.technical(
-                    "transport.build_mismatch",
-                    severity="WARN",
-                    device_id=device_id,
-                    apk_build_id=apk_build_id,
-                    trainer_build_id=BUILD_ID,
-                    allowed=True,
-                )
-
             try:
                 channel_id, first_for_device = self._register_channel(device_id, conn)
             except RuntimeError as exc:
@@ -1907,21 +2187,65 @@ class NativeIngressServer:
                     raise ValueError("device_capacity")
                 raise
 
-            send_json_frame(
-                conn,
-                {
-                    "type": "welcome",
-                    "version": PROTOCOL_VERSION,
-                    "device_id": device_id,
-                    "table_id": transport_id,
-                    "native_mux": True,
-                    "devices": self.count(),
-                    "process_channels": self.channel_count(device_id),
-                    "channel_id": channel_id,
-                    "build_id": BUILD_ID,
-                },
-            )
-            conn.settimeout(35.0)
+            welcome = {
+                "type": "welcome",
+                "version": PROTOCOL_VERSION,
+                "device_id": device_id,
+                "table_id": transport_id,
+                "native_mux": True,
+                "devices": self.count(),
+                "process_channels": self.channel_count(device_id),
+                "channel_id": channel_id,
+                "build_id": BUILD_ID,
+            }
+            welcome_raw = json.dumps(
+                welcome, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            send_raw_frame(conn, welcome_raw)
+            if self.operator is not None:
+                self.operator.technical(
+                    "transport.welcome_sent",
+                    device_id=device_id,
+                    transport_id=transport_id,
+                    channel_id=channel_id,
+                    peer=f"{addr[0]}:{addr[1]}",
+                    bytes=4 + len(welcome_raw),
+                    payload_prefix=welcome_raw[:48].decode("ascii", errors="replace"),
+                )
+            conn.settimeout(20.0)
+            if self.operator is not None:
+                self.operator.technical(
+                    "transport.hello",
+                    device_id=device_id,
+                    transport_id=transport_id,
+                    peer=f"{addr[0]}:{addr[1]}",
+                    native=bool(hello.get("native_mux")),
+                    apk_build_id=apk_build_id,
+                    trainer_build_id=BUILD_ID,
+                    build_match=(apk_build_id == BUILD_ID),
+                    device_label=device_label or None,
+                )
+
+            apk_mismatch = apk_build_id != BUILD_ID
+            if apk_mismatch and self.operator is not None:
+                self.operator.technical(
+                    "transport.build_mismatch",
+                    severity="WARN",
+                    device_id=device_id,
+                    apk_build_id=apk_build_id,
+                    trainer_build_id=BUILD_ID,
+                    allowed=True,
+                )
+                line = getattr(self.operator, "_line", None)
+                if callable(line):
+                    line(
+                        f"{device_label or device_id}: APK {apk_build_id} ≠ тренер {BUILD_ID} — авто-CC нестабилен, обновите APK",
+                        "operator.apk_mismatch",
+                        severity="WARN",
+                        device_id=device_id,
+                        apk_build_id=apk_build_id,
+                        trainer_build_id=BUILD_ID,
+                    )
 
             if first_for_device:
                 try:
@@ -1941,6 +2265,17 @@ class NativeIngressServer:
                     peer=f"{addr[0]}:{addr[1]}",
                     channels=self.channel_count(device_id),
                 )
+            if apk_mismatch:
+                self.send_json(device_id, {
+                    "type": "hud",
+                    "text": f"APK {apk_build_id} ≠ {BUILD_ID} — обновите приложение",
+                    "sticky": True,
+                    "tone": "red",
+                    "action": "LEAVE",
+                    "delay_ms": 0,
+                    "source": "apk",
+                    "from_cc": False,
+                })
 
             route_thread = threading.Thread(
                 target=self._route_worker,
@@ -1950,13 +2285,38 @@ class NativeIngressServer:
             )
             route_thread.start()
 
+            last_ping = time.monotonic()
+            try:
+                self.router_service.note_ping(device_id)
+            except Exception:
+                pass
             while not self._stop.is_set():
                 try:
                     raw = recv_raw_frame(conn)
                 except socket.timeout:
+                    if time.monotonic() - last_ping >= HEARTBEAT_CLEANUP_SECONDS:
+                        reason = "heartbeat timeout"
+                        raise ConnectionError("heartbeat timeout")
                     continue
 
                 kind, message = parse_native_message(raw)
+                last_ping = time.monotonic()
+                try:
+                    self.router_service.note_ping(device_id)
+                except Exception:
+                    pass
+                if kind == "ui_dump":
+                    try:
+                        self.router_service.ui_dump(device_id, str(message.get("xml") or ""))
+                    except Exception:
+                        pass
+                    try:
+                        cmd = self.router_service.lobby_join_command(device_id)
+                        if cmd:
+                            self.send_json(device_id, cmd)
+                    except Exception:
+                        pass
+                    continue
                 if kind == "heartbeat":
                     heartbeat_count += 1
                     if not self._send_channel(
@@ -2197,12 +2557,18 @@ class ProductionTrainer:
             first_account = account_ids[0]
             account_base = first_account.rsplit("-", 1)[0] if "-" in first_account else ""
         autogrow = bool(account_base) and os.getenv("POKEREYE_ACCOUNT_AUTOGROW", "0").strip().lower() in {"1", "true", "yes", "on"}
+        blocked = [
+            str(item).strip()
+            for item in (data.get("blocked_accounts") or [])
+            if str(item).strip()
+        ]
         pool = AccountPool(
             account_ids,
             dynamic_base=account_base or None,
             registry_path=account_path if account_base else None,
             profile=str(data.get("profile") or "PPPoker"),
             auto_expand_unbounded=autogrow,
+            blocked_accounts=blocked,
         )
         self.account_count = len(validated_accounts)
         self.operator = OperatorConsole(
@@ -2295,6 +2661,41 @@ class ProductionTrainer:
                 detail=observation.detail or {},
                 status=observation.status,
             )
+        hud = (observation.detail or {}).get("hud") if isinstance(observation.detail, dict) else None
+        if isinstance(hud, dict) and observation.device_id:
+            text = str(hud.get("text") or observation.reason or "").strip()
+            if text:
+                payload = {
+                    "type": "hud",
+                    "text": text[:160],
+                    "leave": bool(hud.get("leave")),
+                    "sticky": bool(hud.get("sticky")),
+                }
+                tone = str(hud.get("tone") or "").strip().lower()
+                if tone in {"red", "green", "yellow", "amber"}:
+                    payload["tone"] = "yellow" if tone == "amber" else tone
+                action = str(hud.get("action") or "").strip()
+                if action:
+                    payload["action"] = action[:16]
+                if hud.get("amount") is not None:
+                    payload["amount"] = hud.get("amount")
+                try:
+                    payload["delay_ms"] = int(hud.get("delay_ms") or 0)
+                except (TypeError, ValueError):
+                    payload["delay_ms"] = 0
+                if hud.get("source"):
+                    payload["source"] = str(hud.get("source") or "")[:16]
+                if "from_cc" in hud:
+                    payload["from_cc"] = bool(hud.get("from_cc"))
+                if hud.get("join") is not None:
+                    payload["join"] = bool(hud.get("join"))
+                if hud.get("bb") is not None:
+                    payload["bb"] = hud.get("bb")
+                if hud.get("tapx") is not None:
+                    payload["tapx"] = int(hud.get("tapx") or 0)
+                    payload["tapy"] = int(hud.get("tapy") or 0)
+                    payload["why"] = str(hud.get("why") or "")
+                self.server.send_json(str(observation.device_id), payload)
         self.operator.observation(observation)
 
     def start(self) -> None:

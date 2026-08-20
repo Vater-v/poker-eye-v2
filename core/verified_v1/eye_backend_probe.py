@@ -145,6 +145,14 @@ def ping_envelope(timestamp_ms: Optional[int] = None) -> bytes:
     return encode_envelope("CSPing", {"timestamp": int(timestamp_ms)})
 
 
+def settings_envelope(*, game_type: str = "PPPoker", working_mode: str = "AUTO") -> bytes:
+    """CSSettingsDto: kotlinx JSON keys game_type / working_mode (r4/j.smali)."""
+    return encode_envelope(
+        "CSSettings",
+        {"game_type": str(game_type), "working_mode": str(working_mode)},
+    )
+
+
 RECONNECT_INTERVAL_TRAILER = "RECONNECT_INTERVAL"
 REPLAY_PACKET_LIMIT = 50
 

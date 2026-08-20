@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -45,12 +46,13 @@ constexpr uint8_t kProtocol = 1;
 constexpr uint8_t kMsgWsFrame = 0x01;
 constexpr uint8_t kMsgHeartbeat = 0x02;
 constexpr uint8_t kMsgActionResult = 0x03;
+constexpr uint8_t kMsgUiDump = 0x04;
 constexpr uint8_t kMsgCommand = 0x81;
 constexpr uint8_t kMsgHeartbeatAck = 0x82;
 
 constexpr size_t kQueueMax = 2048;
 constexpr size_t kMaxWireFrame = 16u * 1024u * 1024u;
-constexpr uint64_t kHeartbeatNs = 5ull * 1000ull * 1000ull * 1000ull;
+constexpr uint64_t kHeartbeatNs = 1ull * 1000ull * 1000ull * 1000ull;
 constexpr uint64_t kTrainerSilenceNs = 15ull * 1000ull * 1000ull * 1000ull;
 constexpr uint64_t kReconnectNs = 1000ull * 1000ull * 1000ull;
 constexpr uint64_t kStatsNs = 60ull * 1000ull * 1000ull * 1000ull;
@@ -60,6 +62,9 @@ constexpr uint64_t kQueuedFrameMaxAgeNs = 30ull * 1000ull * 1000ull * 1000ull;
 JavaVM* g_vm = nullptr;
 jclass g_bridge_class = nullptr;
 jmethodID g_send_synthetic = nullptr;
+jmethodID g_hud_method = nullptr;
+std::mutex g_hud_mu;
+std::string g_pending_hud;
 
 jclass g_system_class = nullptr;
 jmethodID g_identity_hash = nullptr;
@@ -78,8 +83,12 @@ std::string g_device_id;
 std::string g_transport_id;
 std::string g_proof;
 std::string g_trainer_host;
+std::string g_trainer_fallback;
 std::string g_device_label;
 int g_port = 19037;
+constexpr int kConnectMs = 3000;
+constexpr int kHandshakeMs = 3000;
+constexpr int kFallbackConnectMs = 8000;
 
 struct FrameRef {
     uint64_t seq = 0;
@@ -127,6 +136,9 @@ std::atomic<uint64_t> m_copy_ns{0};
 std::atomic<uint64_t> m_tx_ns{0};
 std::atomic<uint64_t> m_reconnects{0};
 std::atomic<uint64_t> m_commands{0};
+
+std::mutex g_dump_mu;
+std::string g_pending_dump;
 std::atomic<uint64_t> m_actions_sent{0};
 std::atomic<uint64_t> m_action_fail{0};
 
@@ -401,25 +413,41 @@ bool handshake_confirmed(
     g_welcome_confirmed.store(false, std::memory_order_release);
     if (!send_frame(fd, hello_json())) return false;
     HLOGI(
-        "[+] trainer hello sent host=%s:%d build=%s; waiting welcome",
-        host.c_str(), g_port, POKEREYE_BUILD_ID);
+        "[+] trainer hello sent host=%s:%d build=%s; waiting welcome up to %dms",
+        host.c_str(), g_port, POKEREYE_BUILD_ID, timeout_ms);
 
-    pollfd pfd{fd, POLLIN, 0};
-    const int rc = poll(&pfd, 1, std::max(100, timeout_ms));
-    if (rc <= 0 || !(pfd.revents & POLLIN)) {
+    timeval tv{};
+    tv.tv_sec = std::max(1, timeout_ms) / 1000;
+    tv.tv_usec = (std::max(1, timeout_ms) % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    const uint64_t start = now_ns();
+    std::vector<uint8_t> reply;
+    if (!recv_frame(fd, reply)) {
         HLOGW(
-            "[~] trainer welcome timeout host=%s:%d after=%dms",
-            host.c_str(), g_port, timeout_ms);
+            "[~] trainer welcome timeout host=%s:%d after=%dms errno=%d",
+            host.c_str(), g_port, timeout_ms, errno);
+        return false;
+    }
+    HLOGI(
+        "[+] trainer welcome bytes=%zu first=%02x host=%s:%d",
+        reply.size(),
+        reply.empty() ? 0 : reply.front(),
+        host.c_str(),
+        g_port);
+    if (!parse_command(reply) || !g_welcome_confirmed.load(std::memory_order_acquire)) {
+        std::string head(reply.begin(), reply.begin() + static_cast<ptrdiff_t>(std::min<size_t>(reply.size(), 80)));
+        HLOGW("[~] trainer welcome not parsed: %s", head.c_str());
         return false;
     }
 
-    std::vector<uint8_t> reply;
-    if (!recv_frame(fd, reply) || !parse_command(reply)) return false;
-    if (!g_welcome_confirmed.load(std::memory_order_acquire)) return false;
-
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const uint64_t rtt_ms = (now_ns() - start) / 1000000ull;
     HLOGI(
-        "[+] trainer VPS handshake confirmed host=%s:%d ipv4=1 routing=android-default",
-        host.c_str(), g_port);
+        "[+] trainer VPS handshake confirmed host=%s:%d rtt=%" PRIu64 "ms ipv4=1",
+        host.c_str(), g_port, rtt_ms);
     return true;
 }
 
@@ -531,6 +559,13 @@ bool parse_command(const std::vector<uint8_t>& body) {
                     "[+] trainer handshake confirmed device=%s build=%s",
                     g_device_id.c_str(), POKEREYE_BUILD_ID);
             }
+            return true;
+        }
+        if (text.find("\"type\":\"hud\"") != std::string::npos
+                || text.find("\"type\": \"hud\"") != std::string::npos) {
+            std::lock_guard<std::mutex> lock(g_hud_mu);
+            g_pending_hud = text;
+            wake_worker();
             return true;
         }
         HLOGW("[~] trainer rejected native hello: %s", text.c_str());
@@ -855,6 +890,43 @@ bool ensure_worker_started() {
     }
 }
 
+int try_trainer_uplink(const std::string& host, int connect_ms, int handshake_ms) {
+    if (host.empty()) return -1;
+    HLOGI(
+        "[~] trainer connecting host=%s:%d connect=%dms handshake=%dms",
+        host.c_str(), g_port, connect_ms, handshake_ms);
+    int fd = connect_tcp(host, connect_ms);
+    if (fd < 0) {
+        HLOGW(
+            "[~] trainer connect fail host=%s:%d errno=%d",
+            host.c_str(), g_port, errno);
+        return -1;
+    }
+    if (!handshake_confirmed(fd, host, handshake_ms)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+void flush_hud(JNIEnv* env) {
+    if (!env || !g_bridge_class || !g_hud_method) return;
+    std::string json;
+    {
+        std::lock_guard<std::mutex> lock(g_hud_mu);
+        json.swap(g_pending_hud);
+    }
+    if (json.empty()) return;
+    jstring text = env->NewStringUTF(json.c_str());
+    if (!text) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return;
+    }
+    env->CallStaticVoidMethod(g_bridge_class, g_hud_method, text);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(text);
+}
+
 void worker_main() {
     JNIEnv* env = nullptr;
     if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
@@ -869,12 +941,18 @@ void worker_main() {
         int fd = -1;
         std::string connected_host = g_trainer_host;
 
-        // One endpoint, one route: normal AF_INET socket. SocksDroid/VpnService
-        // decides the path exactly as it does for ordinary Android traffic.
-        fd = connect_tcp(g_trainer_host, 2500);
-        if (fd >= 0 && !handshake_confirmed(fd, g_trainer_host, 5000)) {
-            close(fd);
-            fd = -1;
+        // Primary VPS first. If hello gets no welcome in 3s, same traffic goes
+        // through the NL socat bridge (Sony/USA path that swallows the reply).
+        fd = try_trainer_uplink(g_trainer_host, kConnectMs, kHandshakeMs);
+        if (fd < 0 && !g_trainer_fallback.empty()
+                && g_trainer_fallback != g_trainer_host) {
+            HLOGW(
+                "[~] trainer primary timeout host=%s:%d; failover via bridge %s:%d",
+                g_trainer_host.c_str(), g_port,
+                g_trainer_fallback.c_str(), g_port);
+            fd = try_trainer_uplink(
+                g_trainer_fallback, kFallbackConnectMs, kHandshakeMs);
+            if (fd >= 0) connected_host = g_trainer_fallback;
         }
         if (fd < 0) {
             m_reconnects.fetch_add(1, std::memory_order_relaxed);
@@ -883,9 +961,13 @@ void worker_main() {
             continue;
         }
 
+        const char* path =
+            (connected_host == g_trainer_fallback
+                && connected_host != g_trainer_host)
+            ? "nl-bridge" : "vps";
         HLOGI(
-            "[+] native uplink open device=%s trainer=%s:%d build=%s welcome=confirmed path=vps ipv4=1",
-            g_device_id.c_str(), connected_host.c_str(), g_port, POKEREYE_BUILD_ID);
+            "[+] native uplink open device=%s trainer=%s:%d build=%s welcome=confirmed path=%s ipv4=1",
+            g_device_id.c_str(), connected_host.c_str(), g_port, POKEREYE_BUILD_ID, path);
         next_heartbeat = now_ns() + kHeartbeatNs;
         uint64_t last_trainer_rx = now_ns();
 
@@ -911,6 +993,25 @@ void worker_main() {
                     connected_host.c_str(), static_cast<uint64_t>((now - last_trainer_rx) / 1000000ull));
                 connected = false;
                 break;
+            }
+            std::string dump;
+            {
+                std::lock_guard<std::mutex> lock(g_dump_mu);
+                dump.swap(g_pending_dump);
+            }
+            if (!dump.empty()) {
+                std::vector<uint8_t> body;
+                body.reserve(12 + dump.size());
+                put_u32(body, kMagic);
+                body.push_back(kMsgUiDump);
+                body.push_back(kProtocol);
+                put_u16(body, 0);
+                put_u32(body, static_cast<uint32_t>(dump.size()));
+                body.insert(body.end(), dump.begin(), dump.end());
+                if (!send_frame(fd, body)) {
+                    connected = false;
+                    break;
+                }
             }
             if (now >= next_heartbeat) {
                 if (!send_frame(fd, make_heartbeat(now))) {
@@ -940,7 +1041,10 @@ void worker_main() {
                 break;
             }
 
-            if (fds[1].revents & POLLIN) drain_wake_fd();
+            if (fds[1].revents & POLLIN) {
+                drain_wake_fd();
+                flush_hud(env);
+            }
 
             if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 connected = false;
@@ -954,6 +1058,7 @@ void worker_main() {
                     break;
                 }
                 last_trainer_rx = now_ns();
+                flush_hud(env);
             }
 
             log_stats(last_stats);
@@ -998,6 +1103,7 @@ Java_com_hmuriy_HmuriyBridge_nativeInit(
         jstring transport_id,
         jstring proof,
         jstring trainer_host,
+        jstring trainer_fallback,
         jint port,
         jstring device_label) {
     if (g_initialized.load(std::memory_order_acquire)) {
@@ -1017,12 +1123,16 @@ Java_com_hmuriy_HmuriyBridge_nativeInit(
     g_transport_id = to_string(transport_id);
     g_proof = to_string(proof);
     g_trainer_host = to_string(trainer_host);
+    g_trainer_fallback = to_string(trainer_fallback);
     g_port = static_cast<int>(port);
     g_device_label = to_string(device_label);
 
     g_bridge_class = static_cast<jclass>(env->NewGlobalRef(clazz));
     g_send_synthetic = env->GetStaticMethodID(
         clazz, "sendSynthetic", "(Ljava/lang/Object;[B)Z");
+    g_hud_method = env->GetStaticMethodID(
+        clazz, "onTrainerHud", "(Ljava/lang/String;)V");
+    if (!g_hud_method && env->ExceptionCheck()) env->ExceptionClear();
 
     if (!g_bridge_class || !g_send_synthetic) {
         if (env->ExceptionCheck()) env->ExceptionClear();
@@ -1064,10 +1174,26 @@ Java_com_hmuriy_HmuriyBridge_nativeInit(
     const bool worker = ensure_worker_started();
 
     HLOGI(
-        "[+] libhmuriy initialized build=%s device=%s transport=%s protocol=HMN1 action_result=1 eager_transport=%d trainer=%s:%d ipv4=1 routing=android-default label=%s",
+        "[+] libhmuriy initialized build=%s device=%s transport=%s protocol=HMN1 action_result=1 eager_transport=%d trainer=%s:%d fallback=%s:%d handshake_ms=%d ipv4=1 routing=android-default label=%s",
         POKEREYE_BUILD_ID, g_device_id.c_str(), g_transport_id.c_str(),
-        worker ? 1 : 0, g_trainer_host.c_str(), g_port, g_device_label.c_str());
+        worker ? 1 : 0, g_trainer_host.c_str(), g_port,
+        g_trainer_fallback.c_str(), g_port, kHandshakeMs, g_device_label.c_str());
     return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hmuriy_HmuriyBridge_nativeUiDump(JNIEnv* env, jclass, jstring xml) {
+    if (!xml) return;
+    const char* chars = env->GetStringUTFChars(xml, nullptr);
+    if (!chars) return;
+    std::string text(chars);
+    env->ReleaseStringUTFChars(xml, chars);
+    if (text.size() > 48000u) text.resize(48000u);
+    {
+        std::lock_guard<std::mutex> lock(g_dump_mu);
+        g_pending_dump.swap(text);
+    }
+    wake_worker();
 }
 
 extern "C" JNIEXPORT void JNICALL

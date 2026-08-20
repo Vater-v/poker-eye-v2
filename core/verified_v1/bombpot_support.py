@@ -54,14 +54,6 @@ _SECOND_BOARD_KEYS = {
     "dealerCardsRit2",
 }
 
-_EXPLICIT_ACTIVE_KEYS = {
-    "isDoubleBoard",
-    "doubleBoard",
-    "is_double_board",
-    "double_board",
-}
-
-
 def _walk(value: Any, path: str = "root") -> Iterator[tuple[str, Any]]:
     """Walk nested objects and JSON strings without throwing on malformed payloads."""
     yield path, value
@@ -148,12 +140,9 @@ def detect_double_board(payload: Any, command: Optional[str] = None) -> tuple[bo
         if is_hand and value.get("isDoubleBoard") is True:
             return True, f"{path}.isBombpotHand+isDoubleBoard"
 
-        # Explicit active flags are accepted only on game traffic and never from a
-        # room/lobby configuration object.
-        if cmd_lower.startswith("game.") and not _configuration_path(path, value):
-            for key in _EXPLICIT_ACTIVE_KEYS:
-                if value.get(key) is True:
-                    return True, f"{path}.{key}=true"
+        # Catalog/wait_list often ships isDoubleBoard:1 as a room capability
+        # (same class as isStraddle:1). That is not this-hand second board.
+        # Only nonempty second-board cards / odds / bombpot-hand flags count.
 
     return False, ""
 

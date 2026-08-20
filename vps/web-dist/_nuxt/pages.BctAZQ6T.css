@@ -1,0 +1,1 @@
+@keyframes pe-fuel-blink{0%,to{color:#ffe8ea;background-color:#3a1014}50%{color:#1a1a1a;background-color:#f4f4f4}}.pe-fuel-low{animation:.9s steps(2,end) infinite pe-fuel-blink}.pe-fuel-low .text-\[18px\]{color:inherit}

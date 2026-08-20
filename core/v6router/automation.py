@@ -5,11 +5,12 @@ import base64
 import json
 import os
 import random
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypedDict
 
 from ..verified_v1.coin_action_wire import (
     build_game_leave_seat_packet,
@@ -18,82 +19,45 @@ from ..verified_v1.coin_action_wire import (
     build_game_take_seat_packet,
     build_lobby_join_game_packet,
 )
+from .lobby_scene import (
+    MIN_PLAYERS,
+    MIN_TABLE_SIZE,
+    LobbyPlan,
+    UiDump,
+    UiNodeRow,
+    _is_hu_label,
+    _ui_compact,
+    classify_lobby_scene,
+    parse_ui_dump,
+    plan_lobby_join_tap,
+)
+from .persist import (
+    ALLOWED_BB,
+    COIN_MAX_TABLES,
+    DEFAULT_BB,
+    DEFAULT_TABLES,
+    LEAVE_BELOW_BB,
+    OPEN_IF_FREE_BB,
+    AutoPolicy,
+    AutomationStore,
+    _closest_bb,
+    _finite,
+    _policy_path,
+)
 from .router import RoutedEvent, _decode_event, _forward
 
-
-ALLOWED_BB = (0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
-DEFAULT_BB = 0.02
-DEFAULT_TABLES = 5
-COIN_MAX_TABLES = 5
-LEAVE_BELOW_BB = 79.0
-OPEN_IF_FREE_BB = 100.0
-MIN_PLAYERS = 3
-JOIN_GAP_SECONDS = 8.0
 JOIN_GAP_MIN_SECONDS = 25.0
 JOIN_GAP_MAX_SECONDS = 40.0
+JOIN_HANDS_BEFORE_NEXT = 1
 WATCHDOG_SECONDS = 2.0
-EMPTY_GRACE_SECONDS = 8.0
+# Real table that emptied: wait 20s (seat_map flicker / next deal).
+# Junk tab that never got a roster/hand/cards: do not wait 20s.
+EMPTY_IDLE_SECONDS = 20.0
+JUNK_SECONDS = 3.0
+STACK_GRACE_SECONDS = 20.0
 TAB_COOLDOWN_SECONDS = 45.0
 JOIN_REJECT_COOLDOWN = 30.0
-
-
-def _policy_path() -> Path:
-    raw = os.getenv("POKEREYE_AUTO_FILE", "").strip()
-    if raw:
-        return Path(raw)
-    return Path(__file__).resolve().parents[2] / "config" / "device_automation.json"
-
-
-def _finite(value: Any) -> Optional[float]:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number != number or number in {float("inf"), float("-inf")}:
-        return None
-    return number
-
-
-def _closest_bb(value: Any) -> float:
-    number = _finite(value)
-    if number is None:
-        return DEFAULT_BB
-    return min(ALLOWED_BB, key=lambda item: abs(item - number))
-
-
-@dataclass
-class AutoPolicy:
-    enabled: bool = False
-    table_count: int = DEFAULT_TABLES
-    bb: float = DEFAULT_BB
-    watch_balance: bool = True
-    watch_players: bool = True
-    min_players: int = MIN_PLAYERS
-    leave_below_bb: float = LEAVE_BELOW_BB
-    open_if_free_bb: float = OPEN_IF_FREE_BB
-
-    @classmethod
-    def from_mapping(cls, raw: Any) -> "AutoPolicy":
-        data = dict(raw or {}) if isinstance(raw, dict) else {}
-        tables = int(data.get("table_count") or DEFAULT_TABLES)
-        tables = max(1, min(COIN_MAX_TABLES, tables))
-        min_players = int(data.get("min_players") or MIN_PLAYERS)
-        min_players = max(2, min(9, min_players))
-        leave_below = _finite(data.get("leave_below_bb")) or LEAVE_BELOW_BB
-        open_free = _finite(data.get("open_if_free_bb")) or OPEN_IF_FREE_BB
-        return cls(
-            enabled=bool(data.get("enabled")),
-            table_count=tables,
-            bb=_closest_bb(data.get("bb")),
-            watch_balance=bool(data.get("watch_balance", True)),
-            watch_players=bool(data.get("watch_players", True)),
-            min_players=min_players,
-            leave_below_bb=max(1.0, float(leave_below)),
-            open_if_free_bb=max(1.0, float(open_free)),
-        )
-
-    def public(self) -> dict[str, Any]:
-        return asdict(self)
+LOBBY_STEP_SECONDS = 1.8
 
 
 @dataclass
@@ -143,16 +107,27 @@ class DeviceAutomation:
         self._queue: list[PendingCommand] = []
         self._joining = False
         self._last_join_at = 0.0
+        self._last_opened_table = 0
         self._gradual: list[tuple[int, float, str]] = []
         self._leave_reasons: dict[int, str] = {}
         self._closed_reasons: dict[int, str] = {}
         self._seated: set[int] = set()
         self._players: dict[int, int] = {}
         self._stack_bb: dict[int, float] = {}
+        self._stack_positive: set[int] = set()
         self._sitout: set[int] = set()
+        self._sitout_since: dict[int, float] = {}
         self._want_seat: set[int] = set()
         self._seated_at: dict[int, float] = {}
         self._hand_live: dict[int, bool] = {}
+        self._hand_ended_at: dict[int, float] = {}
+        self._hands_done: dict[int, int] = {}
+        self._ui_players: dict[int, int] = {}
+        self._ui_closed: set[int] = set()
+        self._ui_loading: set[int] = set()
+        self._ui_waitlist: set[int] = set()
+        self._short_since: dict[int, float] = {}
+        self._peak_players: dict[int, int] = {}
         self._table_bb: dict[int, float] = {}
         self._leave_inflight: set[int] = set()
         self._tabs: dict[int, float] = {}
@@ -161,15 +136,51 @@ class DeviceAutomation:
         self._leaving_all = False
         self._status = "idle"
         self._counter = 0
+        self._ui_last: dict[str, Any] = {}
+        self._ui_join_armed = False
+        self._last_ui_join_at = 0.0
+        self._lobby_dump_key = ""
+        self._ui_boot_since = 0.0
+        self._table_size: dict[int, int] = {}
         if store is not None:
             saved = store.get(self.device_id)
             if saved is not None:
                 self.policy = saved
+            self._restore_runtime()
+
+    def persist_runtime(self) -> None:
+        if self._store is None:
+            return
+        self._store.put_runtime(self.device_id, {
+            "seated_tables": sorted(int(tid) for tid in self._seated if int(tid) > 0),
+            "play_enabled": bool(self.policy.play_enabled),
+            "policy": self.policy.public(),
+        })
+
+    def _restore_runtime(self) -> None:
+        if self._store is None:
+            return
+        blob = self._store.get_runtime(self.device_id) or {}
+        if not isinstance(blob, dict):
+            return
+        for raw in blob.get("seated_tables") or []:
+            try:
+                table_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if table_id <= 0:
+                continue
+            self._seated.add(table_id)
+            self._tabs.setdefault(table_id, 0.0)
+        play = blob.get("play_enabled")
+        if play is not None:
+            self.policy.play_enabled = bool(play)
 
     def snapshot(self) -> dict[str, Any]:
         bbs = sorted({round(row.big_blind, 4) for row in self.configs.values() if row.mini_game_type == 1})
         return {
             "enabled": self.policy.enabled,
+            "play_enabled": bool(self.policy.play_enabled),
             "policy": self.policy.public(),
             "status": self._status,
             "wallet_cash": self.wallet_cash,
@@ -184,6 +195,7 @@ class DeviceAutomation:
             "sitout_tables": sorted(self._sitout),
             "coin_tabs": self.coin_tab_count(),
             "coin_tab_cap": COIN_MAX_TABLES,
+            "ui": dict(self._ui_last),
         }
 
     def apply_policy(self, raw: dict[str, Any], *, enable: Optional[bool] = None) -> AutoPolicy:
@@ -193,6 +205,7 @@ class DeviceAutomation:
         self.policy = policy
         if not policy.enabled:
             self._joining = False
+            self._want_seat.clear()
             self._queue = [
                 item for item in self._queue
                 if item.command not in {"lobby.join_game", "game.reserve_Seat", "game.take_Seat"}
@@ -204,10 +217,11 @@ class DeviceAutomation:
             self._status = "armed"
         if self._store is not None:
             self._store.put(self.device_id, policy)
+            self.persist_runtime()
         self._note(
             "automation.policy",
-            f"auto {'on' if policy.enabled else 'off'} · {policy.table_count}×{policy.bb:g}",
-            severity="INFO" if policy.enabled else "WARN",
+            f"auto {'on' if policy.enabled else 'off'} · play {'on' if policy.play_enabled else 'off'} · {policy.table_count}×{policy.bb:g}",
+            severity="INFO" if policy.enabled or policy.play_enabled else "WARN",
         )
         return policy
 
@@ -217,6 +231,7 @@ class DeviceAutomation:
     def schedule_leave_all(self, table_ids: list[int], *, gradual: bool) -> int:
         self._leaving_all = True
         self._joining = False
+        self._want_seat.clear()
         self._queue = [
             item for item in self._queue
             if item.command not in {"lobby.join_game", "game.reserve_Seat", "game.take_Seat"}
@@ -236,14 +251,14 @@ class DeviceAutomation:
             seen.add(table_id)
             if gradual:
                 delay += random.uniform(120.0, 600.0)
+            # Sequential even for "сразу": next table starts only after this
+            # one has stood up and the Coin tab actually closed.
             self._gradual.append((table_id, now + delay, "operator leave-all"))
             queued += 1
-            if not gradual:
-                delay += 0.4
         self._status = "leaving"
         self._note(
             "automation.leave_all",
-            f"покидаем все столы · join выключен · {'постепенно' if gradual else 'сразу'} · {queued}",
+            f"покидаем все столы · по одному · {'пауза 2–10 мин' if gradual else 'сразу после закрытия'} · {queued}",
             severity="WARN",
         )
         return queued
@@ -258,16 +273,30 @@ class DeviceAutomation:
             self.wallet_cash = float(self.wallet_cash) + float(stack_bb) * float(bb)
         self._seated.discard(table_id)
         self._sitout.discard(table_id)
+        self._sitout_since.pop(table_id, None)
         self._players.pop(table_id, None)
         self._seated_at.pop(table_id, None)
         self._hand_live.pop(table_id, None)
+        self._hand_ended_at.pop(table_id, None)
+        self._hands_done.pop(table_id, None)
+        self._ui_players.pop(table_id, None)
+        self._ui_closed.discard(table_id)
+        self._ui_loading.discard(table_id)
+        self._ui_waitlist.discard(table_id)
+        self._short_since.pop(table_id, None)
+        self._peak_players.pop(table_id, None)
+        self._stack_positive.discard(table_id)
         self._leave_inflight.discard(table_id)
         self._want_seat.discard(table_id)
+        self._table_size.pop(table_id, None)
         self._tabs[table_id] = time.monotonic() + TAB_COOLDOWN_SECONDS
         self._gradual = [row for row in self._gradual if row[0] != table_id]
         self._queue = [item for item in self._queue if item.table_id != table_id]
+        self.persist_runtime()
         if self._leaving_all:
             self._status = "leaving"
+        elif self.coin_tab_count() >= min(int(self.policy.table_count), COIN_MAX_TABLES):
+            self._status = f"cap {self.coin_tab_count()}/{COIN_MAX_TABLES}"
         elif self.policy.enabled:
             self._status = "refill"
         else:
@@ -290,31 +319,56 @@ class DeviceAutomation:
 
     def drain_leaves(self) -> list[tuple[int, str]]:
         now = time.monotonic()
+        if self._leaving_all:
+            if self._leave_inflight:
+                return []
+            due = [row for row in self._gradual if row[1] <= now]
+            if not due:
+                return []
+            table_id, _when, reason = due[0]
+            table_id = int(table_id)
+            self._gradual = [row for row in self._gradual if int(row[0]) != table_id]
+            self._leave_inflight.add(table_id)
+            self._leave_reasons[table_id] = reason
+            return [(table_id, reason)]
+        if self._leave_inflight:
+            return []
         due = [row for row in self._gradual if row[1] <= now]
         self._gradual = [row for row in self._gradual if row[1] > now]
-        out: list[tuple[int, str]] = []
         for table_id, _when, reason in due:
             table_id = int(table_id)
             if table_id in self._leave_inflight:
                 continue
             self._leave_inflight.add(table_id)
-            out.append((table_id, reason))
+            return [(table_id, str(reason))]
         for table_id, reason in list(self._leave_reasons.items()):
             table_id = int(table_id)
             if table_id in self._leave_inflight:
                 continue
             self._leave_inflight.add(table_id)
-            out.append((table_id, reason))
-        return out
+            return [(table_id, str(reason))]
+        return []
 
     def coin_tab_count(self) -> int:
+        return len(self._live_tabs())
+
+    def coin_tab_ids(self) -> list[tuple[int, str]]:
+        """Coin UI tabs the trainer still owes the operator, live or ghost."""
+        rows: list[tuple[int, str]] = []
+        for table_id, expiry in self._live_tabs().items():
+            kind = "live" if float(expiry or 0.0) == 0.0 else "ghost"
+            rows.append((int(table_id), kind))
+        rows.sort(key=lambda item: item[0])
+        return rows
+
+    def _live_tabs(self) -> dict[int, float]:
         now = time.monotonic()
         keep: dict[int, float] = {}
         for table_id, expiry in self._tabs.items():
             if expiry == 0 or expiry > now:
                 keep[int(table_id)] = float(expiry)
         self._tabs = keep
-        return len(keep)
+        return keep
 
     def handle(self, event: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -333,33 +387,112 @@ class DeviceAutomation:
         return _forward(event)
 
     def tick(self, *, seated_tables: int, live_table_ids: Optional[list[int]] = None) -> None:
-        now = time.monotonic()
         live = set(int(item) for item in (live_table_ids or self._seated))
         self._seated = {tid for tid in self._seated if tid in live}
-        if self._halt_joins():
-            return
-        pending_joins = sum(1 for item in self._queue if item.command == "lobby.join_game")
-        tabs = self.coin_tab_count()
-        open_count = max(len(live), tabs) + pending_joins + (1 if self._joining else 0)
-        target = min(int(self.policy.table_count), COIN_MAX_TABLES)
-        if open_count < target and self._can_open(open_count=open_count):
-            self._queue_join()
+        # Manual: operator sits and leaves in Coin. Trainer only plays CC
+        # and honors operator leave-all. No auto-join, no auto-standup.
+
+    def _watch_tables(self, live: set[int], now: float) -> None:
         for table_id in list(live):
             players = int(self._players.get(table_id) or 0)
             in_hand = bool(self._hand_live.get(table_id))
             age = now - float(self._seated_at.get(table_id) or now)
-            # Sit → cards → immediate leave is the short-handed first-deal bug.
-            if self.policy.watch_players and players and players < int(self.policy.min_players):
-                if in_hand:
+            if in_hand:
+                # Never stand up mid-hand. Do not clear a short-table leave
+                # and do not reset idle — a 2-player ring used to play
+                # forever because each deal wiped the 20s timer.
+                continue
+            if self.policy.watch_players:
+                ui_n = self._ui_players.get(table_id)
+                seat_n = int(players or 0)
+                peak = max(int(self._peak_players.get(table_id) or 0), seat_n, int(ui_n or 0))
+                self._peak_players[table_id] = peak
+                min_n = int(self.policy.min_players)
+                loading = table_id in self._ui_loading
+                closed = table_id in self._ui_closed
+                useful = peak >= 2 or int(self._hands_done.get(table_id) or 0) > 0
+                if useful:
+                    self.retract_false_leave(table_id)
+                if not useful:
+                    if closed or table_id in self._ui_waitlist:
+                        self._request_leave(table_id, "uidump TABLE CLOSED")
+                        continue
+                    if loading:
+                        self._short_since.pop(table_id, None)
+                        continue
+                    # Missing uidump/roster is normal while game_init lands.
+                    # Never stand up on the first 0-player dump.
+                    if age >= JUNK_SECONDS:
+                        why = "нет данных" if ui_n is None else f"uidump {ui_n} игроков"
+                        self._request_leave(table_id, why)
                     continue
-                if age >= EMPTY_GRACE_SECONDS:
-                    self._request_leave(table_id, f"пусто {players} игроков после {int(age)}с")
+                short = False
+                if ui_n is not None:
+                    short = int(ui_n) < min_n
+                elif seat_n < min_n:
+                    short = True
+                if short:
+                    hands = int(self._hands_done.get(table_id) or 0)
+                    if hands > 0:
+                        why = f"uidump {ui_n} игроков" if ui_n is not None else f"пусто {seat_n} игроков"
+                        self._request_leave(table_id, why)
+                    else:
+                        started = float(self._short_since.get(table_id) or 0.0)
+                        if started <= 0:
+                            self._short_since[table_id] = now
+                            started = now
+                        if (now - started) >= EMPTY_IDLE_SECONDS:
+                            why = f"uidump {ui_n} игроков" if ui_n is not None else f"пусто {seat_n} игроков"
+                            self._request_leave(table_id, why)
+                else:
+                    self._short_since.pop(table_id, None)
             if self.policy.watch_balance:
                 stack = self._stack_bb.get(table_id)
-                if stack is not None and stack < float(self.policy.leave_below_bb) and not in_hand:
-                    self._request_leave(table_id, f"стек {stack:.1f} BB < {self.policy.leave_below_bb:g}")
-            if table_id in self._sitout and not in_hand:
-                self._request_leave(table_id, "sitout")
+                if (
+                    stack is not None
+                    and stack < float(self.policy.leave_below_bb)
+                    and age >= STACK_GRACE_SECONDS
+                ):
+                    if stack <= 0.05 and table_id not in self._stack_positive:
+                        pass
+                    else:
+                        self._request_leave(
+                            table_id,
+                            f"стек {stack:.1f} BB < {self.policy.leave_below_bb:g}",
+                        )
+        for tid, expiry in list(self._live_tabs().items()):
+            if float(expiry or 0.0) != 0.0 or tid in live or tid in self._leave_reasons:
+                continue
+            # Observing/pending tabs are not junk. Only a focused TABLE CLOSED
+            # / waitlist dump may close a tab that has not seated yet.
+            if tid in self._ui_closed or tid in self._ui_waitlist:
+                self._request_leave(int(tid), "uidump TABLE CLOSED")
+
+    def _newest_has_enough_hands(self) -> bool:
+        waiting = [
+            tid for tid in self._seated
+            if int(self._hands_done.get(tid, 0)) < JOIN_HANDS_BEFORE_NEXT
+            and tid not in self._leave_reasons
+            and tid not in self._ui_closed
+        ]
+        if waiting:
+            return False
+        for tid, expiry in self._live_tabs().items():
+            if float(expiry or 0.0) != 0.0:
+                continue
+            if tid in self._leave_reasons or tid in self._ui_closed:
+                continue
+            if tid not in self._seated:
+                self._status = "wait sit"
+                return False
+        tid = int(self._last_opened_table or 0)
+        if tid <= 0 or tid in self._seated or tid in self._closed_reasons or tid in self._ui_closed:
+            return True
+        expiry = float(self._tabs.get(tid) or 0.0)
+        if expiry == 0.0:
+            self._status = "wait sit"
+            return False
+        return True
 
     def _can_open(self, *, open_count: int = 0) -> bool:
         now = time.monotonic()
@@ -367,11 +500,22 @@ class DeviceAutomation:
             self._status = "leaving" if self._leaving_all else "paused"
             return False
         if self._joining:
+            if now - float(self._last_join_at or 0.0) < 10.0:
+                return False
+            self._joining = False
+            self._queue = [item for item in self._queue if item.command != "lobby.join_game"]
+            self._note("automation.join_timeout", "join_game не открыл стол · открываем из лобби")
+        if self.coin_tab_count() == 0 and not self._seated:
+            self._status = "ui-join"
             return False
         if now < float(self._join_block_until or 0.0):
             self._status = "join-cooldown"
             return False
         if now - self._last_join_at < float(self._next_join_gap or JOIN_GAP_MIN_SECONDS):
+            return False
+        if not self._newest_has_enough_hands():
+            if self._status != "wait sit":
+                self._status = "wait 1 hand"
             return False
         if open_count >= min(int(self.policy.table_count), COIN_MAX_TABLES):
             self._status = f"cap {open_count}/{COIN_MAX_TABLES}"
@@ -380,10 +524,10 @@ class DeviceAutomation:
             self._status = "coin 5 tabs"
             return False
         if not self._pick_config():
-            self._status = "waiting-catalog"
+            self._status = "ui-join"
             return False
         if not self.lobby_ws:
-            self._status = "waiting-lobby"
+            self._status = "ui-join" if self.needs_ui_join() else "waiting-lobby"
             return False
         if self.policy.watch_balance and self.wallet_cash is not None:
             free_bb = self.wallet_cash / max(self.policy.bb, 1e-9)
@@ -402,6 +546,21 @@ class DeviceAutomation:
             return None
         return sorted(candidates, key=lambda row: (abs(row.big_blind - target), row.config_id))[0]
 
+    def _open_table_count(self) -> int:
+        return max(len(self._seated), self.coin_tab_count())
+
+    def _want_more_tables(self) -> bool:
+        if self._halt_joins():
+            return False
+        return self._open_table_count() < min(int(self.policy.table_count), COIN_MAX_TABLES)
+
+    def needs_ui_join(self) -> bool:
+        return False
+
+    def lobby_join_command(self) -> Optional[dict[str, Any]]:
+        return None
+
+
     def _buyin(self, config: RoomConfig) -> float:
         want = float(self.policy.open_if_free_bb) * float(config.big_blind)
         amount = min(float(config.max_buyin or want), want)
@@ -410,6 +569,8 @@ class DeviceAutomation:
         return amount
 
     def _queue_join(self) -> None:
+        return
+
         if self._halt_joins():
             return
         config = self._pick_config()
@@ -446,17 +607,38 @@ class DeviceAutomation:
         if table_id in self._leave_reasons:
             return
         self._leave_reasons[table_id] = reason
+        self._want_seat.discard(table_id)
         self._note("automation.leave", f"стол {table_id}: {reason}")
+
+    def retract_false_leave(self, table_id: int) -> Optional[str]:
+        """Drop a junk/uidump standup if the table is actually playable."""
+        table_id = int(table_id)
+        why = str(self._leave_reasons.get(table_id) or "")
+        if not why:
+            return None
+        if not (
+            why.startswith("нет данных")
+            or why.startswith("uidump")
+            or why.startswith("пусто")
+        ):
+            return None
+        peak = max(
+            int(self._peak_players.get(table_id) or 0),
+            int(self._players.get(table_id) or 0),
+            int(self._ui_players.get(table_id) or 0),
+        )
+        if peak < int(self.policy.min_players):
+            return None
+        self._leave_reasons.pop(table_id, None)
+        self._leave_inflight.discard(table_id)
+        self._note("automation.leave_abort", f"стол {table_id}: отмена стендапа · стол живой")
+        return why
 
     def _observe(self, routed: RoutedEvent) -> None:
         if routed.is_dummy:
             url = str(routed.event.get("url") or "")
             ws = str(routed.websocket_id or "")
-            if ws and (
-                "mainlobby" in url.lower()
-                or "lobby" in url.lower()
-                or routed.room_id in {None, -1, 0}
-            ):
+            if ws and ("mainlobby" in url.lower() or "lobby" in url.lower()):
                 self.lobby_ws = ws
                 self.lobby_url = url
             if ws and routed.room_id:
@@ -465,8 +647,7 @@ class DeviceAutomation:
                     self.game_ws[table_id] = ws
             return
         data = routed.data if isinstance(routed.data, dict) else {}
-        if routed.decoded_body:
-            self._ingest_catalog(routed)
+        self._ingest_catalog(routed)
         if routed.command == "lobby.join_game" and routed.direction == "in":
             failed = data.get("isSuccess") is False or int(data.get("errorCode") or 0) != 0
             if failed:
@@ -479,6 +660,7 @@ class DeviceAutomation:
             self._joining = False
             for tid in routed.table_ids:
                 self._tabs[int(tid)] = 0.0
+                self._last_opened_table = int(tid)
             for row in data.get("tablesToJoin") or ():
                 if not isinstance(row, dict):
                     continue
@@ -495,7 +677,28 @@ class DeviceAutomation:
             if routed.websocket_id:
                 self.game_ws[table_id] = str(routed.websocket_id)
             if routed.command == "game.game_init":
-                self._want_seat.add(table_id)
+                size = 0
+                init = data.get("gameInitResponseData") if isinstance(data.get("gameInitResponseData"), dict) else data
+                try:
+                    size = int((init or {}).get("maxSize") or (init or {}).get("tableSize") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                if size <= 0:
+                    cfg = self._pick_config()
+                    size = int(cfg.table_size) if cfg and cfg.table_size else 0
+                if size:
+                    self._table_size[table_id] = size
+                hu_name = str((init or {}).get("tableName") or (init or {}).get("roomName") or "")
+                if (size and size < max(3, int(self.policy.min_players))) or _is_hu_label(_ui_compact(hu_name)):
+                    self._want_seat.discard(table_id)
+                    self._request_leave(table_id, f"стол {size or 'HU'}-max")
+                elif (
+                    self.policy.enabled
+                    and not self._leaving_all
+                    and table_id not in self._leave_reasons
+                    and table_id not in self._closed_reasons
+                ):
+                    self._want_seat.add(table_id)
         if routed.command == "game.reserve_Seat" and routed.direction == "in":
             balance = _finite(data.get("balance"))
             if balance is not None:
@@ -505,6 +708,12 @@ class DeviceAutomation:
                 seat = int(data.get("seatId") or 0)
                 buyin = _finite(data.get("maxBuyin") or data.get("maxbuyin"))
                 if table_id and seat and routed.room_id:
+                    if (
+                        self._leaving_all
+                        or table_id in self._leave_reasons
+                        or table_id in self._closed_reasons
+                    ):
+                        return
                     amount = buyin or self._buyin(self._pick_config() or RoomConfig(0, self.policy.bb, 0, buyin or 0))
                     self._enqueue(
                         "game.take_Seat",
@@ -568,6 +777,8 @@ class DeviceAutomation:
         room = int(routed.room_id or 0)
         if room <= 0:
             return
+        if self._leaving_all or table_id in self._leave_reasons or table_id in self._closed_reasons:
+            return
         if any(item.command in {"game.reserve_Seat", "game.take_Seat"} and item.table_id == table_id for item in self._queue):
             return
         taken = set()
@@ -598,7 +809,23 @@ class DeviceAutomation:
             from ..verified_v1.coin_ppp_bridge import extract_all_json_after
         except Exception:
             return
-        for props in extract_all_json_after(routed.decoded_body, b"GameRoomProperties"):
+        blobs: list[bytes] = []
+        if routed.decoded_body:
+            blobs.append(bytes(routed.decoded_body))
+        raw = routed.raw if isinstance(routed.raw, (bytes, bytearray)) else b""
+        if raw:
+            raw_b = bytes(raw)
+            if raw_b not in blobs:
+                blobs.append(raw_b)
+        for blob in blobs:
+            if b"GameRoomProperties" not in blob:
+                continue
+            for props in extract_all_json_after(blob, b"GameRoomProperties"):
+                if isinstance(props, dict):
+                    self._remember_config(props)
+        data = routed.data if isinstance(routed.data, dict) else {}
+        for key in ("roomProperties", "GameRoomProperties"):
+            props = data.get(key)
             if isinstance(props, dict):
                 self._remember_config(props)
 
@@ -622,7 +849,7 @@ class DeviceAutomation:
             size = int(props.get("tableSize") or props.get("maxSize") or 6)
         except (TypeError, ValueError):
             size = 6
-        self.configs[config_id] = RoomConfig(
+        cfg = RoomConfig(
             config_id=config_id,
             big_blind=float(bb),
             min_buyin=float(min_buyin),
@@ -631,6 +858,7 @@ class DeviceAutomation:
             table_size=size,
             name=name or str(props.get("roomName") or ""),
         )
+        self.configs[config_id] = cfg
 
     def _enqueue(self, command: str, room_id: int, raw: bytes, *, ws_kind: str, table_id: int = 0) -> None:
         self._counter += 1
@@ -691,24 +919,99 @@ class DeviceAutomation:
         table_id = int(table_id)
         if sitting_out:
             self._sitout.add(table_id)
+            self._sitout_since.setdefault(table_id, time.monotonic())
         else:
             self._sitout.discard(table_id)
+            self._sitout_since.pop(table_id, None)
 
-    def mark_stack(self, table_id: int, stack_bb: float, players: int, seated: bool) -> None:
+    def mark_stack(
+        self,
+        table_id: int,
+        stack_bb: Optional[float],
+        players: int,
+        seated: bool,
+        *,
+        stack_known: bool = True,
+    ) -> None:
         table_id = int(table_id)
-        self._stack_bb[table_id] = float(stack_bb)
+        if stack_known and stack_bb is not None:
+            value = float(stack_bb)
+            self._stack_bb[table_id] = value
+            if value > 0.05:
+                self._stack_positive.add(table_id)
         if players:
             self._players[table_id] = int(players)
+            self._peak_players[table_id] = max(int(self._peak_players.get(table_id) or 0), int(players))
         if seated:
             if table_id not in self._seated:
                 self._seated_at.setdefault(table_id, time.monotonic())
             self._seated.add(table_id)
             self._tabs.setdefault(table_id, 0.0)
+            self.persist_runtime()
         else:
             self._seated.discard(table_id)
+            self.persist_runtime()
 
     def mark_hand(self, table_id: int, live: bool) -> None:
-        self._hand_live[int(table_id)] = bool(live)
+        table_id = int(table_id)
+        was = bool(self._hand_live.get(table_id))
+        self._hand_live[table_id] = bool(live)
+        if was and not live:
+            self._hand_ended_at[table_id] = time.monotonic()
+            self._hands_done[table_id] = int(self._hands_done.get(table_id, 0)) + 1
+        elif live:
+            self._hand_ended_at.pop(table_id, None)
+
+    def ingest_ui_dump(self, xml: str, *, table_id: int = 0) -> dict[str, Any]:
+        stats = parse_ui_dump(xml)
+        self._ui_last = {
+            "closed": bool(stats.get("closed")),
+            "waitlist": bool(stats.get("waitlist")),
+            "loading": bool(stats.get("loading")),
+            "players": stats.get("players"),
+            "timer": stats.get("shortest_timer"),
+            "janitor": bool(stats.get("janitor")),
+            "tap": str(stats.get("tap") or ""),
+            "tap_age_ms": stats.get("tap_age_ms"),
+            "nodes": int(stats.get("nodes") or 0),
+            "ts": time.time(),
+            "rows": list(stats.get("rows") or []),
+            "live": bool(stats.get("live")),
+        }
+        tid = int(table_id or 0)
+        # Unscoped dumps are the focused Coin window, not last_opened.
+        # Mutating per-table maps from them closed/cleared the wrong tab.
+        if tid <= 0:
+            return stats
+        seated_here = tid in self._seated
+        live_here = bool(self._hand_live.get(tid))
+        peak = int(self._peak_players.get(tid) or 0)
+        hands = int(self._hands_done.get(tid) or 0)
+        live_roster = live_here or peak >= 2 or hands > 0
+        # Focused Coin window. Leftover TABLE CLOSED / waitlist / loading
+        # must not be applied to a table that already played or has a roster.
+        if stats.get("closed") or stats.get("waitlist"):
+            if seated_here and live_roster:
+                return stats
+            self._ui_closed.add(tid)
+            if stats.get("waitlist"):
+                self._ui_waitlist.add(tid)
+            self._ui_players[tid] = 0
+            self._ui_loading.discard(tid)
+            return stats
+        self._ui_waitlist.discard(tid)
+        self._ui_closed.discard(tid)
+        if stats.get("loading"):
+            self._ui_loading.add(tid)
+            return stats
+        self._ui_loading.discard(tid)
+        if stats.get("players") is not None:
+            counted = int(stats["players"])
+            if live_roster and counted < 2:
+                return stats
+            self._ui_players[tid] = counted
+            self._peak_players[tid] = max(peak, counted)
+        return stats
 
     def mark_bb(self, table_id: int, bb: float) -> None:
         value = _finite(bb)
@@ -732,39 +1035,3 @@ class DeviceAutomation:
             pass
 
 
-class AutomationStore:
-    def __init__(self, path: Optional[Path] = None) -> None:
-        self.path = path or _policy_path()
-        self._lock = threading.Lock()
-        self._rows: dict[str, AutoPolicy] = {}
-        self._load()
-
-    def _load(self) -> None:
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        devices = raw.get("devices") if isinstance(raw, dict) else None
-        if not isinstance(devices, dict):
-            return
-        for key, value in devices.items():
-            self._rows[str(key)] = AutoPolicy.from_mapping(value)
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema": 1,
-            "devices": {key: policy.public() for key, policy in self._rows.items()},
-        }
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(self.path)
-
-    def get(self, device_id: str) -> Optional[AutoPolicy]:
-        with self._lock:
-            return self._rows.get(str(device_id))
-
-    def put(self, device_id: str, policy: AutoPolicy) -> None:
-        with self._lock:
-            self._rows[str(device_id)] = policy
-            self._save()

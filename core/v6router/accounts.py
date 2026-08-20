@@ -114,6 +114,7 @@ class AccountPool:
         registry_path: Optional[str | Path] = None,
         profile: str = "PPPoker",
         auto_expand_unbounded: bool = False,
+        blocked_accounts: Iterable[str] = (),
     ):
         ordered = tuple(dict.fromkeys(str(x).strip() for x in accounts if str(x).strip()))
         if not ordered:
@@ -134,6 +135,11 @@ class AccountPool:
         self._invalid_retry_seconds = max(0.0, float(invalid_retry_seconds))
         self._registry_path = Path(registry_path).expanduser() if registry_path else None
         self._auto_expand_unbounded = bool(auto_expand_unbounded)
+        self._blocked = {
+            str(item).strip()
+            for item in blocked_accounts
+            if str(item).strip()
+        }
         if self._auto_expand_unbounded and not self._dynamic_base:
             raise ValueError("auto_expand_unbounded requires dynamic_base")
         raw_limit = str(os.getenv("POKEREYE_ACCOUNT_MAX_SUFFIX", "150")).strip()
@@ -145,6 +151,8 @@ class AccountPool:
             ) from exc
 
         for account_id in ordered:
+            if account_id in self._blocked:
+                continue
             suffix = self._suffix(account_id)
             self._records[account_id] = _AccountRecord(
                 account_id=account_id,
@@ -267,6 +275,8 @@ class AccountPool:
 
     def _register_candidate_locked(self, value: str | int, *, source: str) -> str:
         account_id = self._candidate_id(value)
+        if account_id in self._blocked:
+            return account_id
         if account_id not in self._records:
             self._approved_candidates.setdefault(account_id, str(source or "explicit"))
         return account_id
@@ -362,32 +372,58 @@ class AccountPool:
         return record
 
     def _next_unbounded_candidate_locked(self) -> Optional[_AccountRecord]:
-        """Create the next monotonic ``base-N`` candidate, capped at 150 by default.
+        """Reuse a hole between known suffixes, then grow by +1 if AUTOGROW is on."""
 
-        Selection policy is intentionally simple and operator-friendly:
-
-        1. ``acquire`` already leases the lowest validated AVAILABLE account first.
-        2. Only when no validated account is free do we grow the namespace.
-        3. Growth is strictly ``max(existing_suffixes) + 1``; rejected historical
-           gaps are never scanned backwards during live table startup.
-        4. Automatic growth stops at ``POKEREYE_ACCOUNT_MAX_SUFFIX``.
-
-        This means a registry containing 9,10,11,12,17,18,19 grows to 20, not 1.
-        """
-
-        if not self._auto_expand_unbounded or not self._dynamic_base:
+        if not self._dynamic_base:
             return None
-        occupied = {
+        now = self._clock()
+        busy = {
+            record.suffix
+            for record in self._records.values()
+            if record.suffix is not None
+            and record.state in {AccountState.LEASED, AccountState.PROBING}
+        }
+        known = {
             record.suffix
             for record in self._records.values()
             if record.suffix is not None
         }
-        occupied.update(
+        known.update(
             suffix
             for account_id in self._approved_candidates
             if (suffix := self._suffix(account_id)) is not None
         )
-        suffix = (max(occupied) if occupied else 0) + 1
+        if not known:
+            if not self._auto_expand_unbounded:
+                return None
+            known = {0}
+        low, high = min(known), max(known)
+        # Prefer an existing cooled-down ID. Inventing missing suffixes inside
+        # [low, high] is hole-fill; AUTOGROW=0 must stay on the explicit pool.
+        for suffix in range(low, high + 1):
+            if suffix in busy:
+                continue
+            account_id = f"{self._dynamic_base}-{suffix}"
+            if account_id in self._blocked:
+                continue
+            record = self._records.get(account_id)
+            if record is None:
+                if not self._auto_expand_unbounded:
+                    continue
+                record = _AccountRecord(
+                    account_id=account_id,
+                    state=AccountState.PROBING,
+                    validated=False,
+                    suffix=suffix,
+                    last_error="reuse hole between known Eye suffixes",
+                )
+                self._records[account_id] = record
+                return record
+            if record.state in {AccountState.INVALID, AccountState.QUARANTINED} and record.retry_at <= now:
+                return record
+        if not self._auto_expand_unbounded:
+            return None
+        suffix = high + 1
         if suffix > self._dynamic_suffix_limit:
             return None
         account_id = f"{self._dynamic_base}-{suffix}"
@@ -447,8 +483,8 @@ class AccountPool:
             # retry setting from looping on one gap while good candidates wait.
             record = (
                 self._approved_candidate_locked()
-                or self._next_unbounded_candidate_locked()
                 or self._retry_candidate_locked(self._clock())
+                or self._next_unbounded_candidate_locked()
             )
             if record is None:
                 raise AccountPoolExhausted(
@@ -637,6 +673,7 @@ class AccountPool:
             "profile": self._profile,
             "max_suffix": self._dynamic_suffix_limit if self._dynamic_base else None,
             "accounts": accounts,
+            "blocked_accounts": sorted(self._blocked),
             "approved_candidates": [
                 {"account_id": account_id, "source": self._approved_candidates[account_id]}
                 for account_id in sorted(self._approved_candidates, key=self._candidate_sort_key)
@@ -663,6 +700,10 @@ class AccountPool:
             )
         now = self._clock()
         wall = self._wall_clock()
+        for raw_block in payload.get("blocked_accounts") or ():
+            blocked_id = str(raw_block or "").strip()
+            if blocked_id:
+                self._blocked.add(blocked_id)
         for row in payload.get("accounts") or ():
             if not isinstance(row, dict):
                 continue
@@ -670,6 +711,9 @@ class AccountPool:
                 account_id = self._candidate_id(str(row.get("account_id") or ""))
                 state = AccountState(str(row.get("state") or ""))
             except (TypeError, ValueError):
+                continue
+            if account_id in self._blocked:
+                self._records.pop(account_id, None)
                 continue
             validated = bool(row.get("validated"))
             retry_at = now + max(0.0, float(row.get("retry_after") or 0.0) - wall)

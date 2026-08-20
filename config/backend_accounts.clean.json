@@ -36,7 +36,15 @@
       "last_error": ""
     },
     {
-      "account_id": "709393393-19",
+      "account_id": "709393393-20",
+      "state": "AVAILABLE",
+      "validated": true,
+      "attempts": 0,
+      "retry_after": 0,
+      "last_error": ""
+    },
+    {
+      "account_id": "709393393-21",
       "state": "AVAILABLE",
       "validated": true,
       "attempts": 0,
@@ -44,5 +52,6 @@
       "last_error": ""
     }
   ],
+  "blocked_accounts": ["709393393-19"],
   "approved_candidates": []
 }

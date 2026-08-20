@@ -16,6 +16,7 @@ if exist "%ROOT%\BUILD_ID" set /p BUILD_ID=<"%ROOT%\BUILD_ID"
 echo [PokerEye] Building APK: %BUILD_ID%
 echo [PokerEye] Root: %ROOT%
 echo [PokerEye] Trainer: 5.42.124.216:19037 ^(VPS, IPv4^)
+echo [PokerEye] Fallback: 84.32.231.194:19037 ^(NL bridge after 3s welcome timeout^)
 echo [PokerEye] Route: Android default / SocksDroid; ADB reverse: NOT USED
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\android\build_v2_native.ps1" -Repo "%ROOT%"

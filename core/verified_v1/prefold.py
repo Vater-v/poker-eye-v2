@@ -355,14 +355,17 @@ def default_nlh_prefold_config() -> PrefoldConfig:
                     f"{players}-{position}-{facing}", players, position, facing, cards, line,
                 ))
         for position in steal:
-            if players == 2 and position == "SB":
-                facings = ("RAISE", "RERAISE")
-            else:
-                facings = ("RAISE", "RERAISE")
+            facings = ("RAISE", "RERAISE")
             for facing in facings:
                 line += 1
                 rules.append(PrefoldRule(
                     f"{players}-{position}-{facing}", players, position, facing, cards, line,
+                ))
+        if players >= 3:
+            for facing in ("RAISE", "RERAISE"):
+                line += 1
+                rules.append(PrefoldRule(
+                    f"{players}-BB-{facing}", players, "BB", facing, cards, line,
                 ))
     return PrefoldConfig(enabled=True, mode=PrefoldMode.LIVE, rules=tuple(rules))
 

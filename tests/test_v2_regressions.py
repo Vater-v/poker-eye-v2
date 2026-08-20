@@ -25,7 +25,7 @@ from core.production_runtime import (
     send_json_frame,
     send_raw_frame,
 )
-from core.v6router.accounts import AccountPool, AccountState
+from core.v6router.accounts import AccountPool, AccountPoolExhausted, AccountState
 from core.v6router.router import (
     LiveTableSession,
     LiveTableSessionFactory,
@@ -33,6 +33,7 @@ from core.v6router.router import (
     RouterObservation,
     RouterSeed,
 )
+from tests.test_async_hotfix import coin_event
 
 
 class _Logger:
@@ -69,6 +70,18 @@ class V2RegressionTests(unittest.TestCase):
         # A released verified configured ID always beats generated candidates.
         pool.release("a")
         self.assertEqual(pool.acquire("e").account_id, "base-9")
+
+    def test_account_pool_reuses_gap_before_growing_high_water(self):
+        pool = AccountPool.dynamic_registered(
+            "base",
+            known_suffixes=(9, 11),
+            auto_expand_unbounded=True,
+            max_probe_concurrency=2,
+        )
+        self.assertEqual(pool.acquire("a").account_id, "base-9")
+        self.assertEqual(pool.acquire("b").account_id, "base-11")
+        probe = pool.acquire("c")
+        self.assertEqual(probe.account_id, "base-10")
 
     def test_account_registry_persists_generated_invalid_suffix(self):
         with tempfile.TemporaryDirectory() as td:
@@ -155,6 +168,38 @@ class V2RegressionTests(unittest.TestCase):
             "NLH: 0 · PLO4: 0 · PLO5: 0 · PLO6: 0",
         )
 
+    def test_native_send_ack_stops_action_retries(self):
+        from core.verified_v1.coin_bridge_live import LiveCoinBridge
+
+        bridge = LiveCoinBridge()
+        bridge.pending_action_ack = {
+            "action": "CHECK", "retries": 0, "token": "hand:1", "seat": 0,
+            "retry_at": 0.0, "hand_id": "h",
+        }
+        rows = []
+        bridge._diagnostic = lambda tag, msg, detail=None: rows.append((tag, detail or {}))
+        self.assertTrue(bridge.confirm_pending_action(source="native-send", action="CHECK"))
+        self.assertIsNone(bridge.pending_action_ack)
+        self.assertTrue(rows)
+        self.assertNotIn("hud", rows[-1][1])
+
+    def test_dead_red_backend_requests_close_after_120s(self):
+        session = object.__new__(LiveTableSession)
+        session._backend_red_since = time.monotonic() - 121
+        session._snapshot = lambda: SimpleNamespace(
+            backend_health="red",
+            backend_message="NO_TRAFFIC_FROM_ROOM",
+            phase="offline",
+        )
+        request = session.take_dead_table_request()
+        self.assertIsNotNone(request)
+        self.assertIn("120s", request["reason"])
+        session._backend_red_since = 0.0
+        session._snapshot = lambda: SimpleNamespace(
+            backend_health="green", backend_message="", phase="table",
+        )
+        self.assertIsNone(session.take_dead_table_request())
+
     def test_low_stack_guard_requests_exit_below_79bb_only(self):
         session = object.__new__(LiveTableSession)
         session.device_id = "dev"
@@ -190,6 +235,32 @@ class V2RegressionTests(unittest.TestCase):
                 event={"id": "y"}, payload=None, raw=b"", command="game.seatInfo",
                 direction="in", room_id=9, table_ids=(77,), websocket_id="01020304",
                 data={"seatResponseDataList": [{"userId": 42, "userChips": 158.0}]},
+            )
+        )
+        self.assertIsNone(session.take_low_stack_exit_request())
+
+    def test_low_stack_guard_ignores_zero_chips_until_real_stack(self):
+        session = object.__new__(LiveTableSession)
+        session.device_id = "dev"
+        session.table_id = 77
+        session.account_id = "base-9"
+        session._candidate_hand = "123"
+        session._stack_guard = {}
+        session._low_stack_exit_request = None
+        session._stack_guard_saw_positive = False
+        session._bridge = SimpleNamespace(
+            identity={"user_id": 42, "user_name": "hero"},
+            state={"user_id": 42, "user_name": "hero"},
+            active_money_profile=None,
+        )
+        session._sink = lambda _row: None
+        session._snapshot = lambda: SimpleNamespace(game_type="NLH")
+        session._arm_stack_guard("123", {"bbAmount": 0.02})
+        session._observe_stack_guard(
+            RoutedEvent(
+                event={"id": "zero"}, payload=None, raw=b"", command="game.seatInfo",
+                direction="in", room_id=9, table_ids=(77,), websocket_id="01020304",
+                data={"seatResponseDataList": [{"userId": 42, "userName": "hero", "userChips": 0}]},
             )
         )
         self.assertIsNone(session.take_low_stack_exit_request())
@@ -231,13 +302,20 @@ class V2RegressionTests(unittest.TestCase):
         build = (repo / "android" / "build_v2_native.ps1").read_text(encoding="utf-8-sig")
 
         self.assertIn('private static final String TRAINER_HOST = "5.42.124.216";', bridge)
+        self.assertIn('private static final String TRAINER_FALLBACK = "84.32.231.194";', bridge)
+        self.assertNotIn('compact.equals("menu")', bridge)
+        self.assertIn("nativeUiDump", bridge)
+        self.assertIn("kHeartbeatNs = 1ull * 1000ull * 1000ull * 1000ull", source)
+        self.assertIn("kMsgUiDump", source)
         self.assertNotIn("LAN_HOSTS", bridge)
         self.assertNotIn("nonVpnNetworkHandle", bridge)
         self.assertNotIn("android_setsocknetwork", source)
         self.assertNotIn("try_lan_upgrade", source)
         self.assertNotIn("10.0.2.2", build)
         self.assertNotIn("10.0.3.2", build)
-        self.assertIn("handshake_confirmed(fd, g_trainer_host, 5000)", source)
+        self.assertIn("try_trainer_uplink(g_trainer_host, kConnectMs, kHandshakeMs)", source)
+        self.assertIn("failover via bridge", source)
+        self.assertIn("kHandshakeMs = 3000", source)
         self.assertIn("socket(AF_INET", source)
 
 
@@ -619,8 +697,84 @@ class SCLoginDiagnosticTests(unittest.TestCase):
         self.assertIn("<redacted>", detail)
         self.assertNotIn("super-secret", detail)
 
+    def test_hook_game_mode_is_always_auto(self):
+        from core.verified_v1.eye_direct_proxy import hook_game_mode, hook_game_mode_frame, _work_mode
 
-class MidHandStandupTests(unittest.TestCase):
+        self.assertEqual(_work_mode({"workMode": 0}), "man")
+        self.assertEqual(hook_game_mode("man"), "auto")
+        self.assertEqual(hook_game_mode_frame({"workMode": 0})["data"], "auto")
+        self.assertEqual(hook_game_mode_frame({"workMode": "MAN"})["tag"], "game_mode")
+        self.assertEqual(hook_game_mode_frame({"workingMode": "vip"})["data"], "auto")
+
+    def test_hook_game_type_is_always_pppoker(self):
+        import json
+        from core.verified_v1.eye_backend_probe import decode_envelope, settings_envelope
+        from core.verified_v1.eye_direct_proxy import hook_game_type, hook_working_mode
+
+        self.assertEqual(hook_game_type(""), "PPPoker")
+        self.assertEqual(hook_game_type(None), "PPPoker")
+        self.assertEqual(hook_working_mode("MANUAL"), "AUTO")
+        message_type, body = decode_envelope(settings_envelope())
+        self.assertEqual(message_type, "CSSettings")
+        self.assertEqual(json.loads(body), {"game_type": "PPPoker", "working_mode": "AUTO"})
+
+    def test_local_pool_file_has_20_21_not_19(self):
+        import json
+        path = Path(__file__).resolve().parents[1] / "config" / "backend_accounts.local.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        ids = [str(row.get("account_id") or "") for row in (data.get("accounts") or [])]
+        self.assertNotIn("709393393-19", ids)
+        self.assertIn("709393393-20", ids)
+        self.assertIn("709393393-21", ids)
+        self.assertIn("709393393-19", data.get("blocked_accounts") or [])
+
+    def test_pool_acquires_20_21_and_skips_blocked_19_hole(self):
+        with tempfile.TemporaryDirectory() as td:
+            registry = Path(td) / "accounts.json"
+            pool = AccountPool(
+                ["709393393-18", "709393393-20", "709393393-21"],
+                dynamic_base="709393393",
+                registry_path=registry,
+                profile="PPPoker",
+                auto_expand_unbounded=True,
+                blocked_accounts=["709393393-19"],
+            )
+            self.assertEqual(pool.acquire("a").account_id, "709393393-18")
+            self.assertEqual(pool.acquire("b").account_id, "709393393-20")
+            self.assertEqual(pool.acquire("c").account_id, "709393393-21")
+            fourth = pool.acquire("d")
+            self.assertNotEqual(fourth.account_id, "709393393-19")
+            self.assertIsNone(pool.state_for("709393393-19"))
+
+    def test_autogrow_off_uses_explicit_pool_and_does_not_fill_holes(self):
+        with tempfile.TemporaryDirectory() as td:
+            registry = Path(td) / "accounts.json"
+            pool = AccountPool(
+                [
+                    "709393393-4",
+                    "709393393-13",
+                    "709393393-14",
+                    "709393393-18",
+                    "709393393-20",
+                    "709393393-21",
+                ],
+                dynamic_base="709393393",
+                registry_path=registry,
+                profile="PPPoker",
+                auto_expand_unbounded=False,
+                blocked_accounts=["709393393-19"],
+            )
+            for owner in "abcdef":
+                lease = pool.acquire(owner)
+                self.assertNotEqual(lease.account_id, "709393393-19")
+                self.assertNotEqual(lease.account_id, "709393393-5")
+            with self.assertRaises(AccountPoolExhausted):
+                pool.acquire("g")
+            self.assertIsNone(pool.state_for("709393393-5"))
+            self.assertIsNone(pool.state_for("709393393-19"))
+
+
+class MidHandStandupTests(unittest.IsolatedAsyncioTestCase):
     def test_standup_during_hand_does_not_abort_cc_or_tell_eye(self):
         from core.verified_v1.coin_bridge_live import LiveCoinBridge
 
@@ -639,6 +793,53 @@ class MidHandStandupTests(unittest.TestCase):
         self.assertTrue(bridge._lifecycle_aborts_cc("game.leave_Seat"))
         self.assertTrue(bridge._should_announce_standup_to_eye())
 
+    async def test_handle_event_leave_seat_mid_hand_keeps_pending_cc(self):
+        from core.verified_v1.coin_bridge_live import LiveCoinBridge
+
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.state["hand_id"] = "112"
+        bridge.current_hand = object()
+        bridge.pending_action_ack = {
+            "action": "CHECK",
+            "token": "hand:112",
+            "retries": 0,
+            "hand_id": "112",
+            "retry_at": time.monotonic() + 2,
+        }
+        decision, _ = await bridge.handle_event(
+            coin_event("game.leave_Seat", 59059, mid="ls-mid", direction="out")
+        )
+        self.assertIsNotNone(bridge.pending_action_ack)
+        self.assertEqual(bridge.pending_action_ack["token"], "hand:112")
+        self.assertNotEqual(decision.get("cancel_schedule"), "hand:112")
+        task = bridge.protocol_task
+        if task is not None:
+            task.cancel()
+
+    async def test_handle_event_quit_table_cancels_pending_cc(self):
+        from core.verified_v1.coin_bridge_live import LiveCoinBridge
+
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.state["hand_id"] = "112"
+        bridge.current_hand = object()
+        bridge.pending_action_ack = {
+            "action": "CHECK",
+            "token": "hand:112",
+            "retries": 0,
+            "hand_id": "112",
+            "retry_at": time.monotonic() + 2,
+        }
+        decision, _ = await bridge.handle_event(
+            coin_event("game.quit_table", 59059, mid="qt", direction="out")
+        )
+        self.assertIsNone(bridge.pending_action_ack)
+        self.assertEqual(decision.get("cancel_schedule"), "hand:112")
+        task = bridge.protocol_task
+        if task is not None:
+            task.cancel()
+
     def test_first_sit_packet_claims_the_table_room(self):
         from core.verified_v1.coin_bridge_live import LiveCoinBridge
 
@@ -648,6 +849,44 @@ class MidHandStandupTests(unittest.TestCase):
         self.assertEqual(bridge.active_hook_room, 57953)
         self.assertTrue(bridge._is_active_room(57953))
         self.assertFalse(bridge._is_active_room(1))
+
+    def test_hero_sit_defers_zero_uid_and_zero_chips(self):
+        from core.verified_v1.coin_bridge_live import LiveCoinBridge
+
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = False
+        bridge.hero_departing = False
+        bridge.context_active = True
+        bridge.context_hand = SimpleNamespace(hero_id=0, hero_seat=0, hero_name="", table_id=1)
+        bridge.state.update(user_id=0, user_name="")
+        bridge.identity.update(user_id=0, user_name="")
+        sent = []
+
+        async def _ready(*_a, **_k):
+            return None
+
+        async def _send(*_a, **_k):
+            sent.append(True)
+            return b""
+
+        bridge.ensure_observer_context = _ready  # type: ignore[method-assign]
+        bridge._build_context_hand = lambda: bridge.context_hand  # type: ignore[method-assign]
+        bridge._activate_money_profile = lambda *_a, **_k: None  # type: ignore[method-assign]
+        bridge.eye_send_cmd = _send  # type: ignore[method-assign]
+
+        asyncio.run(bridge._send_hero_sit({"seatId": 3, "userId": 0, "userChips": 0}))
+        self.assertFalse(bridge.hero_sitting)
+        self.assertEqual(bridge.state.get("user_id"), 0)
+        self.assertEqual(sent, [])
+
+        builder = SimpleNamespace(_sitdown_brc=lambda *_a, **_k: b"")
+        with patch("core.verified_v1.coin_bridge_live.core.PPPBuilder", return_value=builder):
+            asyncio.run(bridge._send_hero_sit({
+                "seatId": 3, "userId": 42, "buyinAmount": 2.0, "userName": "Hero",
+            }))
+        self.assertTrue(bridge.hero_sitting)
+        self.assertEqual(bridge.state.get("user_id"), 42)
+        self.assertTrue(sent)
 
     def test_immediate_sit_ack_without_uid_is_still_hero(self):
         from core.verified_v1.coin_bridge_live import LiveCoinBridge
@@ -659,6 +898,7 @@ class MidHandStandupTests(unittest.TestCase):
         self.assertTrue(bridge._is_hero_row({"userId": 42, "seatId": 3}))
         bridge.active_hook_room = 100
         self.assertTrue(bridge._is_hero_row({"seatId": 2, "buyinAmount": 2}, room=100))
+        self.assertFalse(bridge._is_hero_row({"seatId": 2, "playerCards": ["Ah", "Kd"]}, room=100))
         self.assertFalse(bridge._is_hero_row({"userName": "Villain", "userId": 9, "seatId": 1}))
         self.assertTrue(bridge._is_hero_turn({"whoseTurn": "HeroNick"}))
 

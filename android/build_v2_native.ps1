@@ -49,6 +49,7 @@ Write-Host "[+] BUILD_ID: $buildId"
 
 $trainerEndpoint = "5.42.124.216:19037"
 Write-Host "[+] Trainer endpoint: $trainerEndpoint"
+Write-Host "[+] Fallback bridge: 84.32.231.194:19037 after 3s handshake timeout"
 Write-Host "[+] Routing: plain IPv4 via Android default route / SocksDroid"
 Write-Host "[+] ADB reverse: disabled/not used"
 

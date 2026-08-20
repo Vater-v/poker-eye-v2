@@ -8,6 +8,7 @@ import io
 import json
 import mimetypes
 import os
+import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,6 +22,8 @@ CONTROL_PORT = 19101
 HOST = "127.0.0.1"
 PORT = 19100
 WEB_ID = "console-nuxt-v6"
+_LAST_STATE: dict = {}
+_LATEST_RUN: tuple[float, Path | None] = (0.0, None)
 
 
 def token_value() -> str:
@@ -31,9 +34,30 @@ def token_value() -> str:
 
 
 def latest_run() -> Path | None:
+    global _LATEST_RUN
+    now = time.monotonic()
+    stamp, cached = _LATEST_RUN
+    if cached is not None and now - stamp < 2.0:
+        return cached
     logs = ROOT / "logs"
-    rows = [p for p in logs.glob("run_*") if p.is_dir()]
-    return max(rows, key=lambda p: p.stat().st_mtime, default=None)
+    latest = None
+    latest_mtime = -1.0
+    try:
+        with os.scandir(logs) as it:
+            for ent in it:
+                if not ent.name.startswith("run_") or not ent.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    mtime = ent.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest = Path(ent.path)
+    except OSError:
+        latest = cached
+    _LATEST_RUN = (now, latest)
+    return latest
 
 
 def tail_jsonl(path: Path | None, limit: int = 300) -> list[dict]:
@@ -165,25 +189,35 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if path in ("/api/state", "/pokereye/api/state"):
-            status, snapshot = control("GET", "/snapshot")
-            if status != 200:
-                self._send(
-                    503,
-                    {"ok": False, "error": snapshot.get("error", "trainer control unavailable")},
-                    cookie=via_query,
-                )
-                return
-            snapshot["devices"] = [
-                d for d in snapshot.get("devices", [])
-                if "selftest" not in str(d.get("device_id", "")).lower()
-            ]
+            status, snapshot = control("GET", "/snapshot", timeout=8.0)
+            if status != 200 or not isinstance(snapshot, dict):
+                snapshot = dict(_LAST_STATE.get("snapshot") or {})
+                if not snapshot:
+                    self._send(
+                        503,
+                        {"ok": False, "error": "trainer control unavailable"},
+                        cookie=via_query,
+                    )
+                    return
+                snapshot["stale"] = True
+            else:
+                snapshot["devices"] = [
+                    d for d in snapshot.get("devices", [])
+                    if "selftest" not in str(d.get("device_id", "")).lower()
+                ]
             run = latest_run()
-            events = tail_jsonl((run / "events.jsonl") if run else None, 600)
-            self._send(
-                200,
-                {"ok": True, "snapshot": snapshot, "events": events, "run": run.name if run else None},
-                cookie=via_query,
-            )
+            try:
+                events = tail_jsonl((run / "events.jsonl") if run else None, 400)
+            except Exception:
+                events = list(_LAST_STATE.get("events") or [])
+            payload = {
+                "ok": True,
+                "snapshot": snapshot,
+                "events": events,
+                "run": run.name if run else None,
+            }
+            _LAST_STATE.update(payload)
+            self._send(200, payload, cookie=via_query)
             return
         if path in ("/api/logs", "/pokereye/api/logs"):
             run = latest_run()

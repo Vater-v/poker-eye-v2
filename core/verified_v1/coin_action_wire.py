@@ -150,9 +150,34 @@ class ResolvedAction:
     bet_amount:float
 
 
+_PLAYABLE_CC=frozenset({'FOLD','FAST_FOLD','CHECK','CALL','RAISE','BET','ALLIN','ALL-IN','ALL_IN'})
+
+
+def normalize_eye_cc_type(cc:Dict[str,Any]) -> str:
+    """Prefer a playable type. Eye MANUAL slots send type=INFO with the action in message."""
+    if not isinstance(cc, dict):
+        return ''
+    typ=str(cc.get('type') or '').strip().upper()
+    if typ in _PLAYABLE_CC:
+        return typ
+    for key in ('action','message'):
+        raw=str(cc.get(key) or '').strip().upper().replace('_',' ').replace('-',' ')
+        if not raw:
+            continue
+        word=raw.split()[0] if raw.split() else ''
+        compact=raw.replace(' ','')
+        if compact in {'ALLIN','ALL-IN'} or word=='ALLIN':
+            return 'ALLIN'
+        if word=='FAST':
+            return 'FOLD'
+        if word in _PLAYABLE_CC:
+            return word
+    return typ
+
+
 def resolve_eye_cc_action(cc:Dict[str,Any], *, user_turn_options:Optional[dict]=None,
                           current_street_bet:float=0.0, chip_scale:int=100)->ResolvedAction:
-    typ=str(cc.get('type') or cc.get('action') or cc.get('message') or '').strip().upper()
+    typ=normalize_eye_cc_type(cc)
     opts=user_turn_options or {}
     if typ in ('FOLD','FAST_FOLD'): return ResolvedAction('FOLD',7,0.0)
     if typ=='CHECK': return ResolvedAction('CHECK',3,0.0)
