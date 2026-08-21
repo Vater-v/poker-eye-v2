@@ -19,7 +19,7 @@ Coin RealWebSocket → libhmuriy.so → TCP :19037 → v6 router → Coin/PPP/Po
 
 Manual sit. Play is protocol CC. No lobby janitor, no auto-join, no auto-leave.
 
-Trainer live: `V7.4.48-HMN1-VPS`. Phone APK: `CoinPoker-PokerEye-V7.4.46-HMN1-VPS.apk` (room-force is trainer-side; no APK bump for 7.4.47/48).
+Trainer live: `V7.4.50-HMN1-VPS`. Phone APK: `CoinPoker-PokerEye-V7.4.50-HMN1-VPS.apk` (match trainer BUILD_ID; mismatch no longer paints a red HUD).
 
 1. Install that APK. Log into Coin on the phone.
 2. Sit the tables yourself.

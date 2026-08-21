@@ -88,6 +88,15 @@ except OSError:
     BUILD_ID = "dev-unversioned"
 
 
+def apk_mismatch_device_hud(apk_build_id: str, trainer_build_id: str) -> Optional[dict[str, Any]]:
+    """Never paint a sticky red APK banner for a BUILD_ID label skew.
+
+    Trainer-only deploys share HMN1 with the previous APK. A red ``LEAVE`` HUD
+    after hello was a false alarm, not a protocol break.
+    """
+    return None
+
+
 def _short(value: Any, limit: int = 220) -> str:
     return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())[:limit]
 
@@ -2260,22 +2269,12 @@ class NativeIngressServer:
             if apk_mismatch and self.operator is not None:
                 self.operator.technical(
                     "transport.build_mismatch",
-                    severity="WARN",
                     device_id=device_id,
                     apk_build_id=apk_build_id,
                     trainer_build_id=BUILD_ID,
                     allowed=True,
+                    hud=False,
                 )
-                line = getattr(self.operator, "_line", None)
-                if callable(line):
-                    line(
-                        f"{device_label or device_id}: APK {apk_build_id} ≠ тренер {BUILD_ID} — авто-CC нестабилен, обновите APK",
-                        "operator.apk_mismatch",
-                        severity="WARN",
-                        device_id=device_id,
-                        apk_build_id=apk_build_id,
-                        trainer_build_id=BUILD_ID,
-                    )
 
             if first_for_device:
                 try:
@@ -2295,17 +2294,9 @@ class NativeIngressServer:
                     peer=f"{addr[0]}:{addr[1]}",
                     channels=self.channel_count(device_id),
                 )
-            if apk_mismatch:
-                self.send_json(device_id, {
-                    "type": "hud",
-                    "text": f"APK {apk_build_id} ≠ {BUILD_ID} — обновите приложение",
-                    "sticky": True,
-                    "tone": "red",
-                    "action": "LEAVE",
-                    "delay_ms": 0,
-                    "source": "apk",
-                    "from_cc": False,
-                })
+            mismatch_hud = apk_mismatch_device_hud(apk_build_id, BUILD_ID)
+            if mismatch_hud:
+                self.send_json(device_id, mismatch_hud)
 
             route_thread = threading.Thread(
                 target=self._route_worker,

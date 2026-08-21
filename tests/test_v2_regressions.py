@@ -20,6 +20,7 @@ from core.production_runtime import (
     NativeIngressServer,
     OperatorConsole,
     TrafficMeter,
+    apk_mismatch_device_hud,
     direct_proof,
     recv_json_frame,
     send_json_frame,
@@ -459,6 +460,15 @@ class V2RegressionTests(unittest.TestCase):
         source = (Path(__file__).parents[1] / "core" / "production_runtime.py").read_text(encoding="utf-8")
         self.assertIn("SO_EXCLUSIVEADDRUSE", source)
         self.assertIn("close the old PokerEye process", source)
+
+    def test_apk_label_skew_does_not_paint_leave_hud(self):
+        self.assertIsNone(apk_mismatch_device_hud("V7.4.48-HMN1-VPS", BUILD_ID))
+        self.assertIsNone(apk_mismatch_device_hud(BUILD_ID, BUILD_ID))
+        self.assertIsNone(apk_mismatch_device_hud("legacy-unversioned", BUILD_ID))
+        source = (Path(__file__).parents[1] / "core" / "production_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("mismatch_hud = apk_mismatch_device_hud", source)
+        self.assertNotIn("авто-CC нестабилен", source)
+        self.assertNotIn('action": "LEAVE"', source)
 
 class V2UnboundedFactoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_unbounded_production_probe_ignores_finite_per_table_budget(self):
