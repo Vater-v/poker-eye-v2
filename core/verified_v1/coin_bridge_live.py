@@ -50,6 +50,67 @@ def format_action_hint(action: Any, amount: Any = None, delay_ms: Any = 0) -> st
     return f"{name} {amt_s} {delay}"
 
 
+def hud_clear() -> dict[str, Any]:
+    """Drop the on-device hint bar after Coin ACK (not native send)."""
+    return {
+        "text": "",
+        "clear": True,
+        "sticky": False,
+        "leave": False,
+        "tone": "",
+        "from_cc": False,
+        "source": "ack",
+    }
+
+
+def device_hud_payload(hud: dict[str, Any], *, fallback_text: str = "") -> Optional[dict[str, Any]]:
+    """Wire HUD JSON for the APK. Empty/clear must not reuse the diagnostic reason."""
+    if not isinstance(hud, dict):
+        return None
+    if hud.get("clear"):
+        return {
+            "type": "hud",
+            "text": "",
+            "clear": True,
+            "sticky": False,
+            "leave": False,
+        }
+    text = str(hud.get("text") or fallback_text or "").strip()
+    if not text:
+        return None
+    payload = {
+        "type": "hud",
+        "text": text[:160],
+        "leave": bool(hud.get("leave")),
+        "sticky": bool(hud.get("sticky")),
+    }
+    tone = str(hud.get("tone") or "").strip().lower()
+    if tone in {"red", "green", "yellow", "amber"}:
+        payload["tone"] = "yellow" if tone == "amber" else tone
+    action = str(hud.get("action") or "").strip()
+    if action:
+        payload["action"] = action[:16]
+    if hud.get("amount") is not None:
+        payload["amount"] = hud.get("amount")
+    try:
+        payload["delay_ms"] = int(hud.get("delay_ms") or 0)
+    except (TypeError, ValueError):
+        payload["delay_ms"] = 0
+    if hud.get("source"):
+        payload["source"] = str(hud.get("source") or "")[:16]
+    if "from_cc" in hud:
+        payload["from_cc"] = bool(hud.get("from_cc"))
+    if hud.get("join") is not None:
+        payload["join"] = bool(hud.get("join"))
+    if hud.get("bb") is not None:
+        payload["bb"] = hud.get("bb")
+    if hud.get("tapx") is not None:
+        payload["tapx"] = int(hud.get("tapx") or 0)
+        payload["tapy"] = int(hud.get("tapy") or 0)
+        payload["why"] = str(hud.get("why") or "")
+    return payload
+
+
 def hud_action(
     action: Any,
     amount: Any = None,
@@ -1669,13 +1730,14 @@ class LiveCoinBridge:
         if not ack:
             return False
         name=str(action or ack.get("action") or "")
-        # Coin/native ACK is post-factum. The HUD is the pre-send hint only.
+        # Native send is "отправлено". Coin ACK is "выполнено" and drops the hint bar.
         self._diagnostic("action_confirmed",f"action confirmed via {source}",{
             "action":name,
             "amount":ack.get("display_amount"),
             "attempt":1+int(ack.get("retries") or 0),
             "token":str(ack.get("token") or ""),
             "source":str(source or ""),
+            "hud":hud_clear(),
         })
         self.pending_action_ack=None
         return True
@@ -1991,11 +2053,10 @@ class LiveCoinBridge:
                 return
             self._diagnostic(
                 "hero_turn_resumed",
-                "duplicate Coin turn after silent reconnect; action re-armed",
+                "duplicate Coin turn after silent reconnect; re-hint Eye then failsafe",
                 {"timer": str(event.get("_hmuriy_turn_refresh") or data.get("timerName") or "")},
             )
-            if await self.ensure_action_if_hero_silent(reason="RECONNECT_SILENCE"):
-                return
+            # Do not instant-failsafe here: AK/trips would CHECK/FOLD instead of CC.
         mode = "incremental" if (self.current_hand and self.current_hand.hand_id in self.cold_hands) else "cold"
         if event.get("_hmuriy_options_from_advance"):
             options = data.get("userTurnOptions") or {}
@@ -3090,11 +3151,8 @@ class LiveCoinBridge:
                 if time.monotonic()<float(ack.get("due") or 0):cancel_reason="turn-advanced-before-due"
                 else:
                     log("ACTION_ACK",f"turn advanced after {ack.get('action')} hand={ack.get('hand_id')}")
-                    self._diagnostic("action_confirmed","Coin turn advanced after action",{
-                        "action":str(ack.get("action") or ""),"amount":ack.get("display_amount"),
-                        "attempt":1+int(ack.get("retries") or 0),"token":str(ack.get("token") or ""),
-                    })
-                    self.pending_action_ack=None; ack=None
+                    self.confirm_pending_action(source="turn-advanced",action=str(ack.get("action") or ""))
+                    ack=None
         if ack and cancel_reason:
             token=str(ack.get("token") or "")
             if token:

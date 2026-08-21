@@ -41,6 +41,7 @@ from .v6router.router import (
     RouterObservation,
     _decode_event,
 )
+from .verified_v1.coin_bridge_live import device_hud_payload
 
 PROTOCOL_VERSION = 2
 TRANSPORT_MAX_FRAME = 20_000_000
@@ -2684,38 +2685,8 @@ class ProductionTrainer:
             )
         hud = (observation.detail or {}).get("hud") if isinstance(observation.detail, dict) else None
         if isinstance(hud, dict) and observation.device_id:
-            text = str(hud.get("text") or observation.reason or "").strip()
-            if text:
-                payload = {
-                    "type": "hud",
-                    "text": text[:160],
-                    "leave": bool(hud.get("leave")),
-                    "sticky": bool(hud.get("sticky")),
-                }
-                tone = str(hud.get("tone") or "").strip().lower()
-                if tone in {"red", "green", "yellow", "amber"}:
-                    payload["tone"] = "yellow" if tone == "amber" else tone
-                action = str(hud.get("action") or "").strip()
-                if action:
-                    payload["action"] = action[:16]
-                if hud.get("amount") is not None:
-                    payload["amount"] = hud.get("amount")
-                try:
-                    payload["delay_ms"] = int(hud.get("delay_ms") or 0)
-                except (TypeError, ValueError):
-                    payload["delay_ms"] = 0
-                if hud.get("source"):
-                    payload["source"] = str(hud.get("source") or "")[:16]
-                if "from_cc" in hud:
-                    payload["from_cc"] = bool(hud.get("from_cc"))
-                if hud.get("join") is not None:
-                    payload["join"] = bool(hud.get("join"))
-                if hud.get("bb") is not None:
-                    payload["bb"] = hud.get("bb")
-                if hud.get("tapx") is not None:
-                    payload["tapx"] = int(hud.get("tapx") or 0)
-                    payload["tapy"] = int(hud.get("tapy") or 0)
-                    payload["why"] = str(hud.get("why") or "")
+            payload = device_hud_payload(hud, fallback_text=str(observation.reason or ""))
+            if payload:
                 self.server.send_json(str(observation.device_id), payload)
         self.operator.observation(observation)
 

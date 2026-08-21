@@ -21,8 +21,8 @@ from core.verified_v1 import coin_ppp_bridge as ppp
 from core.verified_v1.bombpot_support import BombpotTracker, detect_double_board
 from core.verified_v1.coin_autoplay import CoinAutoplayCoordinator
 from core.verified_v1.coin_bridge_live import (
-    LiveCoinBridge, compute_net_profits, format_action_hint, hud_action,
-    normalized_coin_seat_action,
+    LiveCoinBridge, compute_net_profits, device_hud_payload, format_action_hint,
+    hud_action, hud_clear, normalized_coin_seat_action,
 )
 
 
@@ -343,11 +343,17 @@ class ReconnectSilenceTests(unittest.IsolatedAsyncioTestCase):
         replay = {"direction": "in", "ws_id": "aabb", "url": "wss://coin"}
         bridge.autoplay.observe(replay, body, b"", bridge.state)
         self.assertTrue(replay.get("_hmuriy_duplicate_turn"))
+        hinted = []
+
+        async def fake_hint(event, payload, raw, data):
+            hinted.append("incremental")
+
+        bridge.current_hand = SimpleNamespace(hand_id="h-ak")
+        bridge.cold_hands.add("h-ak")
+        bridge.start_incremental_hint = fake_hint  # type: ignore[method-assign]
         await bridge._on_hero_user_turn(replay, body, b"", turn, ROOM)
-        pending = bridge.autoplay.pending
-        self.assertIsNotNone(pending)
-        self.assertIn(pending["action"], {"CHECK", "FOLD"})
-        self.assertTrue(pending.get("fallback") or pending.get("prefold"))
+        self.assertEqual(hinted, ["incremental"])
+        self.assertIsNone(bridge.autoplay.pending)
 
     async def test_ensure_action_after_reconnect_wipe_sets_failsafe(self):
         bridge = LiveCoinBridge()
@@ -599,6 +605,12 @@ class ActionHintFormatTests(unittest.TestCase):
         self.assertEqual(payload["text"], "CHECK 0.0 800")
         self.assertTrue(payload["sticky"])
         self.assertFalse(payload["leave"])
+        clear = hud_clear()
+        self.assertTrue(clear.get("clear"))
+        frame = device_hud_payload(clear, fallback_text="action confirmed via coin-seat")
+        self.assertEqual(frame.get("clear"), True)
+        self.assertEqual(frame.get("text"), "")
+        self.assertNotIn("confirmed", str(frame.get("text") or ""))
 
 
 class CoinTabSnapshotTests(unittest.IsolatedAsyncioTestCase):

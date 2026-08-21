@@ -179,10 +179,10 @@ class V2RegressionTests(unittest.TestCase):
         }
         rows = []
         bridge._diagnostic = lambda tag, msg, detail=None: rows.append((tag, detail or {}))
-        self.assertTrue(bridge.confirm_pending_action(source="native-send", action="CHECK"))
+        self.assertTrue(bridge.confirm_pending_action(source="coin-seat", action="CHECK"))
         self.assertIsNone(bridge.pending_action_ack)
         self.assertTrue(rows)
-        self.assertNotIn("hud", rows[-1][1])
+        self.assertTrue(rows[-1][1].get("hud", {}).get("clear"))
 
     def test_dead_red_backend_requests_close_after_120s(self):
         session = object.__new__(LiveTableSession)

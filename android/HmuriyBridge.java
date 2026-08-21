@@ -438,6 +438,8 @@ public final class HmuriyBridge {
             }
             bannerTone = tone == null ? "" : tone.trim().toLowerCase();
             bannerSticky = sticky;
+            // Sticky only lengthens TTL. A sticky flag used to keep the hint
+            // bar forever after the action already executed.
             long life = sticky ? 8000L : 2500L;
             bannerUntil = SystemClock.uptimeMillis() + life;
             postInvalidate();
@@ -460,7 +462,7 @@ public final class HmuriyBridge {
         @Override
         protected void onDraw(Canvas canvas) {
             long now = SystemClock.uptimeMillis();
-            if (banner.length() > 0 && (bannerSticky || now < bannerUntil)) {
+            if (banner.length() > 0 && now < bannerUntil) {
                 int w = getWidth();
                 float pad = 10f;
                 float th = bannerFg.getTextSize();
@@ -1254,6 +1256,10 @@ public final class HmuriyBridge {
                 LEAVE_STICKY = false;
             }
             // Manual: never execute trainer lobby taps.
+            if (obj.optBoolean("clear", false) || (text.length() == 0 && action.length() == 0)) {
+                showBanner("", false, "", false);
+                return;
+            }
             if (text.length() > 0) {
                 String tone = obj.optString("tone", "");
                 boolean fromCc = obj.optBoolean("from_cc", !"prefold".equalsIgnoreCase(obj.optString("source", ""))
