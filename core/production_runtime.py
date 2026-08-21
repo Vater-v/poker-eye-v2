@@ -1591,23 +1591,53 @@ class RouterService:
         future = asyncio.run_coroutine_threadsafe(self._control_snapshot(), self.loop)
         try:
             snap = dict(future.result(timeout=6.0))
+            if not (snap.get("devices") or []) and (self._routers or self._connected):
+                snap = self._snapshot_on_timeout(
+                    RuntimeError("empty snapshot while native sessions exist")
+                )
             self._last_snapshot = snap
             return snap
         except Exception as exc:
             future.cancel()
-            if self._last_snapshot:
-                stale = dict(self._last_snapshot)
-                stale["stale"] = True
-                stale["snapshot_error"] = f"{type(exc).__name__}: {_short(exc)}"
-                return stale
-            return {
-                "ok": True,
-                "build": BUILD_ID,
-                "devices": [],
-                "accounts": [],
-                "connected_devices": 0,
-                "snapshot_error": f"{type(exc).__name__}: {_short(exc)}",
-            }
+            return self._snapshot_on_timeout(exc)
+
+    def _skeleton_snapshot(self, error: str) -> dict[str, Any]:
+        now_mono = time.monotonic()
+        devices = []
+        seen: set[str] = set()
+        for device_id in list(self._routers) + sorted(self._connected):
+            if device_id in seen:
+                continue
+            seen.add(device_id)
+            devices.append({
+                "device_id": device_id,
+                "connected": self.device_online(device_id, now=now_mono),
+                "tables": [],
+                "device_label": self._device_labels.get(device_id, ""),
+                "hero_name": "",
+                "display_name": self._device_labels.get(device_id, "") or device_id,
+            })
+        return {
+            "ok": True,
+            "build": BUILD_ID,
+            "devices": devices,
+            "accounts": [],
+            "connected_devices": sum(1 for row in devices if row.get("connected")),
+            "snapshot_error": error,
+            "stale": True,
+        }
+
+    def _snapshot_on_timeout(self, exc: BaseException) -> dict[str, Any]:
+        error = f"{type(exc).__name__}: {_short(exc)}"
+        last = self._last_snapshot if isinstance(getattr(self, "_last_snapshot", None), dict) else {}
+        if last.get("devices"):
+            stale = dict(last)
+            stale["stale"] = True
+            stale["snapshot_error"] = error
+            return stale
+        if self._routers or self._connected:
+            return self._skeleton_snapshot(error)
+        return self._skeleton_snapshot(error)
 
     async def _control_close_table(self, device_id: str, table_id: int) -> bool:
         table_id = int(table_id or 0)

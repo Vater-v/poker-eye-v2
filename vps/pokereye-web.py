@@ -33,6 +33,32 @@ def token_value() -> str:
         return ""
 
 
+def merge_live_state(
+    snapshot: dict,
+    run: Path | None,
+    last: dict | None,
+    events: list | None = None,
+) -> dict:
+    """Keep the last live fleet when a timeout returns an empty 0/0 snapshot."""
+    last = last if isinstance(last, dict) else {}
+    last_snap = dict(last.get("snapshot") or {})
+    devices = list(snapshot.get("devices") or [])
+    last_devices = list(last_snap.get("devices") or [])
+    if not devices and last_devices:
+        snapshot = dict(last_snap)
+        snapshot["stale"] = True
+        snapshot["snapshot_error"] = str(
+            snapshot.get("snapshot_error") or "empty_live_snapshot"
+        )
+    run_name = run.name if run is not None else last.get("run")
+    return {
+        "ok": True,
+        "snapshot": snapshot,
+        "events": list(events or last.get("events") or []),
+        "run": run_name,
+    }
+
+
 def latest_run() -> Path | None:
     global _LATEST_RUN
     now = time.monotonic()
@@ -210,12 +236,7 @@ class Handler(BaseHTTPRequestHandler):
                 events = tail_jsonl((run / "events.jsonl") if run else None, 400)
             except Exception:
                 events = list(_LAST_STATE.get("events") or [])
-            payload = {
-                "ok": True,
-                "snapshot": snapshot,
-                "events": events,
-                "run": run.name if run else None,
-            }
+            payload = merge_live_state(snapshot, run, _LAST_STATE, events)
             _LAST_STATE.update(payload)
             self._send(200, payload, cookie=via_query)
             return

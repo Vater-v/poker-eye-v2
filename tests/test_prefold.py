@@ -192,6 +192,73 @@ class PrefoldChartTests(unittest.TestCase):
         self.assertEqual(bridge.autoplay.pending["action"], "FOLD")
         self.assertTrue(bridge.autoplay.pending.get("prefold"))
 
+    def test_live_schedule_folds_64o_co_vs_raise_not_aa(self):
+        import asyncio
+
+        class Room:
+            props = {"miniGameTypeId": 1, "_gameTypeLabel": "NLH"}
+
+        class Trash:
+            hero_seat = 6
+            ppp_hero_seat = 5
+            roster = [{"seatId": i, "isPlaying": True} for i in range(1, 7)]
+            pre = {"dealerSeatId": 1}
+            cards = ({"value": "SIX", "suit": "SPADES"}, {"value": "FOUR", "suit": "HEARTS"})
+            room = Room()
+            table_id = 1154179
+            hero_name = "Hero"
+            hand_id = "h64"
+
+        class Aces:
+            hero_seat = 6
+            ppp_hero_seat = 5
+            roster = [{"seatId": i, "isPlaying": True} for i in range(1, 7)]
+            pre = {"dealerSeatId": 1}
+            cards = ({"value": "ACE", "suit": "SPADES"}, {"value": "ACE", "suit": "HEARTS"})
+            room = Room()
+            table_id = 1154179
+            hero_name = "Hero"
+            hand_id = "hAA"
+
+        bridge = LiveCoinBridge()
+        bridge.active_hook_room = 10
+        bridge.state["_hook_room"] = 10
+        bridge.autoplay.turn_by_room[10] = {
+            "userTurnOptions": {"7": [], "4": [0.02]},
+            "_ws_id": "ws",
+            "_turn_id": "t-co",
+            "turnTime": 15,
+        }
+        config = default_nlh_prefold_config()
+        co_raise = evaluate_prefold(
+            config,
+            PrefoldContext(
+                dealt_in_players=6,
+                position="CO",
+                facing="RAISE",
+                hole_cards=Trash.cards,
+            ),
+        )
+        self.assertTrue(co_raise.matched)
+        self.assertEqual(co_raise.canonical_hand, "64o")
+        self.assertTrue(asyncio.run(bridge._try_nlh_prefold(Trash())))
+        self.assertEqual(bridge.autoplay.pending["action"], "FOLD")
+        self.assertTrue(bridge.autoplay.pending.get("prefold"))
+        aa = evaluate_prefold(
+            config,
+            PrefoldContext(
+                dealt_in_players=6,
+                position="CO",
+                facing="RAISE",
+                hole_cards=Aces.cards,
+            ),
+        )
+        self.assertFalse(aa.matched)
+        self.assertEqual(aa.canonical_hand, "AA")
+        bridge.autoplay.pending = None
+        self.assertFalse(asyncio.run(bridge._try_nlh_prefold(Aces())))
+        self.assertIsNone(bridge.autoplay.pending)
+
     def test_catalog_isstraddle_does_not_block_live_prefold(self):
         """Coin wait_list isStraddle:1 is a table capability, not this-hand straddle."""
         import asyncio

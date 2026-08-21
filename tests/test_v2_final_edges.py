@@ -280,6 +280,146 @@ class TurnOptionPcapRegressionTests(unittest.TestCase):
         self.assertEqual(fallback["room"], ROOM)
 
 
+class CcTimeoutFailsafeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_cc_timeout_queues_check_or_fold(self):
+        bridge = LiveCoinBridge()
+        bridge.cc_timeout_seconds = 0.05
+        bridge.cc_fallback_margin_seconds = 0.0
+        bridge.active_hook_room = ROOM
+        bridge.state["_hook_room"] = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "t-cc",
+            "_observed_monotonic": time.monotonic(),
+            "turnTime": 15,
+            "_ws_id": "ws",
+        }
+        await bridge._wait_cc_and_schedule()
+        pending = bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["action"], "CHECK")
+        self.assertTrue(pending.get("fallback"))
+        self.assertEqual(pending.get("fallback_reason"), "CC_TIMEOUT")
+
+    async def test_wait_cc_timeout_folds_when_check_absent(self):
+        bridge = LiveCoinBridge()
+        bridge.cc_timeout_seconds = 0.05
+        bridge.cc_fallback_margin_seconds = 0.0
+        bridge.active_hook_room = ROOM
+        bridge.state["_hook_room"] = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"4": [0.2], "7": None},
+            "_turn_id": "t-fold",
+            "_observed_monotonic": time.monotonic(),
+            "turnTime": 15,
+            "_ws_id": "ws",
+        }
+        await bridge._wait_cc_and_schedule()
+        pending = bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["action"], "FOLD")
+        self.assertTrue(pending.get("fallback"))
+
+
+class ReconnectSilenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_duplicate_turn_after_pending_cleared_reschedules(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", user_id=1, _hook_room=ROOM)
+        bridge.active_hook_room = ROOM
+        turn = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"7": None, "4": [0.02]},
+            "turnTime": 12,
+        }
+        body = payload("game.user_turn", turn)
+        first = {"direction": "in", "ws_id": "aabb", "url": "wss://coin"}
+        bridge.autoplay.observe(first, body, b"", bridge.state)
+        self.assertFalse(first.get("_hmuriy_duplicate_turn"))
+        bridge.autoplay.schedule_failsafe(bridge.state, reason="FIRST")
+        self.assertIsNotNone(bridge.autoplay.pending)
+        bridge.autoplay.pending = None
+        replay = {"direction": "in", "ws_id": "aabb", "url": "wss://coin"}
+        bridge.autoplay.observe(replay, body, b"", bridge.state)
+        self.assertTrue(replay.get("_hmuriy_duplicate_turn"))
+        await bridge._on_hero_user_turn(replay, body, b"", turn, ROOM)
+        pending = bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertIn(pending["action"], {"CHECK", "FOLD"})
+        self.assertTrue(pending.get("fallback") or pending.get("prefold"))
+
+    async def test_ensure_action_after_reconnect_wipe_sets_failsafe(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.active_hook_room = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        self.assertTrue(await bridge.ensure_action_if_hero_silent(reason="RECONNECT_SILENCE"))
+        self.assertEqual(bridge.autoplay.pending["action"], "CHECK")
+        self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "RECONNECT_SILENCE")
+
+
+class LiveSnapshotNotEmptyTests(unittest.TestCase):
+    def test_timeout_keeps_native_sessions_instead_of_zero_zero(self):
+        from core.production_runtime import RouterService
+
+        svc = RouterService.__new__(RouterService)
+        svc._routers = {"dev-sony": object()}
+        svc._connected = {"dev-sony"}
+        svc._device_labels = {"dev-sony": "Sony"}
+        svc._heartbeat_at = {"dev-sony": time.monotonic()}
+        svc._last_seen = {}
+        svc._last_snapshot = {
+            "ok": True,
+            "devices": [{"device_id": "dev-sony", "connected": True, "tables": [{"table_id": 1}]}],
+            "connected_devices": 1,
+        }
+        snap = svc._snapshot_on_timeout(TimeoutError())
+        self.assertTrue(snap.get("stale"))
+        self.assertEqual(len(snap.get("devices") or []), 1)
+        self.assertNotEqual(snap.get("connected_devices"), 0)
+
+    def test_skeleton_lists_connected_device_without_last_snapshot(self):
+        from core.production_runtime import RouterService
+
+        svc = RouterService.__new__(RouterService)
+        svc._routers = {"dev-sony": object()}
+        svc._connected = {"dev-sony"}
+        svc._device_labels = {"dev-sony": "Sony"}
+        svc._heartbeat_at = {"dev-sony": time.monotonic()}
+        svc._last_seen = {}
+        svc._last_snapshot = None
+        snap = svc._snapshot_on_timeout(TimeoutError("control"))
+        ids = [row["device_id"] for row in snap.get("devices") or []]
+        self.assertIn("dev-sony", ids)
+        self.assertGreaterEqual(int(snap.get("connected_devices") or 0), 1)
+
+    def test_web_merge_keeps_run_and_devices_on_empty_proxy(self):
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "vps" / "pokereye-web.py"
+        spec = importlib.util.spec_from_file_location("pokereye_web_state", path)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        last = {
+            "snapshot": {
+                "devices": [{"device_id": "dev-1", "connected": True, "tables": [{}]}],
+                "connected_devices": 1,
+            },
+            "run": "run_abc",
+            "events": [],
+        }
+        merged = mod.merge_live_state({"ok": True, "devices": []}, None, last, [])
+        self.assertEqual(merged.get("run"), "run_abc")
+        self.assertTrue((merged.get("snapshot") or {}).get("devices"))
+        self.assertTrue((merged.get("snapshot") or {}).get("stale"))
+
+
 class MidHandRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_seed_is_retried_before_failsafe(self):
         bridge = LiveCoinBridge()

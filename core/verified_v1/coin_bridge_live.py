@@ -1943,6 +1943,76 @@ class LiveCoinBridge:
         })
         return True
 
+    async def ensure_action_if_hero_silent(self, *, reason: str = "RECONNECT_SILENCE") -> bool:
+        """Queue prefold or CHECK/FOLD when a live hero turn has no pending action.
+
+        Short Coin/native reconnects clear ``autoplay.pending``. The next packet
+        is often a duplicate extraTimer turn, which used to keep the clock silent.
+        """
+        if self.autoplay.pending or self.awaiting_cc:
+            return False
+        room = self.state.get("_hook_room") or self.context_hook_room or self.active_hook_room
+        if room is None:
+            return False
+        hand = self.current_hand or self.context_hand
+        if hand is not None:
+            try:
+                if await self._try_nlh_prefold(hand):
+                    return True
+            except Exception:
+                pass
+        try:
+            fb = self.autoplay.schedule_failsafe(self.state, reason=reason)
+        except Exception:
+            return False
+        self._hand_cc_failed = True
+        self._diagnostic(
+            "fallback_ready",
+            "hero turn was silent after reconnect; safety action queued",
+            {
+                "action": fb.get("action"),
+                "attempt": 1,
+                "max_attempts": self.action_max_attempts,
+                "reason": reason,
+                "delay_ms": int(fb.get("delay_ms") or 0),
+                "hud": hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0),
+            },
+        )
+        return True
+
+    async def _on_hero_user_turn(self, event: dict, payload: Any, raw: bytes, data: dict, room: Any) -> None:
+        if event.get("_hmuriy_duplicate_turn"):
+            if self.autoplay.pending or self.awaiting_cc:
+                self._diagnostic(
+                    "turn_refresh",
+                    "Coin extraTimer/time-bank refresh; existing hint/action retained",
+                    {"timer": str(event.get("_hmuriy_turn_refresh") or data.get("timerName") or "")},
+                )
+                return
+            self._diagnostic(
+                "hero_turn_resumed",
+                "duplicate Coin turn after silent reconnect; action re-armed",
+                {"timer": str(event.get("_hmuriy_turn_refresh") or data.get("timerName") or "")},
+            )
+            if await self.ensure_action_if_hero_silent(reason="RECONNECT_SILENCE"):
+                return
+        mode = "incremental" if (self.current_hand and self.current_hand.hand_id in self.cold_hands) else "cold"
+        if event.get("_hmuriy_options_from_advance"):
+            options = data.get("userTurnOptions") or {}
+            self._diagnostic(
+                "turn_options_recovered",
+                "legal hero options recovered from preceding game.advance_player_action",
+                {"room": room, "option_codes": sorted(str(k) for k in options)},
+            )
+        self._diagnostic(
+            "hero_turn",
+            f"matched Coin hero turn room={room} mode={mode} hand={self.state.get('hand_id') or '-'}",
+        )
+        if mode == "incremental":
+            await self.start_incremental_hint(event, payload, raw, data)
+        else:
+            await self.start_cold_hint(event, payload, raw)
+
     async def start_cold_hint(self,event:dict,payload:Any,raw:bytes):
         async with self.hint_lock:
             try:
@@ -2965,29 +3035,7 @@ class LiveCoinBridge:
                 await self._close_open_hint("turn-left-hero")
             if self._is_hero_turn(data):
                 self._hero_turn_this_hand=True
-                if event.get("_hmuriy_duplicate_turn"):
-                    self._diagnostic(
-                        "turn_refresh",
-                        "Coin extraTimer/time-bank refresh; existing hint/action retained",
-                        {"timer":str(event.get("_hmuriy_turn_refresh") or data.get("timerName") or "")},
-                    )
-                else:
-                    mode="incremental" if (self.current_hand and self.current_hand.hand_id in self.cold_hands) else "cold"
-                    if event.get("_hmuriy_options_from_advance"):
-                        options=data.get("userTurnOptions") or {}
-                        self._diagnostic(
-                            "turn_options_recovered",
-                            "legal hero options recovered from preceding game.advance_player_action",
-                            {"room":room,"option_codes":sorted(str(k) for k in options)},
-                        )
-                    self._diagnostic(
-                        "hero_turn",
-                        f"matched Coin hero turn room={room} mode={mode} hand={self.state.get('hand_id') or '-'}",
-                    )
-                    if mode=="incremental":
-                        await self.start_incremental_hint(event,payload,raw,data)
-                    else:
-                        await self.start_cold_hint(event,payload,raw)
+                await self._on_hero_user_turn(event,payload,raw,data,room)
             elif whose and self.current_hand:
                 await self.send_opponent_turn_notify(data)
 

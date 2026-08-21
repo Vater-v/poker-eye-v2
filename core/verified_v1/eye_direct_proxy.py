@@ -667,6 +667,14 @@ class DirectBackendProxy:
 
         if hasattr(bridge, "pending_action_ack"):
             bridge.pending_action_ack = None
+        try:
+            if autoplay is not None:
+                autoplay.schedule_failsafe(
+                    getattr(bridge, "state", {}) or {},
+                    reason="RECOVERY_EXHAUSTED",
+                )
+        except Exception:
+            pass
 
         for task in tuple(getattr(bridge, "schedule_finish_tasks", {}).values()):
             if task is not asyncio.current_task() and not task.done():
@@ -828,6 +836,9 @@ class DirectBackendProxy:
                         autoplay.pending = None
                 if hasattr(bridge, "pending_action_ack"):
                     bridge.pending_action_ack = None
+                ensure = getattr(bridge, "ensure_action_if_hero_silent", None)
+                if callable(ensure):
+                    await ensure(reason="RECONNECT_SILENCE")
                 for task in tuple(getattr(bridge, "schedule_finish_tasks", {}).values()):
                     if task is not asyncio.current_task() and not task.done():
                         task.cancel()
