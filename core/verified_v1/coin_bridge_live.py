@@ -3118,10 +3118,18 @@ class LiveCoinBridge:
             return False
         # Claim before awaiting socket I/O so scheduled, manual and ACK paths can
         # race safely without producing duplicate FinishRoundHintRSP frames.
+        # The 2.5s connect window from the hint send is already dead after a
+        # CC wait. Finish must not inherit it or Eye keeps the open RoundHint.
         self.state["_pending_finish_hint"]=None
-        f=self.finish_frame_by_table.get(table_id)
-        if f: await self.eye_send_outer(f,"pb.FinishRoundHintRSP")
-        else: await self.eye_send_cmd("pb.FinishRoundHintRSP",core.p_int(1,core.ppp_table_id(table_id)))
+        self._eye_send_deadline=None
+        try:
+            f=self.finish_frame_by_table.get(table_id)
+            if f: await self.eye_send_outer(f,"pb.FinishRoundHintRSP")
+            else: await self.eye_send_cmd("pb.FinishRoundHintRSP",core.p_int(1,core.ppp_table_id(table_id)))
+        except Exception:
+            if self.state.get("_pending_finish_hint") is None:
+                self.state["_pending_finish_hint"]=table_id
+            raise
         return True
 
     async def send_opponent_turn_notify(self,data:dict):

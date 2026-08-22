@@ -1952,6 +1952,41 @@ class OpenHintGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await bridge._close_open_hint("dealer_cards"))
 
 
+class FinishAfterCcTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finish_after_expired_hint_deadline_still_sends(self):
+        """CC wait outlives the 2.5s connect window. Finish must not inherit it."""
+        sent: list[str] = []
+        bridge = LiveCoinBridge()
+        bridge.state["_pending_finish_hint"] = 42
+        bridge._eye_send_deadline = time.monotonic() - 8.0
+
+        async def fake_ensure(*, deadline=None):
+            if deadline is not None and time.monotonic() >= float(deadline):
+                raise TimeoutError("eye connect deadline")
+
+        async def fake_generation(frame, label="", generation=0):
+            sent.append(str(label or frame))
+
+        bridge.ensure_eye = fake_ensure  # type: ignore[method-assign]
+        bridge._eye_send_outer_generation = fake_generation  # type: ignore[method-assign]
+        self.assertTrue(await bridge.finish_hint(42))
+        self.assertTrue(any("FinishRoundHint" in item for item in sent))
+        self.assertIsNone(bridge.state["_pending_finish_hint"])
+
+    async def test_failed_finish_keeps_pending_so_retry_can_close_eye(self):
+        bridge = LiveCoinBridge()
+        bridge.state["_pending_finish_hint"] = 42
+
+        async def boom(*_args, **_kwargs):
+            raise TimeoutError("eye connect deadline")
+
+        bridge.eye_send_outer = boom  # type: ignore[method-assign]
+        bridge.eye_send_cmd = boom  # type: ignore[method-assign]
+        with self.assertRaises(TimeoutError):
+            await bridge.finish_hint(42)
+        self.assertEqual(bridge.state["_pending_finish_hint"], 42)
+
+
 class ForcedExitDummyGuardTests(unittest.TestCase):
     def test_leave_does_not_steal_other_table_dummy(self):
         router = DeviceIngressRouter("device-test", object())
