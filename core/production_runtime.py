@@ -64,6 +64,21 @@ MAX_TABLES_PER_DEVICE = 8
 MAX_TOTAL_TABLES = MAX_DEVICES * MAX_TABLES_PER_DEVICE
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 19101
+
+
+def count_sitting_tables(tables: Any) -> int:
+    """Live sits only. Disk ghosts (phase=persisted) are not a person at a table."""
+    n = 0
+    for table in tables or ():
+        if not isinstance(table, dict):
+            continue
+        if table.get("persisted") or str(table.get("phase") or "") == "persisted":
+            continue
+        if str(table.get("state") or "") == "closing":
+            continue
+        if table.get("hero_sitting") or str(table.get("state") or "") == "ready":
+            n += 1
+    return n
 # APK pings every 1s. Reconnect and dump stalls used to flip a live device
 # offline because online required an unbroken TCP channel AND a fresh ping.
 # Stay online while any ping is recent. 120s → drop the router.
@@ -1813,8 +1828,8 @@ class RouterService:
         for row in devices:
             tables = list(row.get("tables") or [])
             live = [t for t in tables if str(t.get("state") or "") != "closing"]
-            live_tables += len(live)
-            seated += sum(1 for t in live if t.get("hero_sitting") or t.get("state") == "ready")
+            live_tables += sum(1 for t in live if not t.get("persisted") and str(t.get("phase") or "") != "persisted")
+            seated += count_sitting_tables(tables)
             hands += int(row.get("hands") or 0)
         latest_qty, latest_rate = snapshot_fuel_from_devices(devices)
         rate = latest_rate

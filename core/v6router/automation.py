@@ -174,15 +174,8 @@ class DeviceAutomation:
         blob = self._store.get_runtime(self.device_id) or {}
         if not isinstance(blob, dict):
             return
-        for raw in blob.get("seated_tables") or []:
-            try:
-                table_id = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if table_id <= 0:
-                continue
-            self._seated.add(table_id)
-            self._tabs.setdefault(table_id, 0.0)
+        # Never restore seated tables from disk. A leftover id (Vaterv 1166102)
+        # looks like a live sit after everyone stood up and blocks deploy.
         play = blob.get("play_enabled")
         if play is not None:
             self.policy.play_enabled = bool(play)

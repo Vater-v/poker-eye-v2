@@ -100,6 +100,37 @@ class LedgerSeedTests(unittest.TestCase):
         self.assertAlmostEqual(end, 12.2662)
         self.assertAlmostEqual(profit, -0.20)
 
+    def test_lobby_end_includes_rakeback_already_on_cash(self):
+        from core.v6router.history_ledger import close_balance_end
+
+        end, profit = close_balance_end(
+            balance_st=12.47,
+            hand_profit=-0.20,
+            live_lobby=15.47,
+        )
+        self.assertAlmostEqual(end, 15.47)
+        self.assertAlmostEqual(profit, 3.00)
+
+
+class GhostSitTests(unittest.TestCase):
+    def test_restore_runtime_does_not_revive_seated_tables(self):
+        from core.v6router.automation import DeviceAutomation
+
+        store = type("S", (), {})()
+        store.get = lambda device_id: None
+        store.get_runtime = lambda device_id: {"seated_tables": [1166102, 11]}
+        auto = DeviceAutomation("dev", store=store)
+        self.assertEqual(auto._seated, set())
+
+    def test_persisted_ghost_is_not_a_sitting_table(self):
+        from core.production_runtime import count_sitting_tables
+
+        tables = [
+            {"state": "ready", "hero_sitting": True, "persisted": True, "phase": "persisted"},
+            {"state": "ready", "hero_sitting": True, "persisted": False},
+        ]
+        self.assertEqual(count_sitting_tables(tables), 1)
+
 
 class DocsPendingTests(unittest.TestCase):
     def test_open_session_before_sheet_ack_is_pending_not_missing(self) -> None:
