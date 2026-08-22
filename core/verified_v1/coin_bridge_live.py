@@ -275,6 +275,7 @@ def compute_net_profits(
     raw_winner_net: dict[int, int],
     payout_by_seat: dict[int, int],
     forced_adjustment_by_seat: dict[int, int],
+    splash_seats: set[int] | list[int] | tuple[int, ...] = (),
 ) -> dict[int, int]:
     """Return one net result per participating zero-based seat.
 
@@ -284,6 +285,10 @@ def compute_net_profits(
     gross payout minus committed chips for fragment-backed winners, Coin's net
     fallback with the one forced-blind adjustment removed, and negative committed
     chips for every remaining participant.
+
+    Splash is not in the pot fragments. Those seats must use Coin's
+    ``cumulativeProfitLoss`` (``raw_winner_net``) or the bonus never lands
+    in History / HUD.
     """
     seats = {
         int(seat1) - 1
@@ -293,10 +298,15 @@ def compute_net_profits(
     seats.update(int(seat) for seat in hand_contrib)
     seats.update(int(seat) for seat in raw_winner_net)
     seats.update(int(seat) for seat in payout_by_seat)
+    splash = {int(seat) for seat in splash_seats}
 
     profits: dict[int, int] = {}
     for seat in seats:
-        if seat in payout_by_seat:
+        if seat in splash and seat in raw_winner_net:
+            profits[seat] = int(raw_winner_net[seat]) - int(
+                forced_adjustment_by_seat.get(seat, 0)
+            )
+        elif seat in payout_by_seat:
             profits[seat] = int(payout_by_seat[seat]) - int(hand_contrib.get(seat, 0))
         elif seat in raw_winner_net:
             profits[seat] = int(raw_winner_net[seat]) - int(
@@ -305,6 +315,68 @@ def compute_net_profits(
         else:
             profits[seat] = -int(hand_contrib.get(seat, 0))
     return profits
+
+
+def splash_winner_seats(winners: Any) -> set[int]:
+    """Zero-based seats Coin marked as splash pot winners."""
+    seats: set[int] = set()
+    for row in winners or ():
+        if not isinstance(row, dict) or not row.get("isSplashPotWinner"):
+            continue
+        try:
+            seat = int(row.get("seatId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if seat > 0:
+            seats.add(seat - 1)
+    return seats
+
+
+def hero_splash_cash(
+    data: Any,
+    *,
+    hero_name: str = "",
+    hero_seat: int = 0,
+    pot_net: Any = None,
+) -> Optional[float]:
+    """Hero's splash bonus in cash, or None if they did not win splash.
+
+    ``pot_net`` is the regular pot result already counted. Coin's
+    ``cumulativeProfitLoss`` includes splash; the difference is the bonus.
+    """
+    if not isinstance(data, dict):
+        return None
+    want = " ".join(str(hero_name or "").split()).casefold()
+    try:
+        want_seat = int(hero_seat or 0)
+    except (TypeError, ValueError):
+        want_seat = 0
+    for row in data.get("winnersData") or ():
+        if not isinstance(row, dict) or not row.get("isSplashPotWinner"):
+            continue
+        name = " ".join(str(row.get("userName") or "").split()).casefold()
+        try:
+            seat = int(row.get("seatId") or 0)
+        except (TypeError, ValueError):
+            seat = 0
+        if (want and name == want) or (want_seat and seat == want_seat):
+            try:
+                cpl = float(row.get("cumulativeProfitLoss") or 0.0)
+            except (TypeError, ValueError):
+                return None
+            try:
+                pot = float(pot_net) if pot_net is not None else None
+            except (TypeError, ValueError):
+                pot = None
+            if pot is None:
+                try:
+                    splash = float(data.get("splashPotAmount") or 0.0)
+                except (TypeError, ValueError):
+                    splash = 0.0
+                return splash if splash else None
+            bonus = round(cpl - pot, 4)
+            return bonus if abs(bonus) >= 0.0001 else None
+    return None
 
 
 def core_hook_empty():
@@ -3735,6 +3807,7 @@ class LiveCoinBridge:
                     raw_winner_net=raw_winner_net,
                     payout_by_seat=payout_by_seat,
                     forced_adjustment_by_seat=self.forced_adjustment_by_seat,
+                    splash_seats=splash_winner_seats(winners),
                 )
                 next_session={seat:self.session_profit[seat]+profit for seat,profit in profits.items()}
                 for seat in sorted(profits):

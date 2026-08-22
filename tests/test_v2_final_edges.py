@@ -1641,6 +1641,49 @@ class AccountingRegressionTests(unittest.TestCase):
         self.assertEqual(profits[0], 150)
         self.assertEqual(profits[1], -100)
 
+    def test_splash_winner_uses_coin_net_not_pot_fragment(self):
+        """Fragments are pot-only. Splash lives in cumulativeProfitLoss."""
+        profits = compute_net_profits(
+            hand_participants={1, 2, 3},
+            hand_contrib={0: 100, 1: 100, 2: 100},
+            raw_winner_net={2: 500},
+            payout_by_seat={2: 300},
+            forced_adjustment_by_seat={},
+            splash_seats={2},
+        )
+        self.assertEqual(profits[2], 500)
+        self.assertEqual(profits[0], -100)
+        self.assertEqual(profits[1], -100)
+
+
+class SplashCashTests(unittest.TestCase):
+    def test_hero_splash_from_winner_flag(self):
+        from core.verified_v1.coin_bridge_live import hero_splash_cash
+
+        data = {
+            "splashPotAmount": 3.0,
+            "isMegaSplash": False,
+            "winnersData": [
+                {
+                    "userName": "Weedman834",
+                    "seatId": 4,
+                    "cumulativeProfitLoss": 2.85,
+                    "isSplashPotWinner": True,
+                },
+                {
+                    "userName": "Villain",
+                    "seatId": 1,
+                    "cumulativeProfitLoss": -0.15,
+                    "isSplashPotWinner": False,
+                },
+            ],
+        }
+        self.assertAlmostEqual(
+            hero_splash_cash(data, hero_name="Weedman834", hero_seat=4, pot_net=0.15),
+            2.70,
+        )
+        self.assertIsNone(hero_splash_cash(data, hero_name="Villain", hero_seat=1, pot_net=-0.15))
+
 
 class BombpotAccountingRegressionTests(unittest.TestCase):
     @staticmethod
