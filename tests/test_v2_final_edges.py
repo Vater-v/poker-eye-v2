@@ -2913,5 +2913,21 @@ class LateCardsAndRecoveryPolicyTests(unittest.TestCase):
         self.assertEqual(folded, [])
 
 
+class SilentEyeResendPolicyTests(unittest.TestCase):
+    def test_first_cc_slice_is_four_seconds_even_for_chart_miss(self):
+        from core.verified_v1.coin_bridge_live import cc_wait_slice_seconds
+
+        self.assertEqual(cc_wait_slice_seconds(chart_miss=True, remaining_seconds=14.0, attempt=0), 4.0)
+        self.assertEqual(cc_wait_slice_seconds(chart_miss=False, remaining_seconds=14.0, attempt=0), 4.0)
+        self.assertLessEqual(cc_wait_slice_seconds(chart_miss=True, remaining_seconds=3.2, attempt=0), 3.2)
+
+    def test_first_silence_resends_hint_second_silence_fails_safe(self):
+        from core.verified_v1.coin_bridge_live import should_resend_hint_after_cc_silence
+
+        self.assertTrue(should_resend_hint_after_cc_silence(attempt=0, remaining_seconds=8.0))
+        self.assertFalse(should_resend_hint_after_cc_silence(attempt=1, remaining_seconds=8.0))
+        self.assertFalse(should_resend_hint_after_cc_silence(attempt=0, remaining_seconds=2.0))
+
+
 if __name__ == "__main__":
     unittest.main()

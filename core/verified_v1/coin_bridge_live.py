@@ -191,6 +191,48 @@ def should_failsafe_while_eye_recovering(remaining_seconds: Optional[float] = No
     return left <= EYE_RECOVERY_FAILSAFE_REMAINING
 
 
+CC_WAIT_SLICE_SECONDS = 4.0
+CC_RESEND_MIN_REMAINING = 3.0
+
+
+def cc_wait_slice_seconds(
+    *,
+    chart_miss: bool = False,
+    remaining_seconds: Optional[float] = None,
+    attempt: int = 0,
+    default_timeout: float = 8.0,
+) -> float:
+    """One wait slice. Chart-miss used to sit 12s on a dead hint; 4s is enough."""
+    del chart_miss, attempt
+    slice_s = min(float(CC_WAIT_SLICE_SECONDS), max(2.0, float(default_timeout)))
+    if remaining_seconds is None:
+        return slice_s
+    try:
+        left = float(remaining_seconds)
+    except (TypeError, ValueError):
+        return slice_s
+    if left <= 0:
+        return 0.75
+    return max(0.75, min(slice_s, left))
+
+
+def should_resend_hint_after_cc_silence(
+    *,
+    attempt: int = 0,
+    remaining_seconds: Optional[float] = None,
+) -> bool:
+    """After the first silent slice, Finish + resend once if the Coin clock still has room."""
+    if int(attempt or 0) > 0:
+        return False
+    if remaining_seconds is None:
+        return True
+    try:
+        left = float(remaining_seconds)
+    except (TypeError, ValueError):
+        return True
+    return left >= CC_RESEND_MIN_REMAINING
+
+
 def lp_pack(obj: dict) -> bytes:
     raw=json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()
     return struct.pack(">I",len(raw))+raw
@@ -437,6 +479,7 @@ class LiveCoinBridge:
         self._street_hand_id=""
         self._cc_deadline=0.0
         self._last_prefold_reason=""
+        self._cc_resend_attempt=0
         self.pending_actor_seat=None
         self.manual_action_event=asyncio.Event(); self.event_count=0; self.inject_count=0; self.cc_count=0; self.heartbeat_count=0
         self.state_error_count=0; self.protocol_error_count=0
@@ -532,6 +575,7 @@ class LiveCoinBridge:
         self._hand_cc_failed=False
         self.cc_miss_streak=0
         self.cc_failsafe_standup=False
+        self._cc_resend_attempt=0
 
     def _arm_failsafe_standup(self) -> None:
         if self.cc_failsafe_standup:
@@ -2579,6 +2623,20 @@ class LiveCoinBridge:
             return "GAME_IS_BROKEN"
         return "EYE_UNAVAILABLE"
 
+    async def _resend_silent_eye_hint(self, event: Optional[dict], payload: Any, raw: bytes) -> bool:
+        """Finish already done. Resend the same Coin hand once after 4s of Eye silence."""
+        hid = self._broken_replay_hand_id()
+        if hid:
+            self.cold_hands.discard(hid)
+        if getattr(self, "_broken_replay_in_progress", False):
+            return False
+        self._broken_replay_in_progress = True
+        try:
+            await self._start_cold_hint_locked(event or {}, payload, raw or b"")
+        finally:
+            self._broken_replay_in_progress = False
+        return not bool(self.autoplay.pending and self.autoplay.pending.get("fallback"))
+
     async def replay_broken_eye_hand(
         self,
         event: Optional[dict] = None,
@@ -3085,24 +3143,24 @@ class LiveCoinBridge:
         cc_task=asyncio.create_task(self.cc_queue.get())
         manual_task=asyncio.create_task(self.manual_action_event.wait())
         self.awaiting_cc=True
-        # Never let the backend consume the whole Coin turn. Four seconds is
-        # the ceiling; short/already-running turns reserve a fallback window.
-        timeout_s=self._cc_wait_timeout()
+        remaining=None
         try:
             room=self.context_hook_room or self.active_hook_room
             turn=self.autoplay.turn_by_room.get(int(room),{}) if room is not None else {}
             remaining=self._hero_turn_remaining_seconds(turn)
-            margin=float(self.cc_fallback_margin_seconds)
-            if remaining is not None and remaining>0:
-                usable=max(0.75, remaining-margin)
-                if self._chart_miss_preflop():
-                    # TT/AJs and other chart-miss preflop hands get the Coin clock,
-                    # not the 4s Eye ceiling. Failsafe FOLD of those is the bug.
-                    timeout_s=min(max(timeout_s, usable), 12.0)
-                else:
-                    timeout_s=min(timeout_s, usable)
+            if remaining is not None:
+                try:
+                    remaining=max(0.0, float(remaining)-float(self.cc_fallback_margin_seconds))
+                except (TypeError,ValueError):
+                    pass
         except (TypeError,ValueError):
-            pass
+            remaining=None
+        timeout_s=cc_wait_slice_seconds(
+            chart_miss=self._chart_miss_preflop(),
+            remaining_seconds=remaining,
+            attempt=int(getattr(self, "_cc_resend_attempt", 0) or 0),
+            default_timeout=self._cc_wait_timeout(),
+        )
         try:
             if self._cc_wait_should_abort():
                 self.abort_cc_wait(self._abort_reason_for_silent_eye())
@@ -3138,6 +3196,29 @@ class LiveCoinBridge:
                 try:await self.finish_hint(self.state.get("_pending_finish_hint"))
                 except Exception as e:
                     self._diagnostic("finish_hint_error",f"finish after CC timeout failed: {e}")
+                leftover_clock=None
+                try:
+                    room=self.context_hook_room or self.active_hook_room
+                    turn=self.autoplay.turn_by_room.get(int(room),{}) if room is not None else {}
+                    leftover_clock=self._hero_turn_remaining_seconds(turn)
+                except Exception:
+                    leftover_clock=None
+                attempt=int(getattr(self,"_cc_resend_attempt",0) or 0)
+                if should_resend_hint_after_cc_silence(attempt=attempt, remaining_seconds=leftover_clock):
+                    self._cc_resend_attempt=attempt+1
+                    self._hand_cc_failed=False
+                    self._diagnostic(
+                        "cc_resend",
+                        f"Eye silent {timeout_s:.1f}s; finish hint and resend same hand",
+                        {"attempt": self._cc_resend_attempt, "timeout_s": timeout_s},
+                    )
+                    ev, pl, rw = getattr(self, "_last_hero_hint", ({}, None, b""))
+                    pending_before = self.autoplay.pending
+                    if await self._resend_silent_eye_hint(ev, pl, rw or b""):
+                        return
+                    if self.autoplay.pending and self.autoplay.pending is not pending_before:
+                        if str(self.autoplay.pending.get("fallback_reason") or "") == "MID_HAND_NO_SEED":
+                            self.autoplay.pending = None
                 try:
                     hint=self._hero_hint_event()
                     fb=self.autoplay.schedule_failsafe(
