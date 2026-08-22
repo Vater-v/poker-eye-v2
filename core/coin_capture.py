@@ -26,7 +26,7 @@ import struct
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 PCAP_MAGIC = 0xA1B2C3D4
 LINKTYPE_USER0 = 147
@@ -41,6 +41,57 @@ _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 def _safe(value: str, fallback: str = "device") -> str:
     text = _SAFE.sub("_", str(value)).strip("._")
     return text[:96] or fallback
+
+
+PCAP_REC_HEADER = struct.Struct("<IIII")
+
+
+def iter_hmr1_pcap(path: str | Path) -> Iterator[dict[str, Any]]:
+    """Yield the same hook events native ingress would queue from this capture.
+
+    Each HMR1 record becomes a ``ws_message`` dict with ``_raw`` bytes so
+    ``decode_hook_payload`` / ``DeviceIngressRouter.handle_event`` can consume
+    it without a parallel decoder.
+    """
+    data = Path(path).read_bytes()
+    if len(data) < 24:
+        return
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic not in {PCAP_MAGIC, 0xD4C3B2A1}:
+        raise ValueError(f"not a classic pcap: {path}")
+    swapped = magic == 0xD4C3B2A1
+    offset = 24
+    seq = 0
+    rec_fmt = ">IIII" if swapped else "<IIII"
+    rec_struct = struct.Struct(rec_fmt)
+    while offset + rec_struct.size <= len(data):
+        sec, usec, incl, orig = rec_struct.unpack_from(data, offset)
+        offset += rec_struct.size
+        pkt = data[offset:offset + incl]
+        offset += incl
+        if len(pkt) < HMR_HEADER.size:
+            continue
+        magic_b, ws_u32, direction, payload_len = HMR_HEADER.unpack_from(pkt, 0)
+        if magic_b != b"HMR1":
+            continue
+        payload = pkt[HMR_HEADER.size:HMR_HEADER.size + payload_len]
+        seq += 1
+        ts = float(sec) + (float(usec) / 1_000_000.0)
+        yield {
+            "type": "ws_message",
+            "kind": "ws_message",
+            "v": 6,
+            "async": True,
+            "schedule_send": True,
+            "id": str(seq),
+            "direction": "out" if direction else "in",
+            "text": False,
+            "url": "",
+            "ws_id": f"{int(ws_u32):08x}",
+            "_ws_u32": int(ws_u32) & 0xFFFFFFFF,
+            "_raw": payload,
+            "_pcap_ts": ts,
+        }
 
 
 class _DeviceCapture:

@@ -25,12 +25,72 @@ from .accounts import (
 from .action_arbiter import ActionArbiter, ActionOffer, ActionState, DispatchPlan
 from .db_recent import store as db_recent_store
 from .fuel import fuel_health, fuel_reason_code, normalize_fuel_threshold
-from ..verified_v1.bombpot_support import detect_double_board
+from .history_ledger import attach_session_docs, attach_session_profit
+from ..verified_v1.bombpot_support import detect_double_board, stale_double_board_should_drop
 from ..verified_v1.coin_action_wire import (
     build_game_leave_seat_packet,
     build_game_quit_table_packet,
     build_game_user_action_packet,
 )
+
+
+def hero_sitout_for_watchdog(bridge: Any) -> bool:
+    """Sitout for policy/sit-in is only the live bridge latch.
+
+    Coin timeout sets ``hero_sitting_out`` from game.sitout sitOutMap or a
+    missed deal. Between-hands ``isPlaying=false`` after a failsafe is not
+    sitout — that OR with ``cc_miss_streak`` produced 29/41 false cases.
+    """
+    return bool(getattr(bridge, "hero_sitting_out", False))
+
+
+@dataclass
+class TableLogic:
+    """Per-table trainer logic that can be swapped between hands.
+
+    ``cc_timeout_seconds`` is consulted on the next hero-turn CC wait.
+    """
+
+    revision: str = ""
+    cc_timeout_seconds: Optional[float] = None
+
+    @classmethod
+    def from_value(cls, value: Any) -> "TableLogic":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            timeout = value.get("cc_timeout_seconds")
+            return cls(
+                revision=str(value.get("revision") or value.get("rev") or ""),
+                cc_timeout_seconds=(
+                    None if timeout is None else float(timeout)
+                ),
+            )
+        return cls(revision=str(value or ""))
+
+
+def swap_logic_between_hands(bridge: Any, logic: Any) -> bool:
+    """Install updated trainer logic between hands without dropping the Coin seat.
+
+    Returns False while a hand is live so the next call can retry after reset_data.
+    Never enqueues leave or standup. Applies ``TableLogic.cc_timeout_seconds``
+    onto the live bridge so the next CC wait uses the new ceiling.
+    """
+    if getattr(bridge, "current_hand", None) is not None:
+        return False
+    state = getattr(bridge, "state", None)
+    if isinstance(state, dict) and str(state.get("hand_id") or "").strip():
+        return False
+    sitting = bool(getattr(bridge, "hero_sitting", False))
+    departing = bool(getattr(bridge, "hero_departing", False))
+    parsed = TableLogic.from_value(logic)
+    setattr(bridge, "table_logic", parsed)
+    setattr(bridge, "_logic", parsed)
+    if parsed.cc_timeout_seconds is not None:
+        bridge.cc_timeout_seconds = max(2.0, float(parsed.cc_timeout_seconds))
+    bridge.hero_sitting = sitting
+    bridge.hero_departing = departing
+    return True
 
 
 MAX_FRAME_BYTES = 20_000_000
@@ -412,7 +472,17 @@ class LiveTableSession:
         self._bridge = bridge
         self._proxy = proxy
         self._accounts = accounts
-        self._sink = observation_sink
+        raw_sink = observation_sink or (lambda _obs: None)
+
+        def _safe_sink(observation: RouterObservation) -> None:
+            # Operator/ledger bugs must not crash the table session. FrozenInstanceError
+            # on hand_started used to close the live seat and empty the console fleet.
+            try:
+                raw_sink(observation)
+            except Exception:
+                return
+
+        self._sink = _safe_sink
         self._quarantine = float(crash_quarantine_seconds)
         self._fuel_low_threshold = normalize_fuel_threshold(fuel_low_threshold)
         self._lock = asyncio.Lock()
@@ -431,9 +501,26 @@ class LiveTableSession:
         self._arbiter_cancellations: collections.deque[tuple[str, str]] = collections.deque()
         self._arbiter_dispatch_context: dict[str, dict[str, Any]] = {}
         self.play_enabled = True
+        self._logic = None
+        self._pending_logic = None
         self._monitor = asyncio.create_task(
             self._monitor_state(), name=f"table-monitor-{device_id}-{table_id}"
         )
+
+    def swap_logic_between_hands(self, logic: Any) -> bool:
+        """Apply now if between hands; otherwise keep queued for reset_data."""
+        self._pending_logic = logic
+        ok = swap_logic_between_hands(self._bridge, logic)
+        if ok:
+            self._logic = getattr(self._bridge, "table_logic", logic)
+            self._pending_logic = None
+        return ok
+
+    def _apply_pending_table_logic(self) -> bool:
+        pending = self._pending_logic
+        if pending is None:
+            return False
+        return self.swap_logic_between_hands(pending)
 
     async def handle_event(
         self, event: dict[str, Any]
@@ -462,6 +549,12 @@ class LiveTableSession:
                     hand = self._candidate_hand or str(self._bridge.state.get("hand_id") or "")
                     if hand:
                         self._emit_hand_started(hand)
+            if routed.command in {"game.hole_cards", "game.player_info"}:
+                cards = data.get("playerCards") or data.get("holeCards") or []
+                if cards:
+                    hand = self._candidate_hand or str(self._bridge.state.get("hand_id") or "")
+                    if hand:
+                        self._emit_hand_started(hand)
             # Never derive hand completion from a transiently empty bridge snapshot.
             # Coin emits explicit atomic boundaries; process settlement before
             # publishing completion so accounting/game type remain available.
@@ -477,6 +570,8 @@ class LiveTableSession:
                 )
             elif complete_before_bridge and hand_before_bridge:
                 self._emit_hand_completed(hand_before_bridge, "Coin reset_data")
+            if routed.command == "game.reset_data":
+                self._apply_pending_table_logic()
             return decision
 
     @staticmethod
@@ -511,6 +606,7 @@ class LiveTableSession:
             "coin_bb": coin_bb,
             "checked": False,
         }
+        self._stack_guard_saw_positive = False
 
     def _seat_rows_for_stack_guard(self, routed: RoutedEvent) -> list[dict[str, Any]]:
         data = routed.data
@@ -648,7 +744,12 @@ class LiveTableSession:
         ack = self._bridge.pending_action_ack
         if ack:
             retry_at = float(ack.get("retry_at") or float("inf"))
-            if now < retry_at or int(ack.get("retries") or 0) >= max(0, int(getattr(self._bridge, "action_max_attempts", 3)) - 1):
+            held = bool(
+                getattr(self._bridge, "ack_refresh_blocks_retry", lambda _ack: False)(ack)
+            )
+            if held:
+                ack = None
+            elif now < retry_at or int(ack.get("retries") or 0) >= max(0, int(getattr(self._bridge, "action_max_attempts", 3)) - 1):
                 ack = None
             elif ack.get("ws_id") and ack.get("ws_id") != event.get("ws_id"):
                 ack = None
@@ -768,11 +869,16 @@ class LiveTableSession:
                     )
                 else:
                     action_id = self._action_id(pending)
-                    ready_at = float(
-                        pending.setdefault(
-                            "_arbiter_ready_at", float(pending.get("due") or now)
+                    if pending.get("extra_urgent"):
+                        ready_at = now
+                        pending["_arbiter_ready_at"] = now
+                        pending["due"] = now
+                    else:
+                        ready_at = float(
+                            pending.setdefault(
+                                "_arbiter_ready_at", float(pending.get("due") or now)
+                            )
                         )
-                    )
                     deadline = pending.get("turn_deadline_at")
                     offers.append(
                         ActionOffer(
@@ -785,6 +891,11 @@ class LiveTableSession:
                             # Claim a later dummy at/after the reserved timestamp
                             # instead of handing the app an uncancellable 6-12s timer.
                             supports_delayed_send=False,
+                            bypass_gap=bool(
+                                pending.get("fallback")
+                                or pending.get("prefold")
+                                or pending.get("extra_urgent")
+                            ),
                         )
                     )
 
@@ -799,8 +910,12 @@ class LiveTableSession:
             same_hand = str(ack.get("hand_id") or "") == str(
                 self._bridge.state.get("hand_id") or ""
             )
+            held = bool(
+                getattr(self._bridge, "ack_refresh_blocks_retry", lambda _ack: False)(ack)
+            )
             if (
                 now >= retry_at
+                and not held
                 and int(ack.get("retries") or 0) < max(0, int(getattr(self._bridge, "action_max_attempts", 3)) - 1)
                 and same_hand
                 and self._matches_action_socket(ack, event)
@@ -817,6 +932,7 @@ class LiveTableSession:
                         # dummy must wait until arbitration says the gap has elapsed.
                         supports_delayed_send=False,
                         retry=True,
+                        bypass_gap=True,
                     )
                 )
         return tuple(offers)
@@ -899,6 +1015,45 @@ class LiveTableSession:
         return rows
 
 
+    def _ledger_detail(self) -> dict[str, Any]:
+        bridge = self._bridge
+        nick = str(
+            bridge.identity.get("user_name")
+            or bridge.state.get("user_name")
+            or ""
+        )
+        try:
+            hero_seat = int(bridge.state.get("hero_seat") or 0)
+        except (TypeError, ValueError):
+            hero_seat = 0
+        try:
+            scale = float(getattr(bridge, "scale", 100) or 100)
+        except (TypeError, ValueError):
+            scale = 100.0
+        if scale <= 0:
+            scale = 100.0
+        profit_chips = 0
+        if hero_seat > 0:
+            try:
+                profit_chips = int((getattr(bridge, "session_profit", {}) or {}).get(hero_seat - 1, 0) or 0)
+            except (TypeError, ValueError):
+                profit_chips = 0
+        stack = 0.0
+        seat_map = getattr(bridge, "seat_map", {}) or {}
+        raw = seat_map.get(hero_seat)
+        if raw is None:
+            raw = seat_map.get(str(hero_seat))
+        if isinstance(raw, dict):
+            try:
+                stack = float(raw.get("userChips") if raw.get("userChips") not in (None, "") else raw.get("buyinAmount") or 0)
+            except (TypeError, ValueError):
+                stack = 0.0
+        return {
+            "nickname": nick,
+            "stack": stack,
+            "table_profit": round(profit_chips / scale, 4),
+        }
+
     def _emit_hand_started(self, hand: str) -> None:
         hand = str(hand or "")
         if not hand or hand in self._started:
@@ -911,7 +1066,7 @@ class LiveTableSession:
                 "hand_started", self.device_id, self.table_id, self.account_id,
                 snapshot.health, snapshot.reason, snapshot.game_type or None,
                 snapshot.coin_bb, hand, snapshot.pending,
-                detail=snapshot.backend_detail,
+                detail={**snapshot.backend_detail, **self._ledger_detail()},
                 backend_status=snapshot.backend_status,
                 backend_message=snapshot.backend_message,
                 backend_hash=snapshot.backend_hash,
@@ -922,6 +1077,8 @@ class LiveTableSession:
     def _emit_hand_completed(self, hand: str, reason: str) -> None:
         hand = str(hand or "")
         if not hand or hand in self._completed:
+            return
+        if hand not in self._started:
             return
         self._completed.add(hand)
         snapshot = self._snapshot()
@@ -935,7 +1092,7 @@ class LiveTableSession:
                 "hand_completed", self.device_id, self.table_id, self.account_id,
                 snapshot.health, observation_reason, snapshot.game_type or None,
                 snapshot.coin_bb, hand, False, True,
-                detail=snapshot.backend_detail,
+                detail={**snapshot.backend_detail, **self._ledger_detail()},
                 backend_status=snapshot.backend_status,
                 backend_message=snapshot.backend_message,
                 backend_hash=snapshot.backend_hash,
@@ -946,6 +1103,7 @@ class LiveTableSession:
             self._last_hand = ""
         if self._candidate_hand == hand:
             self._candidate_hand = ""
+        self._apply_pending_table_logic()
 
     def _snapshot(self) -> _LiveTableSnapshot:
         bridge = self._bridge
@@ -965,10 +1123,11 @@ class LiveTableSession:
             game_type = str(
                 props.get("_gameTypeLabel")
                 or {1: "NLH", 2: "PLO", 17: "PLO5", 20: "PLO6"}.get(mini, "")
-                or props.get("gameType")
-                or props.get("variant")
                 or ""
             )
+            raw = str(props.get("gameType") or props.get("variant") or "")
+            if not game_type:
+                game_type = "NLH" if raw.upper() in {"", "RING", "CASH"} else raw
         transport_up = bool(bridge.eye_w and not bridge.eye_w.is_closing())
         proxy_status = getattr(self._proxy, "backend_status_snapshot", None)
         if proxy_status is None:
@@ -1036,8 +1195,8 @@ class LiveTableSession:
         try:
             while not self._closed:
                 snapshot = self._snapshot()
-                if snapshot.hand and snapshot.hand != self._last_hand:
-                    self._emit_hand_started(snapshot.hand)
+                # History hands start on hero hole cards / hero user_turn, not
+                # every table gameId that happens to sit in the snapshot.
                 # ``bridge.state[hand_id]`` is temporarily empty while a cold
                 # snapshot is reconstructed or between Coin street packets.  It is
                 # not a settlement signal.  Completion is emitted only from
@@ -1618,6 +1777,7 @@ class DeviceIngressRouter:
             Callable[[dict[str, Any]], dict[str, Any]]
         ] = None,
         automation: Any = None,
+        history_ledger: Any = None,
     ) -> None:
         if int(startup_max_attempts) < 1:
             raise ValueError("startup_max_attempts must be positive")
@@ -1683,6 +1843,7 @@ class DeviceIngressRouter:
         self._action_arbiter = action_arbiter or ActionArbiter(self.device_id)
         self._navigation_handler = navigation_handler
         self.automation = automation
+        self.history_ledger = history_ledger
         if self.automation is not None and self._navigation_handler is None:
             self._navigation_handler = self.automation.handle
         self._watchdog_task: Optional[asyncio.Task[Any]] = None
@@ -2400,14 +2561,7 @@ class DeviceIngressRouter:
                         if parsed is not None:
                             stack_bb = float(parsed) / coin_bb
                             stack_known = parsed > 0
-                    sitting_out = bool(getattr(bridge, "hero_sitting_out", False))
-                    is_playing = hero_row.get("isPlaying") is True if hero_row is not None else True
-                    sitout = sitting_out or (
-                        bool(getattr(bridge, "hero_sitting", False))
-                        and not is_playing
-                        and not getattr(bridge, "current_hand", None)
-                        and int(getattr(bridge, "cc_miss_streak", 0) or 0) > 0
-                    )
+                    sitout = hero_sitout_for_watchdog(bridge)
                     rows.append({
                         "table_id": int(table_id),
                         "stack_bb": stack_bb,
@@ -2450,14 +2604,26 @@ class DeviceIngressRouter:
             auto.retract_false_leave(int(table_id))
         leaves = auto.drain_leaves()
         extra: list[tuple[int, str]] = []
+        standup_ids: set[int] = set()
         for row in rows:
             if not row.get("seated"):
                 continue
             if int(row.get("streak") or 0) > 3 or row.get("failsafe_standup"):
+                standup_ids.add(int(row["table_id"]))
                 extra.append((
                     int(row["table_id"]),
                     "PokerEYE silent 3 hero turns; standup after failsafe",
                 ))
+        leave_ids = {int(tid) for tid, _reason in list(leaves) + extra}
+        for row in rows:
+            if not row.get("seated") or not row.get("sitout"):
+                continue
+            tid = int(row["table_id"])
+            if tid in standup_ids or tid in leave_ids:
+                continue
+            auto.request_sit_in(
+                tid, room=int(row.get("room") or 0), ws_id=str(row.get("ws") or ""),
+            )
         async with self._lock:
             for table_id in list(self._unsupported_exit):
                 self._abort_false_policy_exit_locked(int(table_id))
@@ -2521,6 +2687,127 @@ class DeviceIngressRouter:
         if str(3) in opts or 3 in opts:
             return "CHECK", build_game_user_action_packet(int(room), 3, 0.0)
         return "FOLD", build_game_user_action_packet(int(room), 7, 0.0)
+
+    def _arm_db_checkfold_locked(self, table_id: int) -> None:
+        """Put CHECK/FOLD extra_urgent on the live bridge so the next dummy sends."""
+        slot = self._sessions.get(int(table_id))
+        session = getattr(slot, "session", None) if slot is not None else None
+        if not isinstance(session, LiveTableSession):
+            return
+        bridge = session._bridge
+        room = 0
+        try:
+            room = int(bridge.context_hook_room or bridge.active_hook_room or 0)
+        except (TypeError, ValueError):
+            room = 0
+        if room <= 0:
+            try:
+                room = int((self._unsupported_exit.get(int(table_id)) or {}).get("room") or 0)
+            except (TypeError, ValueError):
+                room = 0
+        if room <= 0:
+            return
+        name, raw = self._checkfold_raw_locked(int(table_id), room)
+        now = time.monotonic()
+        turn = {}
+        try:
+            turn = (bridge.autoplay.turn_by_room.get(int(room)) or {}) if room else {}
+        except Exception:
+            turn = {}
+        if not isinstance(turn, dict):
+            turn = {}
+        with bridge.autoplay.lock:
+            bridge.autoplay.pending = {
+                "due": now,
+                "raw": raw,
+                "room": int(room),
+                "ws_id": turn.get("_ws_id") or self._ws_for_table_locked(int(table_id)),
+                "url": turn.get("_url"),
+                "channel_id": turn.get("_channel_id"),
+                "action": name,
+                "delay_ms": 0,
+                "fallback": True,
+                "extra_urgent": True,
+                "_arbiter_ready_at": now,
+                "hand_id": str(bridge.state.get("hand_id") or ""),
+                "turn_id": str(turn.get("_turn_id") or ""),
+            }
+
+    def _unstick_db_checkfold_locked(self, table_id: int) -> None:
+        state = self._unsupported_exit.get(int(table_id))
+        if not state:
+            return
+        state["next_at"] = 0.0
+        inflight = state.get("inflight") or {}
+        if not inflight:
+            return
+        token, stage = next(iter(inflight.items()))
+        name = str(stage.get("stage") or "")
+        if name not in {"CHECK", "FOLD", "CHECKFOLD"}:
+            return
+        inflight.pop(token, None)
+        state["awaiting_coin"] = False
+        queue = state.setdefault("queue", collections.deque())
+        queue.appendleft(dict(stage))
+
+    def _release_stale_double_board_locked(self, table_id: int) -> bool:
+        """A new ordinary hand must not inherit Warning: DB from the previous one."""
+        table_id = int(table_id)
+        marked = table_id in self._unsupported_tables
+        state = self._unsupported_exit.get(table_id)
+        kind = str((state or {}).get("kind") or "")
+        if kind and kind != "unsupported":
+            return False
+        room = 0
+        try:
+            room = int((state or {}).get("room") or 0)
+        except (TypeError, ValueError):
+            room = 0
+        if room:
+            self._unsupported_room_reasons.pop(room, None)
+        for rid, owner in list(self._room_to_table.items()):
+            if int(owner) == table_id:
+                self._unsupported_room_reasons.pop(int(rid), None)
+        if not marked and not state:
+            return False
+        self._unsupported_tables.pop(table_id, None)
+        self._unsupported_exit.pop(table_id, None)
+        slot = self._sessions.get(table_id)
+        session = getattr(slot, "session", None) if slot is not None else None
+        bridge = getattr(session, "_bridge", None) if session is not None else None
+        if bridge is not None:
+            try:
+                bridge.hero_departing = False
+            except Exception:
+                pass
+            try:
+                pending = getattr(getattr(bridge, "autoplay", None), "pending", None)
+                if (
+                    isinstance(pending, dict)
+                    and pending.get("fallback")
+                    and str(pending.get("action") or "").upper() in {"CHECK", "FOLD", "CHECKFOLD"}
+                ):
+                    bridge.autoplay.pending = None
+            except Exception:
+                pass
+        task = self._unsupported_close_tasks.pop(table_id, None)
+        if task is not None:
+            task.cancel()
+        self._sink(
+            RouterObservation(
+                "unsupported_table",
+                self.device_id,
+                table_id,
+                status="green",
+                reason="DOUBLE BOARD mark dropped; current hand has no second board",
+                detail={
+                    "unsupported": "",
+                    "warning": "",
+                    "hud": {"text": "", "clear": True, "sticky": False, "leave": False},
+                },
+            )
+        )
+        return True
 
     def game_ws_for(self, table_id: int) -> str:
         owners = [ws for ws, tables in self._ws_to_tables.items() if int(table_id) in tables]
@@ -2703,9 +2990,21 @@ class DeviceIngressRouter:
         if isinstance(session, LiveTableSession) and str(exit_kind) != "leave_all":
             bridge = session._bridge
             try:
+                now = time.monotonic()
+                action = ""
                 with bridge.autoplay.lock:
-                    bridge.autoplay.pending = None
-                bridge.pending_action_ack = None
+                    pending = bridge.autoplay.pending
+                    action = str((pending or {}).get("action") or "").upper()
+                    if pending and action in {"CHECK", "FOLD"}:
+                        pending["due"] = now
+                        pending["delay_ms"] = 0
+                        pending["extra_urgent"] = True
+                        pending["fallback"] = True
+                        pending["_arbiter_ready_at"] = now
+                    else:
+                        bridge.autoplay.pending = None
+                if action not in {"CHECK", "FOLD"}:
+                    bridge.pending_action_ack = None
                 bridge.hero_departing = True
             except Exception:
                 pass
@@ -2864,7 +3163,12 @@ class DeviceIngressRouter:
             return forced_forward()
         dummy_ws = str(routed.websocket_id or "")
         want_ws = self._ws_for_table_locked(int(table_id)) or str(state.get("ws_id") or "")
-        if want_ws and dummy_ws and dummy_ws != want_ws:
+        # HMN1 v>=6 names the target websocket in the inject. Any lobby dummy
+        # can carry CHECK/FOLD; requiring the game ws left the HUD burning.
+        if (
+            want_ws and dummy_ws and dummy_ws != want_ws
+            and int(routed.event.get("v") or 0) < 6
+        ):
             return forced_forward()
         now = time.monotonic()
         if state.get("inflight"):
@@ -3091,20 +3395,39 @@ class DeviceIngressRouter:
     async def _route_dummy(self, routed: RoutedEvent) -> tuple[dict[str, Any], Optional[int]]:
         async with self._lock:
             slots = [slot for slot in self._sessions.values() if slot.session is not None]
-            # Hero CC on this dummy always beats leave_Seat. Stealing it is how
-            # table 2's hint stayed open across a street → GAME_IS_BROKEN.
+            # Hero extra_urgent/prefold/failsafe beats STANDUP. DOUBLE BOARD
+            # CHECK/FOLD is itself failsafe: a delayed Eye action on another
+            # table must not leave the DB hint burning with 0 sends.
             has_play = False
+            has_urgent_play = False
             now = time.monotonic()
             for slot in slots:
                 session = slot.session
                 if not isinstance(session, LiveTableSession):
                     continue
                 for offer in session.action_offers(routed.event):
-                    if float(offer.ready_at) <= now + 0.05:
+                    due = offer.bypass_gap or float(offer.ready_at) <= now + 0.05
+                    if due:
                         has_play = True
+                        if offer.bypass_gap:
+                            has_urgent_play = True
                         break
-                if has_play:
+                if has_urgent_play:
                     break
+            for table_id in sorted(self._unsupported_exit):
+                state = self._unsupported_exit.get(int(table_id)) or {}
+                queue = state.get("queue")
+                head = None
+                if queue:
+                    try:
+                        head = queue[0]
+                    except (IndexError, TypeError, KeyError):
+                        head = None
+                stage = str((head or {}).get("stage") or "")
+                if stage in {"CHECK", "FOLD", "CHECKFOLD"}:
+                    forced = self._forced_exit_decision_locked(routed, table_id)
+                    if forced.get("action") != "forward":
+                        return forced, None
             if not has_play:
                 for table_id in sorted(self._unsupported_exit):
                     forced = self._forced_exit_decision_locked(routed, table_id)
@@ -3289,6 +3612,11 @@ class DeviceIngressRouter:
 
                 table_id = self._owner_locked(routed)
                 definite = self._definite_table_locked(routed)
+                owner = int(definite or table_id or 0)
+                if owner and stale_double_board_should_drop(
+                    routed.payload, routed.command, detected=double_board
+                ):
+                    self._release_stale_double_board_locked(owner)
                 if double_board and routed.room_id is not None:
                     self._unsupported_room_reasons[int(routed.room_id)] = str(
                         double_board_reason or "DOUBLE BOARD"
@@ -3312,6 +3640,12 @@ class DeviceIngressRouter:
                     # lease.  Send best-effort FOLD -> STANDUP -> LEAVE directly.
                     if routed.room_id is None or self._room_to_table.get(int(routed.room_id), table_id) == table_id:
                         self._bind_locked(routed, table_id)
+                    extra_timer = "extra" in str(
+                        (routed.data or {}).get("timerName") or ""
+                    ).lower()
+                    if extra_timer or str(routed.command or "") == "game.user_turn":
+                        self._arm_db_checkfold_locked(int(table_id))
+                        self._unstick_db_checkfold_locked(int(table_id))
                     self._ensure_unsupported_exit_locked(
                         table_id, routed, reset=(routed.command == "game.game_init")
                     )
@@ -3566,6 +3900,10 @@ class DeviceIngressRouter:
             start_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await start_task
+        # Return the table stack to wallet before History sees table_close.
+        # Otherwise End is leftover after buy-in, or the table stack ± deltas.
+        if auto is not None:
+            auto.note_table_closed(int(table_id), str(reason or ""))
         if session is not None:
             await session.close(crashed=crashed, reason=reason)
         else:
@@ -3575,8 +3913,6 @@ class DeviceIngressRouter:
                     reason=reason,
                 )
             )
-        if auto is not None:
-            auto.note_table_closed(int(table_id), str(reason or ""))
         async with self._lock:
             if int(table_id) in self._closing_tables:
                 self._schedule_tombstone_clear_locked(int(table_id))
@@ -3659,7 +3995,7 @@ class DeviceIngressRouter:
         )
         return True
 
-    async def control_snapshot(self) -> dict[str, Any]:
+    async def control_snapshot(self, compact: bool = True) -> dict[str, Any]:
         async with self._lock:
             rows = list(self._sessions.values())
         tables = []
@@ -3701,20 +4037,30 @@ class DeviceIngressRouter:
                         "playing": bool(raw.get("isPlaying")),
                     })
                 pending = dict(getattr(bridge.autoplay, "pending", None) or {})
-                if pending.get("action"):
+                live_hint = bool(pending.get("action")) and not pending.get("_hud_done")
+                if live_hint:
                     session._hint_action = str(pending.get("action") or "")
                     session._hint_amount = pending.get("display_amount")
                     try:
-                        session._last_action_delay_ms = int(pending.get("delay_ms") or session._last_action_delay_ms or 0)
+                        session._last_action_delay_ms = int(pending.get("delay_ms") or 0)
                     except (TypeError, ValueError):
-                        pass
-                last_action = str(pending.get("action") or getattr(session, "_hint_action", "") or "")
-                if pending.get("prefold") and str(last_action).upper() == "FOLD":
-                    last_action = "PREFOLD"
-                last_amount = pending.get("display_amount", getattr(session, "_hint_amount", None))
-                last_source = "prefold" if pending.get("prefold") else (
-                    "failsafe" if pending.get("fallback") else ("cc" if last_action else "")
-                )
+                        session._last_action_delay_ms = 0
+                    last_source = "prefold" if pending.get("prefold") else (
+                        "failsafe" if pending.get("fallback") else "cc"
+                    )
+                    last_action = str(pending.get("action") or "")
+                    if last_source == "prefold":
+                        last_action = "PREFOLD"
+                    elif last_source == "failsafe":
+                        last_action = "FALLBACK"
+                    last_amount = pending.get("display_amount")
+                else:
+                    session._hint_action = ""
+                    session._hint_amount = None
+                    session._last_action_delay_ms = 0
+                    last_action = ""
+                    last_amount = None
+                    last_source = ""
                 cards = []
                 hand = getattr(bridge, "current_hand", None) or getattr(bridge, "context_hand", None)
                 if hand is not None:
@@ -3753,12 +4099,32 @@ class DeviceIngressRouter:
                     last_action=last_action,
                     last_amount=last_amount,
                     last_action_source=last_source,
-                    action_delay_ms=int(pending.get("delay_ms") or 0)
-                    or int(getattr(session, "_last_action_delay_ms", 0) or 0)
-                    or None,
+                    action_delay_ms=(
+                        int(pending.get("delay_ms") or 0) if live_hint else None
+                    ),
                     hole_cards=cards,
                     hero_seat=int(bridge.state.get("hero_seat") or 0),
                 )
+                ledger = self.history_ledger
+                enabled = bool(
+                    ledger is not None
+                    and getattr(self.automation, "policy", None) is not None
+                    and getattr(self.automation.policy, "ledger_enabled", False)
+                )
+                profit = None
+                if ledger is not None and enabled:
+                    try:
+                        profit = ledger.table_profit(self.device_id, int(slot.table_id))
+                    except Exception:
+                        profit = None
+                row.update(attach_session_profit(row, profit, enabled=enabled))
+                docs = None
+                if ledger is not None and enabled:
+                    try:
+                        docs = ledger.session_docs(self.device_id, int(slot.table_id))
+                    except Exception:
+                        docs = None
+                row.update(attach_session_docs(row, docs, enabled=enabled))
             if int(slot.table_id) in self._unsupported_tables or db_recent_store().blocked(int(slot.table_id)):
                 row["warning"] = "DB"
                 row["warning_text"] = "Warning: DB"
@@ -3820,6 +4186,14 @@ class DeviceIngressRouter:
                 })
                 live_ids.add(tid)
         auto = self.automation.snapshot() if self.automation is not None else {}
+        if compact:
+            for table in tables:
+                table.pop("seats", None)
+            if isinstance(auto, dict):
+                auto = dict(auto)
+                ui = auto.get("ui")
+                if isinstance(ui, dict):
+                    auto["ui"] = {k: v for k, v in ui.items() if k != "rows"}
         warning = "DB" if any(str(row.get("warning") or "") == "DB" for row in tables) else ""
         return {
             "device_id": self.device_id,

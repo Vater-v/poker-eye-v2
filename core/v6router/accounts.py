@@ -424,21 +424,24 @@ class AccountPool:
         if not self._auto_expand_unbounded:
             return None
         suffix = high + 1
-        if suffix > self._dynamic_suffix_limit:
-            return None
-        account_id = f"{self._dynamic_base}-{suffix}"
-        record = _AccountRecord(
-            account_id=account_id,
-            state=AccountState.PROBING,
-            validated=False,
-            suffix=suffix,
-            last_error=(
-                "auto-generated monotonic candidate "
-                f"(limit={self._dynamic_suffix_limit})"
-            ),
-        )
-        self._records[account_id] = record
-        return record
+        while suffix <= self._dynamic_suffix_limit:
+            account_id = f"{self._dynamic_base}-{suffix}"
+            if account_id in self._blocked:
+                suffix += 1
+                continue
+            record = _AccountRecord(
+                account_id=account_id,
+                state=AccountState.PROBING,
+                validated=False,
+                suffix=suffix,
+                last_error=(
+                    "auto-generated monotonic candidate "
+                    f"(limit={self._dynamic_suffix_limit})"
+                ),
+            )
+            self._records[account_id] = record
+            return record
+        return None
 
     def _expire_quarantine_locked(self) -> None:
         now = self._clock()

@@ -90,6 +90,46 @@ def build_game_take_seat_packet(room_id:int,seat_id:int,buyin:float)->bytes:
         {"seatId":int(seat_id),"buyinAmount":json_wire_number(buyin)},
     )
 
+# Inbound Coin timeout (pcap run_a0d95a4be681 / run_a5711c6d52d5):
+# command game.sitout, data.sitOutMap.sitOutNextHand=true, msg
+# "Since you are timed-out, you will sit-out in the next hand".
+SITOUT_MAP_KEYS = (
+    "sitOutAll",
+    "sitOutTourney",
+    "sitOutNextHand",
+    "sitOutNextBB",
+    "sitOutCash",
+)
+CAPTURED_TIMEOUT_SITOUT_MAP = {
+    "sitOutAll": False,
+    "sitOutTourney": False,
+    "sitOutNextHand": True,
+    "sitOutNextBB": False,
+    "sitOutCash": False,
+}
+
+
+def sitout_map_latched(data: Any) -> bool:
+    """True when Coin armed any sit-out bit on game.sitout."""
+    if not isinstance(data, dict):
+        return False
+    mapping = data.get("sitOutMap")
+    if not isinstance(mapping, dict):
+        return False
+    return any(mapping.get(key) is True for key in SITOUT_MAP_KEYS)
+
+
+def build_game_sitout_packet(room_id: int, *, sit_out_next_hand: bool = False) -> bytes:
+    """Clear (or arm) the captured sitOutMap. sitOutNextHand=false sits back in."""
+    sit_map = {key: False for key in SITOUT_MAP_KEYS}
+    sit_map["sitOutNextHand"] = bool(sit_out_next_hand)
+    return build_extension_packet(
+        "game.sitout",
+        int(room_id),
+        {"sitOutMap": sit_map},
+    )
+
+
 def build_game_leave_seat_packet(room_id:int)->bytes:
     return build_extension_packet('game.leave_Seat',room_id)
 

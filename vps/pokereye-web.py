@@ -33,6 +33,22 @@ def token_value() -> str:
         return ""
 
 
+def attach_reload_fields(snapshot: dict) -> dict:
+    """Disk BUILD_ID vs live trainer. Web restarts even when the trainer is held."""
+    snapshot = dict(snapshot or {})
+    try:
+        from core.deploy_reload import annotate_snapshot, read_disk_build, request_path
+
+        return annotate_snapshot(
+            snapshot,
+            disk_build=read_disk_build(ROOT),
+            request_exists=request_path(ROOT).is_file(),
+            live_build=str(snapshot.get("build") or ""),
+        )
+    except Exception:
+        return snapshot
+
+
 def merge_live_state(
     snapshot: dict,
     run: Path | None,
@@ -42,15 +58,26 @@ def merge_live_state(
     """Keep the last live fleet when a timeout returns an empty 0/0 snapshot."""
     last = last if isinstance(last, dict) else {}
     last_snap = dict(last.get("snapshot") or {})
+    snapshot = dict(snapshot or {})
     devices = list(snapshot.get("devices") or [])
     last_devices = list(last_snap.get("devices") or [])
-    if not devices and last_devices:
+    new_online = sum(1 for row in devices if isinstance(row, dict) and row.get("connected"))
+    last_online = sum(1 for row in last_devices if isinstance(row, dict) and row.get("connected"))
+    if (not devices and last_devices) or (not new_online and last_online and not devices):
         snapshot = dict(last_snap)
         snapshot["stale"] = True
         snapshot["snapshot_error"] = str(
-            snapshot.get("snapshot_error") or "empty_live_snapshot"
+            snapshot.get("snapshot_error") or last_snap.get("snapshot_error") or "empty_live_snapshot"
         )
-    run_name = run.name if run is not None else last.get("run")
+        devices = list(snapshot.get("devices") or [])
+    run_name = (
+        str(snapshot.get("run") or "").strip()
+        or (run.name if run is not None else "")
+        or str(last.get("run") or "").strip()
+        or ""
+    )
+    if run_name:
+        snapshot["run"] = run_name
     return {
         "ok": True,
         "snapshot": snapshot,
@@ -87,22 +114,34 @@ def latest_run() -> Path | None:
 
 
 def tail_jsonl(path: Path | None, limit: int = 300) -> list[dict]:
+    """Last ``limit`` JSON objects. Never decode the whole run file."""
     if path is None or not path.is_file():
         return []
     limit = max(20, min(1500, int(limit)))
+    # ~1 MiB from EOF is enough for a few hundred console events; a 45 MiB
+    # run file must not become a full json.loads scan on each poll.
+    max_bytes = 1024 * 1024
     with path.open("rb") as f:
         f.seek(0, 2)
         pos = f.tell()
-        data = b""
-        while pos > 0 and data.count(b"\n") <= limit + 20:
+        chunks: list[bytes] = []
+        nlines = 0
+        taken = 0
+        while pos > 0 and nlines <= limit and taken < max_bytes:
             take = min(65536, pos)
             pos -= take
             f.seek(pos)
-            data = f.read(take) + data
-            if len(data) > 8 * 1024 * 1024:
-                break
+            chunk = f.read(take)
+            chunks.append(chunk)
+            nlines += chunk.count(b"\n")
+            taken += take
+        data = b"".join(reversed(chunks))
+    if pos > 0:
+        cut = data.find(b"\n")
+        if cut >= 0:
+            data = data[cut + 1 :]
     rows = []
-    for line in data.decode("utf-8", errors="replace").splitlines()[-(limit + 20):]:
+    for line in data.splitlines()[-limit:]:
         try:
             item = json.loads(line)
         except Exception:
@@ -132,8 +171,13 @@ def control(method: str, path: str, body: dict | None = None, timeout: float = 3
         except Exception:
             value = {"ok": False, "error": payload.decode("utf-8", errors="replace")[:500]}
         return int(response.status), value if isinstance(value, dict) else {"value": value}
+    except Exception as exc:
+        return 599, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _safe_console_file(rel: str) -> Path | None:
@@ -208,23 +252,32 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in ("/health", "/pokereye/health"):
             status, ctl = control("GET", "/health")
+            body = {"ok": status == 200, "web": WEB_ID, "control": ctl}
+            live_build = ""
+            if isinstance(ctl, dict):
+                live_build = str(ctl.get("build") or "")
+            body.update(attach_reload_fields({"build": live_build}))
             self._send(
                 200 if status == 200 else 503,
-                {"ok": status == 200, "web": WEB_ID, "control": ctl},
+                body,
                 cookie=via_query,
             )
             return
         if path in ("/api/state", "/pokereye/api/state"):
-            status, snapshot = control("GET", "/snapshot", timeout=8.0)
+            try:
+                status, snapshot = control("GET", "/snapshot", timeout=8.0)
+            except Exception as exc:
+                status, snapshot = 599, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             if status != 200 or not isinstance(snapshot, dict):
                 snapshot = dict(_LAST_STATE.get("snapshot") or {})
                 if not snapshot:
-                    self._send(
-                        503,
-                        {"ok": False, "error": "trainer control unavailable"},
-                        cookie=via_query,
-                    )
-                    return
+                    snapshot = {
+                        "ok": False,
+                        "build": "",
+                        "devices": [],
+                        "stale": True,
+                        "snapshot_error": "trainer control unavailable",
+                    }
                 snapshot["stale"] = True
             else:
                 snapshot["devices"] = [
@@ -237,7 +290,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 events = list(_LAST_STATE.get("events") or [])
             payload = merge_live_state(snapshot, run, _LAST_STATE, events)
-            _LAST_STATE.update(payload)
+            if not payload.get("run") and run is not None:
+                payload["run"] = run.name
+            if isinstance(payload.get("snapshot"), dict):
+                payload["snapshot"] = attach_reload_fields(payload["snapshot"])
+            merged_devices = list((payload.get("snapshot") or {}).get("devices") or [])
+            last_devices = list((_LAST_STATE.get("snapshot") or {}).get("devices") or [])
+            if merged_devices or not last_devices:
+                _LAST_STATE.update(payload)
             self._send(200, payload, cookie=via_query)
             return
         if path in ("/api/logs", "/pokereye/api/logs"):

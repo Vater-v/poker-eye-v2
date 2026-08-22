@@ -734,9 +734,12 @@ class SCLoginDiagnosticTests(unittest.TestCase):
         data = json.loads(path.read_text(encoding="utf-8"))
         ids = [str(row.get("account_id") or "") for row in (data.get("accounts") or [])]
         self.assertNotIn("709393393-19", ids)
+        self.assertNotIn("709393393-17", ids)
         self.assertIn("709393393-20", ids)
         self.assertIn("709393393-21", ids)
-        self.assertIn("709393393-19", data.get("blocked_accounts") or [])
+        blocked = data.get("blocked_accounts") or []
+        self.assertIn("709393393-19", blocked)
+        self.assertIn("709393393-17", blocked)
 
     def test_pool_acquires_20_21_and_skips_blocked_19_hole(self):
         with tempfile.TemporaryDirectory() as td:
@@ -747,14 +750,16 @@ class SCLoginDiagnosticTests(unittest.TestCase):
                 registry_path=registry,
                 profile="PPPoker",
                 auto_expand_unbounded=True,
-                blocked_accounts=["709393393-19"],
+                blocked_accounts=["709393393-19", "709393393-17"],
             )
             self.assertEqual(pool.acquire("a").account_id, "709393393-18")
             self.assertEqual(pool.acquire("b").account_id, "709393393-20")
             self.assertEqual(pool.acquire("c").account_id, "709393393-21")
             fourth = pool.acquire("d")
             self.assertNotEqual(fourth.account_id, "709393393-19")
+            self.assertNotEqual(fourth.account_id, "709393393-17")
             self.assertIsNone(pool.state_for("709393393-19"))
+            self.assertIsNone(pool.state_for("709393393-17"))
 
     def test_autogrow_off_uses_explicit_pool_and_does_not_fill_holes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -772,15 +777,42 @@ class SCLoginDiagnosticTests(unittest.TestCase):
                 registry_path=registry,
                 profile="PPPoker",
                 auto_expand_unbounded=False,
-                blocked_accounts=["709393393-19"],
+                blocked_accounts=["709393393-19", "709393393-17"],
             )
             for owner in "abcdef":
                 lease = pool.acquire(owner)
                 self.assertNotEqual(lease.account_id, "709393393-19")
+                self.assertNotEqual(lease.account_id, "709393393-17")
                 self.assertNotEqual(lease.account_id, "709393393-5")
             with self.assertRaises(AccountPoolExhausted):
                 pool.acquire("g")
             self.assertIsNone(pool.state_for("709393393-5"))
+            self.assertIsNone(pool.state_for("709393393-19"))
+            self.assertIsNone(pool.state_for("709393393-17"))
+
+    def test_live_file_blocked_17_is_never_acquired_on_hole_fill(self):
+        import json
+        path = Path(__file__).resolve().parents[1] / "config" / "backend_accounts.local.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        blocked = [str(item) for item in (data.get("blocked_accounts") or [])]
+        self.assertIn("709393393-17", blocked)
+        with tempfile.TemporaryDirectory() as td:
+            registry = Path(td) / "accounts.json"
+            pool = AccountPool(
+                ["709393393-13", "709393393-18"],
+                dynamic_base=str(data.get("base") or "709393393"),
+                registry_path=registry,
+                profile="PPPoker",
+                auto_expand_unbounded=True,
+                blocked_accounts=blocked,
+                max_probe_concurrency=20,
+            )
+            seen = set()
+            for i in range(8):
+                seen.add(pool.acquire(f"owner-{i}").account_id)
+            self.assertNotIn("709393393-17", seen)
+            self.assertNotIn("709393393-19", seen)
+            self.assertIsNone(pool.state_for("709393393-17"))
             self.assertIsNone(pool.state_for("709393393-19"))
 
 

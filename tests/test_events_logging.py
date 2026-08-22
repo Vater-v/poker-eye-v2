@@ -1,6 +1,9 @@
 """Unit tests for normalized event model and hierarchical logging."""
+import importlib.util
+import json
 import os, sys, tempfile, unittest
 from pathlib import Path
+from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from core.events import Direction, FrameFamily, coin_frame, eye_frame
 from core.logging import SessionLogger, DeviceLogger, TableLogger
@@ -65,6 +68,46 @@ class LoggingHierarchyTests(unittest.TestCase):
         logger.close()
         op = (self.root / "run_testrun" / "operator.txt").read_text(encoding="utf-8")
         self.assertIn("[+] Trainer корректно запущен", op)
+
+    def test_info_emit_does_not_fsync_per_record(self):
+        logger = SessionLogger(self.root, run_id="hotpath")
+        path = self.root / "run_hotpath" / "events.jsonl"
+        with patch("core.logging.os.fsync") as fsync:
+            for i in range(40):
+                logger.emit("v6.bridge_diag", severity="INFO", tag="hero_turn", n=i)
+            logger.emit("operator.sitout", severity="WARN", message="ситаут")
+            self.assertFalse(fsync.called)
+            text = path.read_text(encoding="utf-8")
+            self.assertGreaterEqual(text.count("v6.bridge_diag"), 40)
+            logger.error("cc_timeout", message="PokerEYE silent")
+            self.assertTrue(fsync.called)
+        logger.close()
+
+    def test_tail_jsonl_does_not_decode_whole_file(self):
+        web = Path(__file__).resolve().parents[1] / "vps" / "pokereye-web.py"
+        spec = importlib.util.spec_from_file_location("pokereye_web_tail", web)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        path = self.root / "events.jsonl"
+        with path.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps({"marker": "HEAD_SENTINEL", "n": 0}) + "\n")
+            for i in range(1, 4000):
+                fh.write(json.dumps({"n": i, "message": f"row-{i}"}) + "\n")
+        loads = {"n": 0}
+        real_loads = json.loads
+
+        def counted(line, *args, **kwargs):
+            loads["n"] += 1
+            return real_loads(line, *args, **kwargs)
+
+        with patch.object(mod.json, "loads", counted):
+            rows = mod.tail_jsonl(path, limit=300)
+        self.assertLessEqual(len(rows), 300)
+        self.assertLessEqual(loads["n"], 300)
+        self.assertTrue(rows)
+        self.assertNotIn("HEAD_SENTINEL", json.dumps(rows))
+        self.assertGreaterEqual(int(rows[-1]["n"]), 3700)
 
 
 if __name__ == "__main__":

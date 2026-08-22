@@ -429,6 +429,37 @@ class DirectBackendSlot:
         return value
 
 
+def keep_failsafe_pending(bridge: Any) -> None:
+    """Drop a stale Eye-mapped action, but never delete queued CHECK/FOLD.
+
+    ``recover_bridge`` used to set ``manual_action_event`` and clear
+    ``autoplay.pending``. The CC wait then returned as a fake manual fold and
+    the failsafe was gone, so Coin's clock sat the hero out.
+    """
+
+    autoplay = getattr(bridge, "autoplay", None)
+    pending = getattr(autoplay, "pending", None) if autoplay is not None else None
+    if isinstance(pending, dict) and pending.get("fallback"):
+        return
+    autoplay_lock = getattr(autoplay, "lock", None)
+    if autoplay_lock is not None:
+        with autoplay_lock:
+            if autoplay is not None:
+                autoplay.pending = None
+    elif autoplay is not None and hasattr(autoplay, "pending"):
+        autoplay.pending = None
+    if hasattr(bridge, "pending_action_ack"):
+        bridge.pending_action_ack = None
+    try:
+        if autoplay is not None:
+            autoplay.schedule_failsafe(
+                getattr(bridge, "state", {}) or {},
+                reason="RECOVERY",
+            )
+    except Exception:
+        pass
+
+
 class DirectBackendProxy:
     """Local LP-to-gRPC adapter used by one ``LiveCoinBridge`` instance."""
 
@@ -639,6 +670,10 @@ class DirectBackendProxy:
             raise RuntimeError("direct backend slot is already bound to another bridge")
 
         self._bound_bridge = bridge
+        try:
+            bridge.eye_backend = self
+        except Exception:
+            pass
         if recovery_exhausted_callback is not None:
             self._recovery_exhausted_callback = recovery_exhausted_callback
 
@@ -826,16 +861,10 @@ class DirectBackendProxy:
                 )
                 self.logger("RECOVERY", "silent backend cleanup started")
 
-                manual_event = getattr(bridge, "manual_action_event", None)
-                if manual_event is not None:
-                    manual_event.set()
-                autoplay = getattr(bridge, "autoplay", None)
-                autoplay_lock = getattr(autoplay, "lock", None)
-                if autoplay_lock is not None:
-                    with autoplay_lock:
-                        autoplay.pending = None
-                if hasattr(bridge, "pending_action_ack"):
-                    bridge.pending_action_ack = None
+                keep_failsafe_pending(bridge)
+                abort_cc = getattr(bridge, "abort_cc_wait", None)
+                if callable(abort_cc):
+                    abort_cc("RECOVERY")
                 for task in tuple(getattr(bridge, "schedule_finish_tasks", {}).values()):
                     if task is not asyncio.current_task() and not task.done():
                         task.cancel()
@@ -882,12 +911,9 @@ class DirectBackendProxy:
                 self.logger("RECOVERY", "backend reconnected; current table re-admitted")
 
             try:
-                hint_lock = getattr(bridge, "hint_lock", None)
-                if hint_lock is None:
-                    await perform()
-                else:
-                    async with hint_lock:
-                        await perform()
+                # Do not hold hint_lock across recycle/login. That used to block
+                # the hero-turn failsafe for the whole Coin clock.
+                await perform()
                 return True
             except asyncio.CancelledError:
                 raise

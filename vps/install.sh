@@ -26,16 +26,61 @@ if ! id pokereye >/dev/null 2>&1; then
 fi
 
 mkdir -p "$DST" "$DST/config" "$DST/secrets" "$DST/logs" "$DST/data" "$DST/vps"
-rm -rf "$DST/core"
-cp -a "$SRC/core" "$DST/core"
+# Atomic core swap so a sitting trainer keeps already-imported modules while
+# the directory is replaced. Copying files does not hot-swap running Python.
+rm -rf "$DST/core.next" "$DST/core.prev"
+cp -a "$SRC/core" "$DST/core.next"
+if [[ -d "$DST/core" ]]; then
+  mv "$DST/core" "$DST/core.prev"
+fi
+mv "$DST/core.next" "$DST/core"
+rm -rf "$DST/core.prev"
 install -m 0644 "$SRC/main.py" "$DST/main.py"
 install -m 0644 "$SRC/BUILD_ID" "$DST/BUILD_ID"
-install -m 0640 "$SRC/config/backend_accounts.local.json" "$DST/config/backend_accounts.local.json"
+if [[ ! -s "$DST/config/backend_accounts.local.json" ]]; then
+  install -m 0640 "$SRC/config/backend_accounts.local.json" "$DST/config/backend_accounts.local.json"
+else
+  # Keep live pool state; union blocked_accounts so 17/19 stay unleased.
+  python3 - "$SRC/config/backend_accounts.local.json" "$DST/config/backend_accounts.local.json" <<'PY'
+import json, sys
+from pathlib import Path
+src = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))
+dest_path = Path(sys.argv[2])
+dst = json.loads(dest_path.read_text(encoding="utf-8-sig"))
+blocked = sorted({
+    str(item).strip()
+    for item in list(dst.get("blocked_accounts") or []) + list(src.get("blocked_accounts") or [])
+    if str(item).strip()
+})
+blockset = set(blocked)
+dst["blocked_accounts"] = blocked
+dst["accounts"] = [
+    row for row in (dst.get("accounts") or [])
+    if isinstance(row, dict) and str(row.get("account_id") or "").strip() not in blockset
+]
+dest_path.write_text(json.dumps(dst, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+fi
 install -m 0640 "$SRC/secrets/trainer.secret" "$DST/secrets/trainer.secret"
 install -m 0640 "$SRC/secrets/eye.agent" "$DST/secrets/eye.agent"
+if [[ -s "$SRC/secrets/google-sheets.json" ]]; then
+  install -m 0640 "$SRC/secrets/google-sheets.json" "$DST/secrets/google-sheets.json"
+fi
+python3 -m pip install -q --disable-pip-version-check cryptography >/dev/null 2>&1 || true
 install -m 0755 "$SRC/vps/pokereye-web.py" "$DST/vps/pokereye-web.py"
+if [[ -f "$SRC/vps/debug_dump.py" ]]; then
+  install -m 0755 "$SRC/vps/debug_dump.py" "$DST/vps/debug_dump.py"
+fi
+if [[ -f "$SRC/vps/deferred_reload.sh" ]]; then
+  install -m 0755 "$SRC/vps/deferred_reload.sh" "$DST/vps/deferred_reload.sh"
+fi
 rm -rf "$DST/vps/console" "$DST/vps/web-dist"
 cp -a "$SRC/vps/web-dist" "$DST/vps/web-dist"
+rm -f "$DST/vps/probe_coin_agent.sh" "$DST/vps/probe_eye_credential.py" \
+  "$DST/vps/probe_parallel_eye.py" "$DST/vps/hmn1_selftest.py" \
+  "$DST/vps/pool_status.py" "$DST/vps/install_multitable_fix.sh" \
+  "$DST/vps/clean_recover.sh" "$DST/vps/_remote_diag.sh" \
+  "$DST/vps/_remote_snap.sh" "$DST/vps/_remote_verify.sh"
 
 if [[ ! -s "$DST/secrets/web.token" ]]; then
   umask 077
@@ -81,10 +126,83 @@ systemctl reload nginx
 systemctl daemon-reload
 systemctl enable pokereye.service pokereye-web.service >/dev/null
 
-# enable --now does NOT reload an already-running Python process.  Always
-# restart after replacing runtime files so the browser cannot keep seeing v1.
-systemctl restart pokereye.service
+# Console static files + proxy. Safe while phones sit: this is not :19037.
 systemctl restart pokereye-web.service
+
+TRAINER_ACTIVE=0
+if systemctl is-active --quiet pokereye.service; then
+  TRAINER_ACTIVE=1
+fi
+FORCE_RESTART=0
+case "${POKEREYE_FORCE_RESTART:-0}" in
+  1|true|TRUE|yes|YES|on|ON) FORCE_RESTART=1 ;;
+esac
+
+DECISION="$(
+  POKEREYE_FORCE_RESTART="$FORCE_RESTART" POKEREYE_TRAINER_ACTIVE="$TRAINER_ACTIVE" \
+    PYTHONPATH="$SRC${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m core.deploy_reload decide "$DST" 2>/dev/null || true
+)"
+ACTION="$(python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+try:
+    print(json.loads(raw).get("action") or "")
+except Exception:
+    print("")
+' <<<"$DECISION")"
+SEATED="$(python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+try:
+    d=json.loads(raw); print(d.get("seated_tables") if d.get("seated_tables") is not None else "")
+except Exception:
+    print("")
+' <<<"$DECISION")"
+LIVE_TABLES="$(python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+try:
+    d=json.loads(raw); print(d.get("live_tables") if d.get("live_tables") is not None else "")
+except Exception:
+    print("")
+' <<<"$DECISION")"
+LIVE_BUILD="$(python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+try:
+    print(json.loads(raw).get("live_build") or "")
+except Exception:
+    print("")
+' <<<"$DECISION")"
+STAGED_BUILD="$(cat "$DST/BUILD_ID" 2>/dev/null | tr -d '\r\n')"
+
+if [[ -z "$ACTION" && "$TRAINER_ACTIVE" == "1" && "$FORCE_RESTART" != "1" ]]; then
+  ACTION=hold
+fi
+
+systemctl stop pokereye-deferred-reload.service >/dev/null 2>&1 || true
+systemctl reset-failed pokereye-deferred-reload.service >/dev/null 2>&1 || true
+
+if [[ "$ACTION" != "hold" ]]; then
+  rm -f "$DST/data/reload_requested"
+  systemctl restart pokereye.service
+  echo "[OK] Trainer restarted (seated=${SEATED:-0} live=${LIVE_TABLES:-0})"
+else
+  # Sitting/live tables keep the old process and :19037. New code is on disk
+  # only until the fleet is empty — not an in-process hot-swap.
+  printf '%s\n' "$STAGED_BUILD" > "$DST/data/reload_requested"
+  chown pokereye:pokereye "$DST/data/reload_requested" >/dev/null 2>&1 || true
+  if [[ -x "$DST/vps/deferred_reload.sh" ]]; then
+    systemd-run --unit=pokereye-deferred-reload \
+      --description="PokerEye deferred trainer reload" \
+      --working-directory="$DST" \
+      --property=Environment=POKEREYE_ROOT="$DST" \
+      "$DST/vps/deferred_reload.sh" >/dev/null \
+      || nohup "$DST/vps/deferred_reload.sh" >>"$DST/logs/deferred_reload.log" 2>&1 &
+  fi
+  pid="$(systemctl show -p MainPID --value pokereye.service 2>/dev/null || true)"
+  if [[ -n "${pid:-}" && "$pid" != "0" ]]; then
+    kill -USR1 "$pid" >/dev/null 2>&1 || true
+  fi
+  echo "[HOLD] Trainer not restarted (seated=${SEATED:-?} live=${LIVE_TABLES:-?} live_build=${LIVE_BUILD:-unknown}). Staged ${STAGED_BUILD}. Applies when last table stands up. Force: POKEREYE_FORCE_RESTART=1"
+fi
 sleep 1
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
@@ -105,6 +223,8 @@ with urllib.request.urlopen(url, timeout=4) as r:
 if data.get("web") != "console-nuxt-v6":
     raise SystemExit(f"[ERROR] wrong web runtime after restart: {data!r}")
 print("[OK] Web runtime: console-nuxt-v6")
+if data.get("reload_pending"):
+    print("[HOLD] trainer live %s staged %s" % (data.get("build") or "", data.get("staged_build") or ""))
 PY
 
 echo

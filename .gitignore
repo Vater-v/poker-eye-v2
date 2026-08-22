@@ -23,6 +23,9 @@ captures/
 logs/
 *.pcap
 *.pcapng
+tests/fixtures/last25/
+NUL
+nul
 _bridge_src/
 /apktool.jar
 /build_apk.ps1

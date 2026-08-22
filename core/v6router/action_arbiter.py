@@ -82,8 +82,8 @@ class ActionArbiterConfig:
         return cls(
             inter_action_gap_min=number("POKER_ACTION_GAP_MIN_SECONDS", 0.45),
             inter_action_gap_max=number("POKER_ACTION_GAP_MAX_SECONDS", 0.80),
-            cross_table_gap_min=number("POKER_CROSS_TABLE_GAP_MIN_SECONDS", 1.60),
-            cross_table_gap_max=number("POKER_CROSS_TABLE_GAP_MAX_SECONDS", 2.30),
+            cross_table_gap_min=number("POKER_CROSS_TABLE_GAP_MIN_SECONDS", 0.55),
+            cross_table_gap_max=number("POKER_CROSS_TABLE_GAP_MAX_SECONDS", 0.90),
             deadline_safety_margin=number(
                 "POKER_ACTION_DEADLINE_SAFETY_MARGIN_SECONDS", 0.55
             ),
@@ -105,6 +105,7 @@ class ActionOffer:
     pot_bb: float = 0.0
     supports_delayed_send: bool = True
     retry: bool = False
+    bypass_gap: bool = False
 
     def __post_init__(self) -> None:
         if not self.action_id:
@@ -135,6 +136,7 @@ class ActionRecord:
     pot_bb: float
     supports_delayed_send: bool
     retry: bool
+    bypass_gap: bool
     fifo_sequence: int
     first_seen_at: float
     state: ActionState = ActionState.QUEUED
@@ -260,7 +262,13 @@ class ActionArbiter:
                     # websocket.  Preserve all samples/FIFO position and never extend
                     # its deadline; only tighten it when newer evidence is safer.
                     existing.supports_delayed_send = bool(offer.supports_delayed_send)
+                    existing.bypass_gap = bool(existing.bypass_gap or offer.bypass_gap)
                     existing.pot_bb = max(existing.pot_bb, float(offer.pot_bb))
+                    existing.ready_at = min(existing.ready_at, float(offer.ready_at))
+                    # extraTimer / failsafe / prefold: a future HOST_DELAY_PLANNED
+                    # must not keep the send at 0/0 attempts until Coin sits out.
+                    if existing.bypass_gap and existing.scheduled_at is not None:
+                        existing.scheduled_at = None
                     if offer.deadline_at is not None:
                         existing.deadline_at = (
                             float(offer.deadline_at)
@@ -284,6 +292,7 @@ class ActionArbiter:
                 pot_bb=max(0.0, float(offer.pot_bb)),
                 supports_delayed_send=bool(offer.supports_delayed_send),
                 retry=bool(offer.retry),
+                bypass_gap=bool(offer.bypass_gap),
                 fifo_sequence=self._sequence,
                 first_seen_at=now,
             )
@@ -377,26 +386,150 @@ class ActionArbiter:
             if not queued:
                 return None
 
-            # Do not jump over the global EDF head just because this dummy belongs
-            # to another websocket.  The head remains the next device-wide action.
-            record = queued[0]
-            if eligible is not None and record.action_id not in eligible:
-                return None
+            # A dummy on table B must still be allowed to carry B's failsafe
+            # when the EDF head is an ineligible table-A action. Blocking the
+            # head used to burn Coin's clock, then DEADLINE_EXPIRED dropped
+            # the CHECK/FOLD that should have been sent.
+            # A host-planned future CHECK (Eye delay 4.5s) also must not block
+            # another table that can send now — that wait is how we fall into
+            # extraTimer with 0/0 attempts and Coin sit-out.
+            for record in queued:
+                if eligible is not None and record.action_id not in eligible:
+                    continue
+                if record.scheduled_at is not None and record.scheduled_at > current:
+                    if record.bypass_gap:
+                        record.scheduled_at = None
+                    else:
+                        continue
 
-            # Host-held humanisation is planned once.  Repeated dummies/reconnects
-            # must neither re-roll nor slide a deep-pot target forward forever.
-            if record.scheduled_at is not None:
-                planned = record.scheduled_at
-                if planned > current:
-                    return None
-                scheduled = current
+                if record.scheduled_at is not None:
+                    scheduled = current
+                    safe_deadline = (
+                        None if record.deadline_at is None
+                        else record.deadline_at - self.config.deadline_safety_margin
+                    )
+                    reasons = tuple(
+                        reason for reason in record.reasons if reason == HUMANIZE_CLAMPED
+                    )
+                    record.state = ActionState.DISPATCHED
+                    record.scheduled_at = scheduled
+                    record.dispatched_at = current
+                    self._last_scheduled_at = scheduled
+                    self._last_scheduled_table_id = int(record.table_id)
+                    self._emit(record, current, "DISPATCHED", {
+                        "scheduled_at": scheduled,
+                        "delay_seconds": 0.0,
+                        "safe_deadline_at": safe_deadline,
+                        "sampled_gap_seconds": record.sampled_gap_seconds,
+                        "sampled_deep_pot_delay_seconds": record.sampled_deep_pot_delay_seconds,
+                        "reasons": reasons,
+                    })
+                    return DispatchPlan(
+                        action_id=record.action_id,
+                        table_id=record.table_id,
+                        scheduled_at=scheduled,
+                        dispatch_delay_seconds=0.0,
+                        safe_deadline_at=safe_deadline,
+                        sampled_gap_seconds=record.sampled_gap_seconds,
+                        sampled_deep_pot_delay_seconds=record.sampled_deep_pot_delay_seconds,
+                        reasons=reasons,
+                        retry=record.retry,
+                    )
+
+                baseline = max(current, record.ready_at)
+                if record.bypass_gap:
+                    gap_floor = baseline
+                    if record.sampled_gap_seconds is None:
+                        record.sampled_gap_seconds = 0.0
+                elif self._last_scheduled_at is None:
+                    gap_floor = baseline
+                else:
+                    if record.sampled_gap_seconds is None:
+                        gap_min, gap_max, cross_table = self._gap_range(record.table_id)
+                        record.sampled_gap_seconds = float(self._rng.uniform(
+                            gap_min, gap_max,
+                        ))
+                        self._emit(record, current, "GAP_SAMPLED", {
+                            "seconds": record.sampled_gap_seconds,
+                            "cross_table": cross_table,
+                            "previous_table_id": self._last_scheduled_table_id,
+                        })
+                    gap_floor = max(
+                        baseline,
+                        self._last_scheduled_at + record.sampled_gap_seconds,
+                    )
+
+                if record.bypass_gap:
+                    record.deep_pot_evaluated = True
+                    record.sampled_deep_pot_delay_seconds = 0.0
+                if not record.deep_pot_evaluated:
+                    record.deep_pot_evaluated = True
+                    idle_deep_pot = (
+                        len(queued) == 1
+                        and record.pot_bb > self.config.deep_pot_threshold_bb
+                    )
+                    if idle_deep_pot:
+                        record.deep_pot_selected = (
+                            float(self._rng.random()) < self.config.deep_pot_probability
+                        )
+                        if record.deep_pot_selected:
+                            record.sampled_deep_pot_delay_seconds = float(
+                                self._rng.uniform(
+                                    self.config.deep_pot_delay_min,
+                                    self.config.deep_pot_delay_max,
+                                )
+                            )
+                            self._emit(record, current, "DEEP_POT_DELAY_SAMPLED", {
+                                "seconds": record.sampled_deep_pot_delay_seconds,
+                                "pot_bb": record.pot_bb,
+                            })
+
+                desired = gap_floor + float(record.sampled_deep_pot_delay_seconds or 0.0)
                 safe_deadline = (
-                    None if record.deadline_at is None
+                    None
+                    if record.deadline_at is None
                     else record.deadline_at - self.config.deadline_safety_margin
                 )
-                reasons = tuple(
-                    reason for reason in record.reasons if reason == HUMANIZE_CLAMPED
-                )
+                reasons: list[str] = []
+                scheduled = desired
+                if safe_deadline is not None and desired > safe_deadline:
+                    serial_floor = baseline
+                    if self._last_scheduled_at is not None:
+                        serial_floor = max(
+                            serial_floor,
+                            math.nextafter(self._last_scheduled_at, math.inf),
+                        )
+                    if serial_floor > safe_deadline:
+                        scheduled = current
+                        reasons.append("DEADLINE_FORCE")
+                        if "DEADLINE_FORCE" not in record.reasons:
+                            record.reasons.append("DEADLINE_FORCE")
+                        self._emit(record, current, "DEADLINE_FORCE", {
+                            "desired_at": desired,
+                            "safe_deadline_at": safe_deadline,
+                            "scheduled_at": scheduled,
+                        })
+                    else:
+                        scheduled = safe_deadline
+                        reasons.append(HUMANIZE_CLAMPED)
+                        if HUMANIZE_CLAMPED not in record.reasons:
+                            record.reasons.append(HUMANIZE_CLAMPED)
+                        self._emit(record, current, HUMANIZE_CLAMPED, {
+                            "desired_at": desired,
+                            "scheduled_at": scheduled,
+                            "safe_deadline_at": safe_deadline,
+                            "sampled_gap_seconds": record.sampled_gap_seconds,
+                            "sampled_deep_pot_delay_seconds": record.sampled_deep_pot_delay_seconds,
+                        })
+
+                if not record.supports_delayed_send and scheduled > current:
+                    record.scheduled_at = scheduled
+                    self._emit(record, current, "HOST_DELAY_PLANNED", {
+                        "scheduled_at": scheduled,
+                        "safe_deadline_at": safe_deadline,
+                    })
+                    continue
+
                 record.state = ActionState.DISPATCHED
                 record.scheduled_at = scheduled
                 record.dispatched_at = current
@@ -404,143 +537,24 @@ class ActionArbiter:
                 self._last_scheduled_table_id = int(record.table_id)
                 self._emit(record, current, "DISPATCHED", {
                     "scheduled_at": scheduled,
-                    "delay_seconds": 0.0,
+                    "delay_seconds": max(0.0, scheduled - current),
                     "safe_deadline_at": safe_deadline,
                     "sampled_gap_seconds": record.sampled_gap_seconds,
                     "sampled_deep_pot_delay_seconds": record.sampled_deep_pot_delay_seconds,
-                    "reasons": reasons,
+                    "reasons": tuple(reasons),
                 })
                 return DispatchPlan(
                     action_id=record.action_id,
                     table_id=record.table_id,
                     scheduled_at=scheduled,
-                    dispatch_delay_seconds=0.0,
+                    dispatch_delay_seconds=max(0.0, scheduled - current),
                     safe_deadline_at=safe_deadline,
                     sampled_gap_seconds=record.sampled_gap_seconds,
                     sampled_deep_pot_delay_seconds=record.sampled_deep_pot_delay_seconds,
-                    reasons=reasons,
+                    reasons=tuple(reasons),
                     retry=record.retry,
                 )
-
-            baseline = max(current, record.ready_at)
-            if self._last_scheduled_at is None:
-                gap_floor = baseline
-            else:
-                if record.sampled_gap_seconds is None:
-                    gap_min, gap_max, cross_table = self._gap_range(record.table_id)
-                    record.sampled_gap_seconds = float(self._rng.uniform(
-                        gap_min, gap_max,
-                    ))
-                    self._emit(record, current, "GAP_SAMPLED", {
-                        "seconds": record.sampled_gap_seconds,
-                        "cross_table": cross_table,
-                        "previous_table_id": self._last_scheduled_table_id,
-                    })
-                gap_floor = max(
-                    baseline,
-                    self._last_scheduled_at + record.sampled_gap_seconds,
-                )
-
-            # "No load" means no other ready *or future pending* action anywhere on
-            # this device at the moment of evaluation.
-            if not record.deep_pot_evaluated:
-                record.deep_pot_evaluated = True
-                idle_deep_pot = (
-                    len(queued) == 1
-                    and record.pot_bb > self.config.deep_pot_threshold_bb
-                )
-                if idle_deep_pot:
-                    record.deep_pot_selected = (
-                        float(self._rng.random()) < self.config.deep_pot_probability
-                    )
-                    if record.deep_pot_selected:
-                        record.sampled_deep_pot_delay_seconds = float(
-                            self._rng.uniform(
-                                self.config.deep_pot_delay_min,
-                                self.config.deep_pot_delay_max,
-                            )
-                        )
-                        self._emit(record, current, "DEEP_POT_DELAY_SAMPLED", {
-                            "seconds": record.sampled_deep_pot_delay_seconds,
-                            "pot_bb": record.pot_bb,
-                        })
-
-            desired = gap_floor + float(record.sampled_deep_pot_delay_seconds or 0.0)
-            safe_deadline = (
-                None
-                if record.deadline_at is None
-                else record.deadline_at - self.config.deadline_safety_margin
-            )
-            reasons: list[str] = []
-            scheduled = desired
-            if safe_deadline is not None and desired > safe_deadline:
-                # Preserve device-wide ordering but allow all artificial delay to
-                # shrink.  A tiny nextafter keeps two callbacks from sharing an
-                # identical floating-point timestamp after a complete gap clamp.
-                serial_floor = baseline
-                if self._last_scheduled_at is not None:
-                    serial_floor = max(
-                        serial_floor,
-                        math.nextafter(self._last_scheduled_at, math.inf),
-                    )
-                if serial_floor > safe_deadline:
-                    record.state = ActionState.CANCELLED
-                    record.cancelled_at = current
-                    record.cancellation_reason = "DEADLINE_EXPIRED"
-                    self._emit(record, current, HUMANIZE_CLAMPED, {
-                        "desired_at": desired,
-                        "safe_deadline_at": safe_deadline,
-                        "dispatch_impossible": True,
-                    })
-                    self._emit(record, current, "DEADLINE_EXPIRED", {
-                        "cancelled": True,
-                        "safe_deadline_at": safe_deadline,
-                    })
-                    return self.dispatch_next(eligible, now=current)
-                scheduled = safe_deadline
-                reasons.append(HUMANIZE_CLAMPED)
-                if HUMANIZE_CLAMPED not in record.reasons:
-                    record.reasons.append(HUMANIZE_CLAMPED)
-                self._emit(record, current, HUMANIZE_CLAMPED, {
-                    "desired_at": desired,
-                    "scheduled_at": scheduled,
-                    "safe_deadline_at": safe_deadline,
-                    "sampled_gap_seconds": record.sampled_gap_seconds,
-                    "sampled_deep_pot_delay_seconds": record.sampled_deep_pot_delay_seconds,
-                })
-
-            if not record.supports_delayed_send and scheduled > current:
-                record.scheduled_at = scheduled
-                self._emit(record, current, "HOST_DELAY_PLANNED", {
-                    "scheduled_at": scheduled,
-                    "safe_deadline_at": safe_deadline,
-                })
-                return None
-
-            record.state = ActionState.DISPATCHED
-            record.scheduled_at = scheduled
-            record.dispatched_at = current
-            self._last_scheduled_at = scheduled
-            self._last_scheduled_table_id = int(record.table_id)
-            self._emit(record, current, "DISPATCHED", {
-                "scheduled_at": scheduled,
-                "delay_seconds": max(0.0, scheduled - current),
-                "safe_deadline_at": safe_deadline,
-                "sampled_gap_seconds": record.sampled_gap_seconds,
-                "sampled_deep_pot_delay_seconds": record.sampled_deep_pot_delay_seconds,
-                "reasons": tuple(reasons),
-            })
-            return DispatchPlan(
-                action_id=record.action_id,
-                table_id=record.table_id,
-                scheduled_at=scheduled,
-                dispatch_delay_seconds=max(0.0, scheduled - current),
-                safe_deadline_at=safe_deadline,
-                sampled_gap_seconds=record.sampled_gap_seconds,
-                sampled_deep_pot_delay_seconds=record.sampled_deep_pot_delay_seconds,
-                reasons=tuple(reasons),
-                retry=record.retry,
-            )
+            return None
 
     @staticmethod
     def _edf_key(record: ActionRecord) -> tuple[float, int]:
@@ -548,19 +562,9 @@ class ActionArbiter:
         return deadline, record.fifo_sequence
 
     def _cancel_expired_locked(self, now: float) -> None:
-        for record in self._records.values():
-            if record.state != ActionState.QUEUED or record.deadline_at is None:
-                continue
-            safe_deadline = record.deadline_at - self.config.deadline_safety_margin
-            if now <= safe_deadline:
-                continue
-            record.state = ActionState.CANCELLED
-            record.cancelled_at = now
-            record.cancellation_reason = "DEADLINE_EXPIRED"
-            self._emit(record, now, "DEADLINE_EXPIRED", {
-                "cancelled": True,
-                "safe_deadline_at": safe_deadline,
-            })
+        # Never drop a queued send because Coin's clock is already tight.
+        # dispatch_next force-sends instead of DEADLINE_EXPIRED cancel.
+        return
 
     def _emit(
         self,

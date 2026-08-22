@@ -113,9 +113,13 @@ class CoinAutoplayCoordinator:
                 'text':False,
                 'channel_id':event.get('_channel_id'),
             }
-        if cmd in ('game.game_init','game.reset_data','game.pre_hand_start_info') and room is not None:
+        if cmd in (
+            'game.game_init','game.reset_data','game.pre_hand_start_info','game.dealer_cards',
+        ) and room is not None:
             # A Coin betAmount is street-local.  Never carry the hero's previous
             # hand/river contribution into the next preflop action projection.
+            # dealer_cards is a new street: BB option CHECK then flop first-to-act
+            # CHECK can share callAmount=0/options and must not look like extraTimer.
             self.reset_street(room)
             self._reset_turn_identity(room)
             self.pending_options_by_room.pop(room,None)
@@ -152,6 +156,27 @@ class CoinAutoplayCoordinator:
                     # code and the stored turn must see the same legal-action set.
                     data['userTurnOptions']=dict(options)
                     event['_hmuriy_options_from_advance']=True
+            stored_turn=self.turn_by_room.get(room) or {}
+            timer_name=str(data.get('timerName') or '').lower()
+            extra_refresh=(
+                'extra' in timer_name
+                or (
+                    bool(stored_turn)
+                    and not (data.get('userTurnOptions') or {})
+                    and bool(data.get('extraTimerEnabled') or stored_turn.get('extraTimerEnabled'))
+                )
+            )
+            if (
+                stored_turn
+                and whose and hero and whose.casefold()==hero.casefold()
+                and (extra_refresh or not (data.get('userTurnOptions') or {}))
+            ):
+                prev_opts=stored_turn.get('userTurnOptions') or {}
+                if prev_opts and not (data.get('userTurnOptions') or {}):
+                    data['userTurnOptions']=dict(prev_opts)
+                for key in ('callAmount','roundMaxBet','totalPot','valueAmount','potRaiseValue'):
+                    if data.get(key) in (None,'') and stored_turn.get(key) not in (None,''):
+                        data[key]=stored_turn.get(key)
             semantic=self._semantic_turn(data)
             with self.lock:
                 previous_owner=str(self.last_turn_owner_by_room.get(room) or '')
@@ -162,13 +187,29 @@ class CoinAutoplayCoordinator:
                     and previous_semantic==semantic
                     and room in self.turn_by_room
                 )
-                if duplicate:
+                if (
+                    not duplicate
+                    and extra_refresh
+                    and whose and hero and whose.casefold()==hero.casefold()
+                    and previous_owner==hero
+                    and room in self.turn_by_room
+                ):
+                    duplicate=True
+                already=str(event.get('_hmuriy_turn_id') or '')
+                if already and not event.get('_hmuriy_duplicate_turn'):
+                    # Same event dict already uniquely stamped on the hook path.
+                    # Re-observe from a hint must not become extraTimer of the
+                    # previous unique turn.
+                    turn_id=already
+                    duplicate=False
+                elif duplicate:
                     # Same legal/monetary decision, only the timer refreshed. Keep
                     # the original turn id/deadline/action alive and skip re-hinting.
                     event['_hmuriy_duplicate_turn']=True
                     event['_hmuriy_turn_refresh']=str(data.get('timerName') or 'timer-refresh')
                     existing=self.turn_by_room.get(room) or {}
-                    turn_id=str(existing.get('_turn_id') or self._turn_id(data))
+                    turn_id=str(existing.get('_turn_id') or already or self._turn_id(data))
+                    event['_hmuriy_turn_id']=turn_id
                     # A process/channel reconnect may replay the same semantic turn.
                     # Keep decision identity/deadline but refresh where the actual
                     # RealWebSocket currently lives.
@@ -176,15 +217,27 @@ class CoinAutoplayCoordinator:
                     existing['_url']=event.get('url') or existing.get('_url')
                     existing['_channel_id']=event.get('_channel_id') or existing.get('_channel_id')
                     existing['_ws_u32']=event.get('_ws_u32', existing.get('_ws_u32'))
+                    if data.get('extraTimerEnabled') is not None:
+                        existing['extraTimerEnabled']=data.get('extraTimerEnabled')
+                    for key in ('extraTurnTime','extraTimePreflop','timerName','turnTime'):
+                        if data.get(key) is not None:
+                            existing[key]=data.get(key)
                 else:
                     generation=int(self.turn_generation_by_room.get(room,0))+1
                     self.turn_generation_by_room[room]=generation
                     turn_id=f'semantic:{room}:{generation}:{semantic[:16]}'
+                    event['_hmuriy_turn_id']=turn_id
 
                 pending=self.pending
                 if pending and int(pending.get('room') or -1)==room:
                     pending_turn=str(pending.get('turn_id') or '')
-                    if (whose and whose!=hero) or (
+                    keep_extra=(
+                        extra_refresh
+                        and whose and hero and whose.casefold()==hero.casefold()
+                    )
+                    if keep_extra:
+                        pass
+                    elif (whose and whose!=hero) or (
                             not duplicate and pending_turn and pending_turn!=turn_id):
                         rid=state.get('_pending_finish_hint')
                         self.pending=None
@@ -260,19 +313,25 @@ class CoinAutoplayCoordinator:
         except (TypeError,ValueError):turn_seconds=0.0
         try:observed=float(turn.get('_observed_monotonic') or now)
         except (TypeError,ValueError):observed=now
-        if turn_seconds>0:
-            turn_deadline_at=observed+turn_seconds
-            remaining_ms=max(0,int(round((observed+turn_seconds-now)*1000.0))-self.turn_deadline_margin_ms)
-            delay_ms=min(requested_delay_ms,remaining_ms)
-        else:
-            turn_deadline_at=None
-            remaining_ms=None
-            delay_ms=requested_delay_ms
         ws_id=turn.get('_ws_id'); url=turn.get('_url'); channel_id=turn.get('_channel_id')
         turn_options=turn.get('userTurnOptions') or {}
         action=resolve_eye_cc_action(cc,user_turn_options=turn_options,
                                      current_street_bet=float(self.hero_bet_by_room.get(room,0.0)),
                                      chip_scale=self.chip_scale)
+        # ExtraTimer is already a miss. Never spend 4-6s of Eye delay on CHECK/FOLD
+        # so the send lands after Coin's main clock and the hero sits out.
+        if action.name in {'CHECK','FOLD'}:
+            requested_delay_ms=min(requested_delay_ms, 800)
+        if turn_seconds>0:
+            turn_deadline_at=observed+turn_seconds
+            remaining_ms=max(0,int(round((observed+turn_seconds-now)*1000.0))-self.turn_deadline_margin_ms)
+            delay_ms=min(requested_delay_ms,remaining_ms)
+            if remaining_ms<1500:
+                delay_ms=0
+        else:
+            turn_deadline_at=None
+            remaining_ms=None
+            delay_ms=requested_delay_ms
         display_amount=None
         if action.name=='CALL':
             call_opt=turn_options.get('4') if '4' in turn_options else turn_options.get(4)
@@ -294,28 +353,62 @@ class CoinAutoplayCoordinator:
         deadline_note='' if delay_ms==requested_delay_ms else f' cappedFrom={requested_delay_ms}ms by Coin turn deadline'
         return f'scheduled {action.name} room={room} betAmount={action.bet_amount} delay={delay_ms}ms{deadline_note} ws={ws_id}'
 
-    def schedule_failsafe(self,state:Dict[str,Any],*,reason:str="NO_CC")->dict[str,Any]:
+    def force_pending_now(self) -> Optional[dict[str,Any]]:
+        """ExtraTimer: send the in-flight Eye/failsafe action on the next dummy."""
+        now=time.monotonic()
+        with self.lock:
+            pending=self.pending
+            if not pending:
+                return None
+            pending['due']=now
+            pending['delay_ms']=0
+            pending['_arbiter_ready_at']=now
+            pending['extra_urgent']=True
+            return dict(pending)
+
+    def schedule_failsafe(
+        self,
+        state:Dict[str,Any],
+        *,
+        reason:str="NO_CC",
+        turn_id:Optional[str]=None,
+        turn:Optional[dict]=None,
+    )->dict[str,Any]:
         """Queue a non-strategic timeout safety action for the current hero turn.
 
         Policy is intentionally narrow: CHECK when Coin exposes a free check;
         otherwise FOLD when Coin exposes fold.  No paid CALL/RAISE decision is
         invented without PokerEYE.
+
+        ``turn`` / ``turn_id`` bind the action to the Coin decision being
+        processed.  ``turn_by_room`` may already hold a later unique turn
+        observed on the hook path while the protocol worker is still finishing
+        the previous one.
         """
         active=state.get('_hook_room')
-        turn=None
+        stored=None
         room=None
         if active is not None:
             room=int(active)
-            turn=self.turn_by_room.get(room) or {}
+            stored=self.turn_by_room.get(room) or {}
         elif self.turn_by_room:
-            room,turn=max(
+            room,stored=max(
                 self.turn_by_room.items(),
                 key=lambda kv: float(kv[1].get('_observed_monotonic') or 0.0),
             )
         if room is None:
             raise RuntimeError("no Coin hero game.user_turn available for failsafe")
-        if not isinstance(turn, dict):
-            turn={}
+        if not isinstance(stored, dict):
+            stored={}
+        if isinstance(turn, dict) and turn:
+            merged=dict(stored)
+            merged.update(turn)
+            for key in ('_ws_id','_url','_channel_id','_ws_u32','_observed_monotonic','_turn_id'):
+                if not merged.get(key) and stored.get(key) is not None:
+                    merged[key]=stored[key]
+            turn=merged
+        else:
+            turn=stored
         ws=self.ws_by_room.get(int(room), {})
         turn.setdefault('_ws_id', ws.get('ws_id'))
         turn.setdefault('_url', ws.get('url'))
@@ -343,7 +436,7 @@ class CoinAutoplayCoordinator:
             if turn_deadline_at is not None else None
         )
         raw=build_game_user_action_packet(room,coin_code,0.0)
-        turn_id=str(turn.get('_turn_id') or self._turn_id(turn))
+        turn_id=str(turn_id or turn.get('_turn_id') or self._turn_id(turn))
         with self.lock:
             self.pending={
                 'due':now,

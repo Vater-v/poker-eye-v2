@@ -5,7 +5,11 @@ import argparse, asyncio, base64, collections, json, os, re, struct, time
 from typing import Any, Optional
 
 from . import coin_ppp_bridge as core
-from .coin_action_wire import build_game_user_action_packet, decode_packet
+from .coin_action_wire import (
+    build_game_user_action_packet,
+    decode_packet,
+    sitout_map_latched,
+)
 from .coin_autoplay import CoinAutoplayCoordinator
 from .bombpot_support import BombpotTracker
 
@@ -28,11 +32,20 @@ def log(tag: str, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
 
 
-def format_action_hint(action: Any, amount: Any = None, delay_ms: Any = 0) -> str:
-    """Operator/HUD line shown BEFORE the Coin send: ACTION amount delay_ms."""
+def format_action_hint(action: Any, amount: Any = None, delay_ms: Any = 0, *, source: str = "") -> str:
+    """Operator/HUD line shown BEFORE the Coin send.
+
+    Eye actions keep ``RAISE 9.37 6024``. Prefold/failsafe are labels, not
+    ``FOLD 0.0 0``.
+    """
     name = str(action or "FOLD").strip().upper() or "FOLD"
     if name.endswith(" ACK"):
         name = name[:-4].strip() or "FOLD"
+    src = str(source or "").strip().lower()
+    if src in {"prefold"} or name == "PREFOLD":
+        return "PREFOLD"
+    if src in {"failsafe", "fallback"} or name == "FALLBACK":
+        return "FALLBACK"
     try:
         amt = float(amount if amount is not None else 0.0)
     except (TypeError, ValueError):
@@ -120,20 +133,23 @@ def hud_action(
     leave: bool = False,
     source: str = "cc",
 ) -> dict[str, Any]:
-    text = format_action_hint(action, amount, delay_ms)
     try:
         delay = max(0, int(round(float(delay_ms or 0))))
     except (TypeError, ValueError):
         delay = 0
     src = str(source or "cc").strip().lower() or "cc"
     name = str(action or "FOLD").strip().upper() or "FOLD"
-    if src == "prefold" and name == "FOLD":
+    if src == "prefold" or name == "PREFOLD":
         name = "PREFOLD"
-        text = format_action_hint("PREFOLD", amount, delay_ms)
+        src = "prefold"
+    elif src in {"failsafe", "fallback"} or name == "FALLBACK":
+        name = "FALLBACK"
+        src = "failsafe"
+    text = format_action_hint(name, amount, delay, source=src)
     tone = "red" if leave else ("red" if delay == 0 and src != "cc" else "green")
     return {
         "text": text,
-        "sticky": bool(sticky),
+        "sticky": False if not leave else bool(sticky),
         "leave": bool(leave),
         "tone": tone,
         "action": name,
@@ -315,6 +331,8 @@ class LiveCoinBridge:
         self.mid_hand_wait_notified=set()
         self.protocol_queue=asyncio.Queue(); self.protocol_task=None
         self.emitted_primary_stages=set(); self.emitted_second_boards=set()
+        self._street_hand_id=""
+        self._cc_deadline=0.0
         self.pending_actor_seat=None
         self.manual_action_event=asyncio.Event(); self.event_count=0; self.inject_count=0; self.cc_count=0; self.heartbeat_count=0
         self.state_error_count=0; self.protocol_error_count=0
@@ -324,14 +342,21 @@ class LiveCoinBridge:
         # extraTimer refresh from spawning a second independent decision.
         self.action_retry_delay=max(0.5,float(os.getenv("POKER_ACTION_RETRY_DELAY_SECONDS","1.0")))
         self.action_max_attempts=max(1,int(os.getenv("POKER_ACTION_MAX_ATTEMPTS","3")))
-        self.cc_timeout_seconds=max(2.0,float(os.getenv("POKER_CC_TIMEOUT_SECONDS","7.0")))
+        self.cc_timeout_seconds=max(2.0,float(os.getenv("POKER_CC_TIMEOUT_SECONDS","8.0")))
         self.cc_fallback_margin_seconds=max(1.0,float(os.getenv("POKER_CC_FALLBACK_MARGIN_SECONDS","2.0")))
         # Router/session replay and simultaneous WebSocket channels can deliver a
         # hero turn a few milliseconds before its seed/card frames are visible to
         # the bridge model.  Give the raw-event cache one bounded grace window.
         self.mid_hand_recovery_grace=max(0.0,float(os.getenv("POKER_MID_HAND_RECOVERY_GRACE_SECONDS","2.0")))
         self.mid_hand_recovery_attempts=max(1,min(8,int(os.getenv("POKER_MID_HAND_RECOVERY_ATTEMPTS","4"))))
+        # Observer/hint Eye connect is bounded so a dead backend cannot stall the
+        # protocol worker past the Coin clock. Failsafe still fires; standup is
+        # unchanged.
+        self.eye_connect_timeout=max(0.5,float(os.getenv("POKER_EYE_CONNECT_TIMEOUT_SECONDS","2.5")))
+        self._observer_eye_failed_until=0.0
+        self._eye_send_deadline=None
         self.awaiting_cc=False
+        self._cc_abort=None
         self.last_eye_rx=time.monotonic(); self.last_hook_rx=time.monotonic()
         self._prefold_config=None
         self._prefold_config_loaded=False
@@ -340,6 +365,12 @@ class LiveCoinBridge:
         self._hero_turn_this_hand=False
         self.cc_failsafe_standup=False
         self.hero_sitting_out=False
+        self._clock_missed_this_orbit=False
+        self._missed_deals=0
+        self._sit_in_wanted=False
+        self._broken_replay_attempts={}
+        self._broken_replay_in_progress=False
+        self._last_hero_hint=( {}, None, b"" )
 
     def _hero_identity(self) -> tuple[int, str]:
         try:hero_id=int(self.state.get("user_id") or self.identity.get("user_id") or 0)
@@ -577,9 +608,22 @@ class LiveCoinBridge:
         self.requested_table_id=max(0,int(requested_table_id or 0))
         self.requested_config_id=max(0,int(requested_config_id or 0))
 
-    async def ensure_eye(self):
+    def _eye_deadline_hit(self, deadline: Optional[float]) -> bool:
+        return deadline is not None and time.monotonic()>=float(deadline)
+
+    async def _sleep_for_eye_retry(self, delay: float, deadline: Optional[float]) -> None:
+        sleep_s=float(delay)
+        if deadline is not None:
+            sleep_s=min(sleep_s, max(0.0, float(deadline)-time.monotonic()))
+        if sleep_s<=0 or self._eye_deadline_hit(deadline):
+            raise TimeoutError("eye connect deadline")
+        await asyncio.sleep(sleep_s)
+
+    async def ensure_eye(self, *, deadline: Optional[float] = None):
         delay=.25
         while True:
+            if self._eye_deadline_hit(deadline):
+                raise TimeoutError("eye connect deadline")
             writer=self.eye_w
             if writer and not writer.is_closing():
                 generation=self.eye_generation
@@ -597,13 +641,17 @@ class LiveCoinBridge:
                             log("EYE",f"connected {self.eye_host}:{self.eye_port} generation={generation}")
                         except Exception as e:
                             log("EYE",f"connect failed: {e}; retry {delay:.2f}s")
-                            await asyncio.sleep(delay); delay=min(3.0,delay*1.7)
+                            await self._sleep_for_eye_retry(delay, deadline)
+                            delay=min(3.0,delay*1.7)
                             continue
             try:
                 await self._ensure_eye_resynced(generation)
             except Exception as e:
                 log("EYE",f"generation={generation} resync failed: {e}")
-                await asyncio.sleep(delay); delay=min(3.0,delay*1.7)
+                if self._eye_deadline_hit(deadline):
+                    raise TimeoutError("eye connect deadline") from e
+                await self._sleep_for_eye_retry(delay, deadline)
+                delay=min(3.0,delay*1.7)
                 continue
             if (generation==self.eye_generation and self.eye_w is writer
                     and writer and not writer.is_closing() and self.eye_ready.is_set()):
@@ -768,7 +816,7 @@ class LiveCoinBridge:
                 self.eye_ready.set()
 
     async def eye_send_outer(self,o:dict, label=""):
-        await self.ensure_eye()
+        await self.ensure_eye(deadline=getattr(self,"_eye_send_deadline",None))
         await self._eye_send_outer_generation(o,label,self.eye_generation)
 
     async def eye_send_cmd(self,cmd:str,body:bytes,location="TABLE",envelope_uid:Optional[int]=None):
@@ -1006,7 +1054,31 @@ class LiveCoinBridge:
         return result
 
     def _decoded_events(self):
-        return core.decode_coin_events(list(self.events))
+        rows=list(self.events)
+        n=len(rows)
+        cache=getattr(self,"_decoded_cache",None)
+        last_id=id(rows[-1]) if rows else None
+        if (
+            isinstance(cache, collections.deque)
+            and last_id is not None
+            and getattr(self,"_decoded_cache_last",None)==last_id
+            and len(cache)==n
+        ):
+            return cache
+        from dataclasses import replace as _dc_replace
+        if isinstance(cache, collections.deque) and rows and last_id!=getattr(self,"_decoded_cache_last",None) and n-len(cache) in (0,1):
+            nxt=core.decode_coin_events(rows[-1:])
+            if nxt:
+                nxt_idx=(int(cache[-1].idx)+1) if cache else 0
+                cache.append(_dc_replace(nxt[0], idx=nxt_idx))
+                while len(cache)>n:
+                    cache.popleft()
+                self._decoded_cache_last=last_id
+                return cache
+        cache=collections.deque(core.decode_coin_events(rows))
+        self._decoded_cache=cache
+        self._decoded_cache_last=last_id
+        return cache
 
     @staticmethod
     def _table_from_data(data:dict) -> int:
@@ -1184,12 +1256,36 @@ class LiveCoinBridge:
                         self.active_hook_room=room
                         if not self.state.get("_operator_seated"):
                             self.state["_operator_seated"]=True
-                            self._diagnostic("seated","hero seated",{"seat":seat,"room":room})
+                            bb=None
+                            profile=self.active_money_profile
+                            if profile is not None:
+                                try:bb=float(profile.coin_big_blind)
+                                except (TypeError,ValueError,AttributeError):bb=None
+                            props=getattr(getattr(self.current_hand or self.context_hand, "room", None),"props",{}) or {}
+                            try:
+                                mini=int(props.get("miniGameTypeId") or props.get("miniGameType") or 0)
+                            except (TypeError,ValueError):
+                                mini=0
+                            label=str(props.get("_gameTypeLabel") or {1:"NLH",2:"PLO",17:"PLO5",20:"PLO6"}.get(mini,"") or "")
+                            if not label or str(label).upper() in {"RING","CASH"}:
+                                label="NLH"
+                            self._diagnostic("seated","hero seated",{
+                                "seat":seat,"room":room,
+                                "nickname":str(self.identity.get("user_name") or self.state.get("user_name") or ""),
+                                "coin_bb":bb,
+                                "game_type":label,
+                            })
         except Exception as e:
             log("CACHE",f"event cache warning: {e}")
 
     def _capture_model(self):
-        model=core.CoinCaptureModel(self._decoded_events())
+        evs=self._decoded_events()
+        last_id=getattr(self,"_decoded_cache_last",None)
+        model=getattr(self,"_capture_model_cache",None)
+        if model is None or getattr(self,"_capture_model_last",None)!=last_id:
+            model=core.CoinCaptureModel(evs)
+            self._capture_model_cache=model
+            self._capture_model_last=last_id
         if self.identity.get("user_id"):
             model.hero_id=int(self.identity["user_id"]); model.hero_name=str(self.identity["user_name"])
         for cid,props in self.room_props_by_config.items():model.room_props_by_config[cid]=dict(props)
@@ -1210,10 +1306,16 @@ class LiveCoinBridge:
         if room is None:
             return
         room=int(room)
+        # Coin lobby frames use r=-1. Claiming that as the table socket ate every
+        # real game.user_turn (room 60521) so the first sit produced 0 actions.
+        if room <= 0:
+            return
         if room in self.closing_rooms:
             return
         if self.active_hook_room is None:
             self.active_hook_room=room
+        if self.state.get("_hook_room") in (None, "", 0, -1):
+            self.state["_hook_room"]=room
         if self.context_active and self.context_hook_room is None:
             self.context_hook_room=room
 
@@ -1273,9 +1375,12 @@ class LiveCoinBridge:
         return self._stamp_game_id_context(h)
 
     async def ensure_observer_context(self):
+        if time.monotonic()<float(getattr(self,"_observer_eye_failed_until",0) or 0):
+            return
         async with self.context_lock:
             try:
-                await self._ensure_observer_context_unlocked()
+                timeout=float(getattr(self,"eye_connect_timeout",2.5) or 2.5)
+                await asyncio.wait_for(self._ensure_observer_context_unlocked(), timeout)
             except core.UnrepresentableMoneyProfile:
                 # A protocol-domain validation failure must never tear down the hook
                 # TCP client. Stay in Coin's room but expose no inconsistent EYE table.
@@ -1285,6 +1390,13 @@ class LiveCoinBridge:
                     self.context_hand=None; self.current_hand=None
                     self.context_table_id=0; self.context_hook_room=None
                     self.lifecycle_phase="lobby"
+                return
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                self._observer_eye_failed_until=time.monotonic()+max(1.0, float(getattr(self,"eye_connect_timeout",2.5) or 2.5))
+                self._diagnostic(
+                    "observer_eye_unavailable",
+                    f"observer context skipped; Eye not reachable: {type(exc).__name__}",
+                )
                 return
 
     async def _ensure_observer_context_unlocked(self):
@@ -1452,16 +1564,46 @@ class LiveCoinBridge:
             flag=hero_row.get("isSittingOut") or hero_row.get("sittingOut") or hero_row.get("sitOut")
             sitout_flag=flag is True or str(flag).lower() in {"true","1"}
             playing=hero_row.get("isPlaying") is True
-            if sitout_flag or (self.hero_sitting and self.wait_blind_cancelled and not playing and not self.current_hand and self.cc_miss_streak>0):
-                if not self.hero_sitting_out:
-                    self._diagnostic("sitout_detected","hero is sitting out of hands",{
-                        "isPlaying":playing,"flag":sitout_flag,"streak":self.cc_miss_streak,
-                    })
-                self.hero_sitting_out=True
-            else:
-                self.hero_sitting_out=False
+            if playing:
+                self._missed_deals=0
+                self._sit_in_wanted=False
+            self._apply_hero_sitout_flags(sitout_flag, playing, source="seat")
         else:
             self.hero_sitting_out=False
+
+    def _note_missed_deal_if_idle(self) -> None:
+        """Between-hands ``isPlaying=false`` is not sit-out.
+
+        Live V7.4.61 inferred sit-out on every orbit (``flag=false``,
+        ``inferred=true``, ``missed_deals=1``) then sat back in. Coin
+        ``game.sitout`` sitOutMap / ``isSittingOut`` is the only latch.
+        """
+        return
+
+    def _apply_hero_sitout_flags(
+        self, sitout_flag: bool, playing: bool, *, source: str = "seat",
+    ) -> None:
+        if playing:
+            self._missed_deals=0
+            self._clock_missed_this_orbit=False
+            self.hero_sitting_out=False
+            self._sit_in_wanted=False
+            return
+        if sitout_flag:
+            if not self.hero_sitting_out:
+                self._diagnostic("sitout_detected","hero is sitting out of hands",{
+                    "isPlaying":playing,"flag":True,"streak":self.cc_miss_streak,
+                    "missed_deals":int(self._missed_deals or 0),"inferred":False,
+                    "source":source,
+                })
+            self.hero_sitting_out=True
+            self._sit_in_wanted=True
+            return
+        if source=="sitout_map":
+            self._missed_deals=0
+            self._clock_missed_this_orbit=False
+            self.hero_sitting_out=False
+            self._sit_in_wanted=False
 
     def _cancel_leave_timeout(self):
         task=self.leave_timeout_task; self.leave_timeout_task=None
@@ -1581,6 +1723,7 @@ class LiveCoinBridge:
         self._bootstrap_hand_accounting(h)
         self.notify_seen.clear()
         self.emitted_primary_stages.clear(); self.emitted_second_boards.clear()
+        self._street_hand_id=str(getattr(h,"hand_id","") or "")
         self.pending_actor_seat=h.ppp_hero_seat
 
     def _bootstrap_hand_accounting(self,h):
@@ -1702,10 +1845,66 @@ class LiveCoinBridge:
         except Exception: pass
         return core.money(next((r.get("userChips",0) for r in h.roster if int(r.get("userId") or 0)==h.hero_id),0),self.scale)
 
+    def defer_pending_exhaustion(self, *, source: str = "extraTimer") -> bool:
+        """Coin extraTimer is a clock refresh, not a NACK. Do not burn retries."""
+        ack=self.pending_action_ack
+        if not ack:
+            return False
+        ack["_refresh_hold"]=True
+        ack["_exhausted_reported"]=False
+        self._diagnostic(
+            "turn_refresh_hold",
+            f"Coin extraTimer/time-bank; ACK wait held ({source})",
+            {"action":str(ack.get("action") or ""),"source":str(source or "")},
+        )
+        return True
+
+    @staticmethod
+    def ack_refresh_blocks_retry(ack: Optional[dict]) -> bool:
+        """True when extraTimer/time-bank is holding the first send's ACK window.
+
+        Hold lasts until Coin ACK (``confirm_pending_action``) or a new unique
+        turn cancels/confirms the pending send. Dummy retries must not pop it.
+        """
+        return bool(isinstance(ack, dict) and ack.get("_refresh_hold"))
+
+    def _note_pending_ack_on_turn(
+        self, event: dict, cmd: str, direction: str, data: dict,
+    ) -> Optional[str]:
+        """Apply extraTimer hold or new-turn ACK before lobby.dummy can retry.
+
+        Observe() sets ``_hmuriy_duplicate_turn`` first. Hold must be latched
+        here, in handle_event, because the protocol worker runs too late.
+        Returns a cancel_reason for opponent-turn-before-due, else None.
+        """
+        ack = self.pending_action_ack
+        if not ack or str(direction or "").lower() != "in" or cmd != "game.user_turn":
+            return None
+        if event.get("_hmuriy_duplicate_turn"):
+            self.defer_pending_exhaustion(source="extraTimer")
+            return None
+        if self._is_hero_turn(data):
+            self.confirm_pending_action(source="new-hero-turn")
+            return None
+        whose = str(data.get("whoseTurn") or "")
+        hero = str(self.state.get("user_name") or "")
+        if whose and whose != hero:
+            if time.monotonic() < float(ack.get("due") or 0):
+                return "turn-advanced-before-due"
+            self.confirm_pending_action(
+                source="turn-advanced", action=str(ack.get("action") or ""),
+            )
+        return None
+
     def report_action_exhausted_if_due(self, now:Optional[float]=None) -> bool:
         ack=self.pending_action_ack
         if not ack:return False
         current=time.monotonic() if now is None else float(now)
+        pending=getattr(self.autoplay,"pending",None)
+        if isinstance(pending,dict) and pending.get("fallback"):
+            return False
+        if ack.get("_refresh_hold"):
+            return False
         if current<float(ack.get("retry_at") or float("inf")):return False
         if int(ack.get("retries") or 0)<max(0,self.action_max_attempts-1):return False
         if ack.get("_exhausted_reported"):return False
@@ -1731,12 +1930,19 @@ class LiveCoinBridge:
             return False
         name=str(action or ack.get("action") or "")
         # Native send is "отправлено". Coin ACK is "выполнено" and drops the hint bar.
+        pending=getattr(self.autoplay,"pending",None) or {}
+        origin="failsafe" if pending.get("fallback") or ack.get("fallback") else (
+            "prefold" if pending.get("prefold") or ack.get("prefold") else str(source or "")
+        )
         self._diagnostic("action_confirmed",f"action confirmed via {source}",{
             "action":name,
             "amount":ack.get("display_amount"),
             "attempt":1+int(ack.get("retries") or 0),
             "token":str(ack.get("token") or ""),
-            "source":str(source or ""),
+            "source":origin,
+            "hand":ack.get("hand") or pending.get("hand"),
+            "position":ack.get("position") or pending.get("position"),
+            "facing":ack.get("facing") or pending.get("facing"),
             "hud":hud_clear(),
         })
         self.pending_action_ack=None
@@ -1759,7 +1965,12 @@ class LiveCoinBridge:
         # from LiveTableSession.action_offers(), because a fully exhausted action
         # no longer creates another arbitration offer.
         self.report_action_exhausted_if_due(now)
-        if ack and now>=float(ack.get("retry_at") or float("inf")) and int(ack.get("retries") or 0)<max(0,self.action_max_attempts-1):
+        if (
+            ack
+            and not self.ack_refresh_blocks_retry(ack)
+            and now>=float(ack.get("retry_at") or float("inf"))
+            and int(ack.get("retries") or 0)<max(0,self.action_max_attempts-1)
+        ):
             same_hand=str(ack.get("hand_id") or "")==str(self.state.get("hand_id") or "")
             native_push=int(event.get("v") or 0)>=6
             same_ws=native_push or (not ack.get("ws_id") or ack.get("ws_id")==event.get("ws_id"))
@@ -1803,11 +2014,22 @@ class LiveCoinBridge:
         cands=[x for x in model.candidate_hands() if core.table_id_from_hand(x[0])==active_tid]
         return model,active_tid,cands
 
-    def _current_hero_turn_id(self) -> str:
+    def _current_hero_turn_id(self, event: Optional[dict] = None) -> str:
+        if isinstance(event, dict):
+            stamped=str(event.get("_hmuriy_turn_id") or "")
+            if stamped:
+                return stamped
         room=self.active_hook_room
         if room is None:return ""
         turn=self.autoplay.turn_by_room.get(int(room)) or {}
         return str(turn.get("_turn_id") or "")
+
+    def _hero_hint_event(self, event: Optional[dict] = None) -> dict:
+        if isinstance(event, dict) and event:
+            return event
+        stored=getattr(self, "_last_hero_hint", ({}, None, b""))
+        first=stored[0] if isinstance(stored, tuple) and stored else {}
+        return first if isinstance(first, dict) else {}
 
     async def _wait_for_cold_seed(self):
         """Allow late seed frames to enter the raw cache before taking a fallback.
@@ -1821,7 +2043,7 @@ class LiveCoinBridge:
         if cands or self.mid_hand_recovery_grace<=0:
             return model,active_tid,cands,"ready",0
         room=self.active_hook_room
-        turn_id=self._current_hero_turn_id()
+        turn_id=self._current_hero_turn_id(self._hero_hint_event())
         attempts=max(1,int(self.mid_hand_recovery_attempts))
         slice_s=float(self.mid_hand_recovery_grace)/float(attempts)
         started=time.monotonic()
@@ -1857,7 +2079,9 @@ class LiveCoinBridge:
         props=getattr(getattr(h,"room",None),"props",{}) or {}
         try:mini=int(props.get("miniGameTypeId") or 0)
         except (TypeError,ValueError):mini=0
-        label=str(props.get("_gameTypeLabel") or {1:"NLH"}.get(mini,"") or props.get("gameType") or "")
+        label=str(props.get("_gameTypeLabel") or {1:"NLH"}.get(mini,"") or "")
+        if not label or str(label).upper() in {"RING","CASH","NL","NLHE"}:
+            label="NLH"
         occupied=[]
         for r in (h.roster or []):
             try: seat=int(r.get("seatId") or 0)
@@ -1881,9 +2105,19 @@ class LiveCoinBridge:
         if has_call and not has_check and facing in {"UNOPENED", "LIMPED"}:
             facing="RAISE"
         cards=tuple(h.cards or ())
-        street="PREFLOP"
-        if any(name in self.emitted_primary_stages for name in ("FLOP","TURN","RIVER")):
-            street="FLOP"
+        hid=getattr(h,"hand_id",None) or self.state.get("hand_id")
+        self._reset_board_street(hid)
+        from .prefold import street_from_board
+        board=0
+        if "RIVER" in self.emitted_primary_stages: board=5
+        elif "TURN" in self.emitted_primary_stages: board=4
+        elif "FLOP" in self.emitted_primary_stages: board=3
+        street=street_from_board(
+            hand_id=hid,
+            board_count=board,
+            emitted_stages=self.emitted_primary_stages,
+            street_hand_id=getattr(self,"_street_hand_id",""),
+        )
         bp=self._bombpot_for(self.active_hook_room).state
         return PrefoldContext(
             dealt_in_players=len(occupied),
@@ -1897,6 +2131,129 @@ class LiveCoinBridge:
             bombpot=bool(bp.is_bombpot_hand),
             straddle=self._live_straddle(h),
         )
+
+    def _reset_board_street(self, hand_id) -> None:
+        """A new deal must not inherit FLOP/TURN/RIVER marks from the previous hand."""
+        hid=str(hand_id or "")
+        if not hid:
+            if self.emitted_primary_stages:
+                self.emitted_primary_stages.clear()
+                self.emitted_second_boards.clear()
+            return
+        if hid==str(getattr(self,"_street_hand_id","") or ""):
+            return
+        self.emitted_primary_stages.clear()
+        self.emitted_second_boards.clear()
+        self._street_hand_id=hid
+
+    def _nonscript_hand_context(self) -> dict:
+        hand=self.current_hand or self.context_hand
+        payload={"hand":None,"position":"","facing":"","street":""}
+        if hand is None:
+            return payload
+        try:
+            context=self._nlh_prefold_context(hand)
+        except Exception:
+            try:
+                from .prefold import canonical_nlh_hand
+                payload["hand"]=canonical_nlh_hand(tuple(getattr(hand,"cards",()) or ()))
+            except Exception:
+                pass
+            return payload
+        payload.update({
+            "hand":getattr(context,"canonical" ,None) or None,
+            "position":str(getattr(context,"position","") or ""),
+            "facing":str(getattr(context,"facing","") or ""),
+            "street":str(getattr(context,"street","") or ""),
+        })
+        try:
+            from .prefold import canonical_nlh_hand
+            payload["hand"]=canonical_nlh_hand(context.hole_cards)
+        except Exception:
+            pass
+        return payload
+
+    def _chart_miss_preflop(self, h=None) -> bool:
+        """True when this is a live preflop turn the chart refused (TT/AJs, not trash)."""
+        hand=h or self.current_hand or self.context_hand
+        if hand is None:
+            return False
+        try:
+            from .prefold import default_nlh_prefold_config, evaluate_prefold
+            config=self._nlh_prefold_config() or default_nlh_prefold_config()
+            decision=evaluate_prefold(config, self._nlh_prefold_context(hand))
+        except Exception:
+            return False
+        code=str(decision.reason_code or "")
+        if code in {"PREFOLD_NO_EXPLICIT_RULE","PREFOLD_FREE_CHECK_BLOCKED"}:
+            return True
+        try:
+            from .prefold import canonical_nlh_hand
+            cards=tuple(getattr(hand,"cards",()) or ())
+            name=canonical_nlh_hand(cards) if len(cards)==2 else ""
+            if len(name)==2 and name[0]==name[1]:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _hero_turn_remaining_seconds(self, turn: Optional[dict]=None) -> float:
+        """Seconds left on the Coin clock, including the extraTimer bank."""
+        room=self.context_hook_room or self.active_hook_room
+        if turn is None and room is not None:
+            turn=self.autoplay.turn_by_room.get(int(room),{}) or {}
+        if not isinstance(turn, dict):
+            return 0.0
+        now=time.monotonic()
+        try:observed=float(turn.get("_observed_monotonic") or 0.0)
+        except (TypeError,ValueError):observed=0.0
+        try:total=float(turn.get("turnTime") or 0.0)
+        except (TypeError,ValueError):total=0.0
+        extra=0.0
+        try:
+            enabled=bool(turn.get("extraTimerEnabled"))
+            timer=str(turn.get("timerName") or "").lower()
+            if enabled or "extra" in timer:
+                extra=float(turn.get("extraTurnTime") or turn.get("extraTimePreflop") or 0.0)
+        except (TypeError,ValueError):
+            extra=0.0
+        if observed<=0:
+            return 0.0
+        return max(0.0, observed+total+extra-now)
+
+    def _failsafe_detail(self, fb: dict, reason: str) -> dict:
+        ctx=self._nonscript_hand_context()
+        pending=self.autoplay.pending
+        if isinstance(pending, dict):
+            pending.update(ctx)
+            pending["fallback"]=True
+        return {
+            "action": fb.get("action"),
+            "attempt": 1,
+            "max_attempts": self.action_max_attempts,
+            "reason": str(reason or ""),
+            "delay_ms": int(fb.get("delay_ms") or 0),
+            "hand": ctx.get("hand"),
+            "position": ctx.get("position"),
+            "facing": ctx.get("facing"),
+            "street": ctx.get("street"),
+            "hud": hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0, source="failsafe"),
+        }
+
+    def extend_cc_wait_for_extra(self, data: Optional[dict]=None) -> None:
+        """Coin extraTimer is more clock for Eye, not an immediate failsafe."""
+        turn=data if isinstance(data, dict) else {}
+        extra=0.0
+        try:
+            extra=float(turn.get("extraTurnTime") or turn.get("extraTimePreflop") or 0.0)
+        except (TypeError,ValueError):
+            extra=0.0
+        if extra<=0:
+            extra=self._hero_turn_remaining_seconds(turn or None)
+        if extra<=0:
+            return
+        bump=min(float(self._cc_wait_timeout()), max(0.75, extra-float(self.cc_fallback_margin_seconds)))
+        self._cc_deadline=max(float(getattr(self,"_cc_deadline",0.0) or 0.0), time.monotonic()+bump)
 
     def _live_straddle(self, h=None) -> bool:
         """True only when this hand posted a straddle seat, not catalog isStraddle:1."""
@@ -1951,7 +2308,7 @@ class LiveCoinBridge:
         self._diagnostic("prefold_intent",f"will PREFOLD {decision.canonical_hand}",{
             "action":"FOLD","hand":decision.canonical_hand,
             "position":getattr(context,"position",""),"facing":getattr(context,"facing",""),
-            "hud":hud_action("FOLD", 0.0, 0),
+            "hud":hud_action("FOLD", 0.0, 0, source="prefold"),
         })
 
     async def _try_nlh_prefold(self,h) -> bool:
@@ -2037,14 +2394,269 @@ class LiveCoinBridge:
                 "max_attempts": self.action_max_attempts,
                 "reason": reason,
                 "delay_ms": int(fb.get("delay_ms") or 0),
-                "hud": hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0),
+                "hud": hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0, source="failsafe"),
             },
         )
         return True
 
+    def abort_cc_wait(self, reason: str = "RECOVERY") -> None:
+        """Unblock an Eye CC wait so CHECK/FOLD can still fire.
+
+        Recovery used to set ``manual_action_event`` and return from the wait
+        as if the hero folded on the device. That dropped the turn with no
+        failsafe while PokerEYE had nothing to answer.
+        """
+        self._cc_abort = str(reason or "RECOVERY")
+        try:
+            self.manual_action_event.set()
+        except Exception:
+            pass
+
+    def _cc_wait_timeout(self) -> float:
+        """Seconds to wait for PokerEYE CC. Table logic may tighten the ceiling."""
+        logic=getattr(self,"table_logic",None)
+        raw=getattr(logic,"cc_timeout_seconds",None) if logic is not None else None
+        if raw is not None:
+            return max(2.0,float(raw))
+        return float(self.cc_timeout_seconds)
+
+    def _eye_status_snapshot(self) -> Any:
+        proxy = getattr(self, "eye_backend", None)
+        snap = getattr(proxy, "backend_status_snapshot", None) if proxy is not None else None
+        if callable(snap):
+            snap = snap()
+        return snap
+
+    def _eye_game_is_broken(self) -> bool:
+        message = str(getattr(self._eye_status_snapshot(), "message", "") or "").upper()
+        return "GAME_IS_BROKEN" in message
+
+    def _broken_replay_hand_id(self) -> str:
+        hid = str(self.state.get("hand_id") or "")
+        if hid:
+            return hid
+        hand = getattr(self, "current_hand", None)
+        return str(getattr(hand, "hand_id", "") or "")
+
+    def _can_replay_broken_hand(self) -> bool:
+        """True when GAME_IS_BROKEN still has a Coin hand we have not replayed."""
+        if getattr(self, "_broken_replay_in_progress", False):
+            return False
+        proxy = getattr(self, "eye_backend", None)
+        if getattr(proxy, "_recovery_in_progress", False) or getattr(proxy, "_closed", False):
+            return False
+        if not self._eye_game_is_broken():
+            return False
+        hid = self._broken_replay_hand_id()
+        if not hid:
+            return False
+        attempts = getattr(self, "_broken_replay_attempts", None) or {}
+        return int(attempts.get(hid, 0) or 0) < 1
+
+    def _abort_reason_for_silent_eye(self) -> str:
+        if self._can_replay_broken_hand():
+            return "GAME_IS_BROKEN"
+        return "EYE_UNAVAILABLE"
+
+    async def replay_broken_eye_hand(
+        self,
+        event: Optional[dict] = None,
+        payload: Any = None,
+        raw: bytes = b"",
+        *,
+        holding_hint_lock: bool = False,
+    ) -> bool:
+        """Finish the poisoned Eye deal and resend the same Coin hand.
+
+        Failsafe is the caller's job when this returns False (no live hand, already
+        replayed, or Eye is in silent-backend recycle rather than GAME_IS_BROKEN).
+
+        ``_wait_cc_and_schedule`` already holds ``hint_lock``. Re-entering
+        ``start_cold_hint`` from there deadlocks the same task, so that path
+        calls ``_start_cold_hint_locked`` instead.
+        """
+        if not self._can_replay_broken_hand():
+            return False
+        hid = self._broken_replay_hand_id()
+        attempts = getattr(self, "_broken_replay_attempts", None)
+        if not isinstance(attempts, dict):
+            attempts = {}
+            self._broken_replay_attempts = attempts
+        attempts[hid] = int(attempts.get(hid, 0) or 0) + 1
+        self._diagnostic(
+            "broken_hand_replay",
+            "GAME_IS_BROKEN; finish then resend same hand",
+            {"hand_id": hid, "attempt": attempts[hid]},
+        )
+        try:
+            await self._close_open_hint("GAME_IS_BROKEN")
+        except Exception as exc:
+            self._diagnostic("finish_hint_error", f"finish before broken-hand replay failed: {exc}")
+        self.cold_hands.discard(hid)
+        stored = getattr(self, "_last_hero_hint", ({}, None, b""))
+        event = event if event is not None else stored[0]
+        payload = payload if payload is not None else stored[1]
+        raw = raw if raw else stored[2]
+        self._broken_replay_in_progress = True
+        try:
+            if holding_hint_lock:
+                await self._start_cold_hint_locked(event or {}, payload, raw or b"")
+            else:
+                await self.start_cold_hint(event or {}, payload, raw or b"")
+        finally:
+            self._broken_replay_in_progress = False
+        return True
+
+    def _eye_socket_dead(self) -> bool:
+        """True when Eye cannot receive a hint. Failsafe without asking is legal here.
+
+        GAME_IS_BROKEN on a live socket is not dead: finish the poisoned deal and
+        resend so Eye has something to answer. Red/ERROR health alone is not dead.
+        """
+        writer = getattr(self, "eye_w", None)
+        if writer is not None and getattr(writer, "is_closing", False):
+            closing = writer.is_closing
+            if callable(closing) and closing():
+                return True
+            if closing is True:
+                return True
+        proxy = getattr(self, "eye_backend", None)
+        if proxy is None:
+            return False
+        if getattr(proxy, "_recovery_in_progress", False) or getattr(proxy, "_closed", False):
+            return True
+        watchdog = getattr(proxy, "_hint_watchdog", None)
+        if getattr(watchdog, "recovery_pending", False):
+            return True
+        status = str(getattr(self._eye_status_snapshot(), "status", "") or "").upper()
+        return status == "RECOVERING"
+
+    def _cc_wait_should_abort(self) -> bool:
+        """Abort the CC wait only when Eye cannot receive, or the deal is poisoned.
+
+        During same-hand replay the poisoned deal is already finished; do not
+        abort the resend wait or the failsafe steals the CC that Eye still owes.
+        """
+        if getattr(self, "_broken_replay_in_progress", False):
+            return False
+        return self._eye_socket_dead() or self._eye_game_is_broken()
+
+    def _eye_cannot_answer(self) -> bool:
+        """True when a hint would be dropped or never answered.
+
+        Failsafe is only for this case after Eye was asked, or the socket is
+        dead so there is nobody to ask. A live backend still gets the hint.
+        During GAME_IS_BROKEN same-hand replay the finish already closed the
+        poisoned deal, so the resend is allowed to wait for CC.
+        """
+        if getattr(self, "_broken_replay_in_progress", False):
+            return False
+        if self._eye_socket_dead():
+            return True
+        snap = self._eye_status_snapshot()
+        status = str(getattr(snap, "status", "") or "").upper()
+        health = str(getattr(snap, "health", "") or "").lower()
+        message = str(getattr(snap, "message", "") or "").upper()
+        if health == "red" or status in {"ERROR", "RECOVERING"}:
+            return True
+        if "GAME_IS_BROKEN" in message:
+            return True
+        return False
+
+    def _eye_writer_live(self) -> bool:
+        writer=self.eye_w
+        if writer is None:
+            return False
+        closing=getattr(writer,"is_closing",False)
+        if callable(closing):
+            try:
+                return not bool(closing())
+            except Exception:
+                return False
+        return not bool(closing)
+
+    async def _ensure_eye_for_hint(self) -> bool:
+        """Connect Eye before synthesizing a hint. False = failsafe, nobody to ask."""
+        if self._eye_writer_live():
+            return True
+        deadline=time.monotonic()+float(getattr(self,"eye_connect_timeout",2.5) or 2.5)
+        try:
+            await self.ensure_eye(deadline=deadline)
+        except Exception:
+            return False
+        return self._eye_writer_live()
+
+    async def _failsafe_hero_turn(self, *, reason: str, event: Optional[dict] = None, data: Optional[dict] = None) -> bool:
+        hint=self._hero_hint_event(event)
+        turn_id=self._current_hero_turn_id(hint)
+        turn_data=data if isinstance(data, dict) else None
+        with self.autoplay.lock:
+            pending=self.autoplay.pending
+            if pending:
+                if str(pending.get("turn_id") or "")==str(turn_id or "") and turn_id:
+                    self._diagnostic(
+                        "failsafe_reuse",
+                        f"CHECK/FOLD already queued for turn {turn_id}",
+                        {"reason": reason},
+                    )
+                    return True
+                # A leftover CHECK/FOLD from a previous decision must not eat
+                # the current unique hero turn. ExtraTimer of the same turn
+                # keeps the pending action above.
+                self.autoplay.pending=None
+        try:
+            fb = self.autoplay.schedule_failsafe(
+                self.state, reason=reason, turn_id=turn_id or None, turn=turn_data,
+            )
+        except Exception as exc:
+            self._diagnostic(
+                "failsafe_unavailable",
+                f"PokerEYE cannot answer and no CHECK/FOLD failsafe is legal: {exc}",
+                {"reason": reason},
+            )
+            return False
+        self._hand_cc_failed = True
+        self._diagnostic(
+            "fallback_ready",
+            "PokerEYE cannot answer this turn; timeout safety action queued",
+            self._failsafe_detail(fb, reason),
+        )
+        return True
+
     async def _on_hero_user_turn(self, event: dict, payload: Any, raw: bytes, data: dict, room: Any) -> None:
+        self._last_hero_hint = (event, payload, raw or b"")
         if event.get("_hmuriy_duplicate_turn"):
+            extra="extra" in str(event.get("_hmuriy_turn_refresh") or data.get("timerName") or "").lower()
+            if extra:
+                if self.pending_action_ack:
+                    self.defer_pending_exhaustion(source="extraTimer")
+                    if not self.autoplay.pending:
+                        return
+                if self.autoplay.pending:
+                    forced=self.autoplay.force_pending_now()
+                    self._diagnostic("extra_urgent","extraTimer: send Eye/failsafe action now",{
+                        "action":str((forced or {}).get("action") or ""),
+                        "delay_ms":0,
+                        "timer":str(event.get("_hmuriy_turn_refresh") or data.get("timerName") or ""),
+                    })
+                    return
+                if self.awaiting_cc:
+                    if self._chart_miss_preflop():
+                        self.extend_cc_wait_for_extra(data if isinstance(data, dict) else None)
+                        self._diagnostic(
+                            "extra_wait",
+                            "extraTimer: keep waiting PokerEYE for a non-trash hand",
+                            {"hand": (self._nonscript_hand_context() or {}).get("hand")},
+                        )
+                        return
+                    self.abort_cc_wait("EXTRA_TIMER")
+                await self._failsafe_hero_turn(reason="EXTRA_TIMER", event=event, data=data if isinstance(data, dict) else None)
+                return
+            if self.pending_action_ack:
+                self.defer_pending_exhaustion(source="extraTimer")
             if self.autoplay.pending or self.awaiting_cc:
+                if self.awaiting_cc and self._cc_wait_should_abort():
+                    self.abort_cc_wait(self._abort_reason_for_silent_eye())
                 self._diagnostic(
                     "turn_refresh",
                     "Coin extraTimer/time-bank refresh; existing hint/action retained",
@@ -2056,7 +2668,31 @@ class LiveCoinBridge:
                 "duplicate Coin turn after silent reconnect; re-hint Eye then failsafe",
                 {"timer": str(event.get("_hmuriy_turn_refresh") or data.get("timerName") or "")},
             )
-            # Do not instant-failsafe here: AK/trips would CHECK/FOLD instead of CC.
+            if await self.replay_broken_eye_hand(event, payload, raw or b""):
+                return
+            if self._eye_socket_dead() or (
+                self._eye_game_is_broken() and self._broken_replay_hand_id()
+            ):
+                await self._failsafe_hero_turn(reason="EYE_UNAVAILABLE")
+                return
+        elif not (self.autoplay.pending or self.awaiting_cc):
+            if await self.replay_broken_eye_hand(event, payload, raw or b""):
+                return
+            if self._eye_socket_dead() or (
+                self._eye_game_is_broken() and self._broken_replay_hand_id()
+            ):
+                self._diagnostic(
+                    "hero_turn_eye_unavailable",
+                    "hero turn with PokerEYE socket dead or deal still broken; CHECK/FOLD without a hint",
+                )
+                await self._failsafe_hero_turn(reason="EYE_UNAVAILABLE")
+                return
+        pending=self.autoplay.pending
+        if pending and not event.get("_hmuriy_duplicate_turn"):
+            pending_turn=str(pending.get("turn_id") or "")
+            current_turn=self._current_hero_turn_id(event)
+            if pending_turn and current_turn and pending_turn==current_turn:
+                return
         mode = "incremental" if (self.current_hand and self.current_hand.hand_id in self.cold_hands) else "cold"
         if event.get("_hmuriy_options_from_advance"):
             options = data.get("userTurnOptions") or {}
@@ -2076,140 +2712,203 @@ class LiveCoinBridge:
 
     async def start_cold_hint(self,event:dict,payload:Any,raw:bytes):
         async with self.hint_lock:
-            try:
-                model,active_tid,cands,recovery_state,recovery_attempts=await self._wait_for_cold_seed()
-                if recovery_state=="turn-changed":
+            await self._start_cold_hint_locked(event,payload,raw)
+
+    async def _start_cold_hint_locked(self,event:dict,payload:Any,raw:bytes):
+        try:
+            model,active_tid,cands,recovery_state,recovery_attempts=await self._wait_for_cold_seed()
+            if recovery_state=="turn-changed":
+                self._diagnostic(
+                    "mid_hand_recovery_cancelled",
+                    "Coin turn changed while waiting for a complete seed; CHECK/FOLD for the original turn",
+                    {"table_id":active_tid,"attempts":recovery_attempts},
+                )
+                await self._failsafe_hero_turn(reason="TURN_CHANGED", event=event)
+                return
+            if not cands:
+                if active_tid and active_tid not in self.mid_hand_wait_notified:
+                    self.mid_hand_wait_notified.add(active_tid)
                     self._diagnostic(
-                        "mid_hand_recovery_cancelled",
-                        "Coin turn changed while waiting for a complete seed; stale hint suppressed",
-                        {"table_id":active_tid,"attempts":recovery_attempts},
+                        "joined_mid_hand",
+                        "current hand has no trustworthy complete seed after bounded recovery; using CHECK/FOLD safety action",
+                        {"table_id":active_tid,
+                         "wait_ms":int(round(self.mid_hand_recovery_grace*1000.0)),
+                         "attempts":recovery_attempts},
                     )
-                    return
-                if not cands:
-                    if active_tid and active_tid not in self.mid_hand_wait_notified:
-                        self.mid_hand_wait_notified.add(active_tid)
-                        self._diagnostic(
-                            "joined_mid_hand",
-                            "current hand has no trustworthy complete seed after bounded recovery; using CHECK/FOLD safety action",
-                            {"table_id":active_tid,
-                             "wait_ms":int(round(self.mid_hand_recovery_grace*1000.0)),
-                             "attempts":recovery_attempts},
-                        )
-                    try:
-                        fb=self.autoplay.schedule_failsafe(self.state,reason="MID_HAND_NO_SEED")
-                        self._hand_cc_failed=True
-                        self._diagnostic("fallback_ready","mid-hand snapshot incomplete; safety action queued",{
-                            "action":fb.get("action"),"attempt":1,
-                            "max_attempts":self.action_max_attempts,
-                            "reason":"MID_HAND_NO_SEED",
-                        })
-                    except Exception as fallback_error:
-                        snapshot=self._error_snapshot(reason="MID_HAND_NO_SEED")
-                        self._diagnostic("failsafe_unavailable",f"mid-hand recovery unavailable and no CHECK/FOLD is legal: {fallback_error}",{"telemetry":snapshot})
-                    return
-                self.mid_hand_wait_notified.discard(active_tid)
-                hid=cands[-1][0]
-                if hid in self.cold_hands:return
-                h=self._stamp_game_id_context(model.build_hand(hid))
-                if h.pre.get("_hmuriy_snapshot_recovery"):
-                    self._diagnostic(
-                        "mid_hand_recovered",
-                        "current hand recovered from pristine game_alldata snapshot",
-                        {"table_id":active_tid,"hand_id":hid},
-                    )
-                # Only wire-level bombpot fact we can prove from supplied captures: IsInBombpot.
-                bp=self._bombpot_for(self.active_hook_room).state
-                h.room.props["_isBombpotHand"]=bool(bp.is_bombpot_hand)
-                h.room.props["_isDoubleBoard"]=bool(bp.is_double_board)
-                h.room.props["_bombpotAnte"]=bp.hand_ante
-                h.room.props["_handsToBombpot"]=bp.current_hand_number if bp.current_hand_number is not None else 0
-                self._sync_identity(h)
-                if self.context_active and not self.hero_sitting:
-                    hero_row=next((r for r in h.roster if int(r.get("userId") or 0)==h.hero_id or str(r.get("userName") or "")==h.hero_name),None)
-                    if hero_row and float(hero_row.get("userChips") or 0)>0:
-                        await self._send_hero_sit(hero_row)
-                elif not self.context_active:
-                    # The synthesized cold stream contains the full SitDown sequence.
-                    # Mark it locally before reaching CancelWaitBlind so late attach
-                    # follows the same one-shot lifecycle as an observed admission.
-                    hero_row=next((r for r in h.roster if int(r.get("userId") or 0)==h.hero_id or str(r.get("userName") or "")==h.hero_name),None)
-                    if hero_row and float(hero_row.get("userChips") or 0)>0:
-                        self.hero_sitting=True; self.hero_total_buyin=self._dynamic_total_buyin(h); self.wait_blind_cancelled=False
-                        self.announced_seats[int(hero_row.get("seatId") or h.hero_seat)]=h.hero_id
-                # Re-observe now that hero identity is known, so autoplay captures room/ws.
-                self.autoplay.observe(event,payload,raw,self.state)
-                if await self._try_nlh_prefold(h):
-                    self.context_active=True; self.context_table_id=h.table_id
-                    self.context_hook_room=self.table_to_room.get(h.table_id,self.active_hook_room)
-                    self.cold_hands.add(hid); self.state["_pending_finish_hint"]=None
-                    log("HAND",f"prefold hand={hid} hero={h.hero_name} cards={h.cards}")
-                    self._diagnostic("cards","hero hole cards captured",{"cards":h.cards,"hand_id":str(hid)})
-                    self._announce_prefold_intent(h)
-                    return
-                frames=core.PPPBuilder(h,self.scale).synthesize_until_first_hero_turn()
-                finish=None
-                skip={"pb.UserLoginRSP","pb.EnterRoomRSP","pb.SitDownBRC","pb.SitDownRSP","pb.TotalBuyinBRC"} if self.context_active else set()
-                for f in frames:
-                    cmd=json.loads(f["msg"])["cmd"]
-                    if cmd=="pb.FinishRoundHintRSP": finish=f; continue
-                    if cmd in skip: continue
-                    if cmd=="pb.CancelWaitBlindBRC":
-                        # PPP cancels the hero's wait-for-blind state once after SitDown,
-                        # not at the beginning of every subsequent hand.
-                        if not self._claim_wait_blind_cancel():continue
-                    if cmd=="pb.RoundHintMultipleTableRSP":
-                        self._clear_cc_queue(); self.manual_action_event.clear()
-                    if cmd=="pb.TotalBuyinBRC":
-                        total=self._dynamic_total_buyin(h)
-                        f=core.PPPBuilder(h,self.scale)._outer(cmd,core.p_int(1,h.hero_id)+core.p_int(2,total)+core.p_int(3,0))
-                        pending_room=self.table_to_room.get(h.table_id,self.active_hook_room)
-                        if pending_room is not None:self.pending_buyin_by_room.pop(pending_room,None)
-                        log("STATE",f"dynamic TotalBuyin={total}")
-                    await self.eye_send_outer(f,cmd)
-                    if self.frame_delay: await asyncio.sleep(self.frame_delay)
-                self.context_active=True; self.context_table_id=h.table_id; self.context_hook_room=self.table_to_room.get(h.table_id,self.active_hook_room)
-                self.cold_hands.add(hid); self.finish_frame_by_table[h.table_id]=finish
-                self.state["_pending_finish_hint"]=h.table_id
-                log("HAND",f"hint hand={hid} hero={h.hero_name} coinSeat={h.hero_seat}->ppp={h.ppp_hero_seat} cards={h.cards}")
-                self._diagnostic("cards","hero hole cards captured",{"cards":h.cards,"hand_id":str(hid)})
-                self._announce_prefold_intent(h)
-                self._diagnostic("hint_sent",f"cold hint sent table={h.table_id} room={self.active_hook_room}")
-                if getattr(self, "play_enabled", True) is False:
-                    await self._close_open_hint("play-off")
-                    return
-                await self._wait_cc_and_schedule()
-            except Exception as e:
-                log("HAND",f"cold hint error: {type(e).__name__}: {e}")
-                snapshot=self._error_snapshot(reason="COLD_HINT_ERROR")
-                self._diagnostic("hint_error",f"cold hint failed: {type(e).__name__}: {e}",{"telemetry":snapshot})
                 try:
-                    fb=self.autoplay.schedule_failsafe(self.state,reason="COLD_HINT_ERROR")
-                    self._diagnostic("fallback_ready","hint failed; safety action queued",{
+                    hint=self._hero_hint_event(event)
+                    fb=self.autoplay.schedule_failsafe(
+                        self.state,
+                        reason="MID_HAND_NO_SEED",
+                        turn_id=self._current_hero_turn_id(hint) or None,
+                    )
+                    self._hand_cc_failed=True
+                    self._diagnostic("fallback_ready","mid-hand snapshot incomplete; safety action queued",{
                         "action":fb.get("action"),"attempt":1,
                         "max_attempts":self.action_max_attempts,
-                        "reason":"COLD_HINT_ERROR",
+                        "reason":"MID_HAND_NO_SEED",
                     })
                 except Exception as fallback_error:
-                    self._diagnostic("failsafe_unavailable",f"hint failed and no CHECK/FOLD is legal: {fallback_error}",{"telemetry":snapshot})
+                    snapshot=self._error_snapshot(reason="MID_HAND_NO_SEED")
+                    self._diagnostic("failsafe_unavailable",f"mid-hand recovery unavailable and no CHECK/FOLD is legal: {fallback_error}",{"telemetry":snapshot})
+                return
+            self.mid_hand_wait_notified.discard(active_tid)
+            hid=cands[-1][0]
+            if hid in self.cold_hands:
+                # Already streamed this hand. A later unique hero turn still needs
+                # CHECK/FOLD or an incremental hint — never a silent drop.
+                _,_,seed_data=cmd_room_data(payload)
+                if not isinstance(seed_data, dict):
+                    seed_data={}
+                if self.current_hand is not None:
+                    await self._start_incremental_hint_locked(event,payload,raw,seed_data)
+                else:
+                    await self._failsafe_hero_turn(reason="NO_HAND_SEED", event=event, data=seed_data)
+                return
+            h=self._stamp_game_id_context(model.build_hand(hid))
+            if h.pre.get("_hmuriy_snapshot_recovery"):
+                self._diagnostic(
+                    "mid_hand_recovered",
+                    "current hand recovered from pristine game_alldata snapshot",
+                    {"table_id":active_tid,"hand_id":hid},
+                )
+            # Only wire-level bombpot fact we can prove from supplied captures: IsInBombpot.
+            bp=self._bombpot_for(self.active_hook_room).state
+            h.room.props["_isBombpotHand"]=bool(bp.is_bombpot_hand)
+            h.room.props["_isDoubleBoard"]=bool(bp.is_double_board)
+            h.room.props["_bombpotAnte"]=bp.hand_ante
+            h.room.props["_handsToBombpot"]=bp.current_hand_number if bp.current_hand_number is not None else 0
+            self._sync_identity(h)
+            if self.context_active and not self.hero_sitting:
+                hero_row=next((r for r in h.roster if int(r.get("userId") or 0)==h.hero_id or str(r.get("userName") or "")==h.hero_name),None)
+                if hero_row and float(hero_row.get("userChips") or 0)>0:
+                    await self._send_hero_sit(hero_row)
+            elif not self.context_active:
+                # The synthesized cold stream contains the full SitDown sequence.
+                # Mark it locally before reaching CancelWaitBlind so late attach
+                # follows the same one-shot lifecycle as an observed admission.
+                hero_row=next((r for r in h.roster if int(r.get("userId") or 0)==h.hero_id or str(r.get("userName") or "")==h.hero_name),None)
+                if hero_row and float(hero_row.get("userChips") or 0)>0:
+                    self.hero_sitting=True; self.hero_total_buyin=self._dynamic_total_buyin(h); self.wait_blind_cancelled=False
+                    self.announced_seats[int(hero_row.get("seatId") or h.hero_seat)]=h.hero_id
+            # Re-observe now that hero identity is known, so autoplay captures room/ws.
+            self.autoplay.observe(event,payload,raw,self.state)
+            if await self._try_nlh_prefold(h):
+                self.context_active=True; self.context_table_id=h.table_id
+                self.context_hook_room=self.table_to_room.get(h.table_id,self.active_hook_room)
+                self.cold_hands.add(hid); self.state["_pending_finish_hint"]=None
+                log("HAND",f"prefold hand={hid} hero={h.hero_name} cards={h.cards}")
+                self._diagnostic("cards","hero hole cards captured",{"cards":h.cards,"hand_id":str(hid)})
+                self._announce_prefold_intent(h)
+                return
+            if not await self._ensure_eye_for_hint():
+                await self._failsafe_hero_turn(reason="EYE_UNAVAILABLE")
+                return
+            self._eye_send_deadline=time.monotonic()+float(getattr(self,"eye_connect_timeout",2.5) or 2.5)
+            frames=core.PPPBuilder(h,self.scale).synthesize_until_first_hero_turn()
+            finish=None
+            skip={"pb.UserLoginRSP","pb.EnterRoomRSP","pb.SitDownBRC","pb.SitDownRSP","pb.TotalBuyinBRC"} if self.context_active else set()
+            for f in frames:
+                cmd=json.loads(f["msg"])["cmd"]
+                if cmd=="pb.FinishRoundHintRSP": finish=f; continue
+                if cmd in skip: continue
+                if cmd=="pb.CancelWaitBlindBRC":
+                    # PPP cancels the hero's wait-for-blind state once after SitDown,
+                    # not at the beginning of every subsequent hand.
+                    if not self._claim_wait_blind_cancel():continue
+                if cmd=="pb.RoundHintMultipleTableRSP":
+                    self._clear_cc_queue(); self.manual_action_event.clear()
+                if cmd=="pb.TotalBuyinBRC":
+                    total=self._dynamic_total_buyin(h)
+                    f=core.PPPBuilder(h,self.scale)._outer(cmd,core.p_int(1,h.hero_id)+core.p_int(2,total)+core.p_int(3,0))
+                    pending_room=self.table_to_room.get(h.table_id,self.active_hook_room)
+                    if pending_room is not None:self.pending_buyin_by_room.pop(pending_room,None)
+                    log("STATE",f"dynamic TotalBuyin={total}")
+                await self.eye_send_outer(f,cmd)
+                if self.frame_delay: await asyncio.sleep(self.frame_delay)
+            self.context_active=True; self.context_table_id=h.table_id; self.context_hook_room=self.table_to_room.get(h.table_id,self.active_hook_room)
+            self.cold_hands.add(hid); self.finish_frame_by_table[h.table_id]=finish
+            self.state["_pending_finish_hint"]=h.table_id
+            log("HAND",f"hint hand={hid} hero={h.hero_name} coinSeat={h.hero_seat}->ppp={h.ppp_hero_seat} cards={h.cards}")
+            self._diagnostic("cards","hero hole cards captured",{"cards":h.cards,"hand_id":str(hid)})
+            self._announce_prefold_intent(h)
+            self._diagnostic("hint_sent",f"cold hint sent table={h.table_id} room={self.active_hook_room}")
+            if getattr(self, "play_enabled", True) is False:
+                await self._close_open_hint("play-off")
+                return
+            await self._wait_cc_and_schedule()
+        except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as e:
+            log("HAND",f"cold hint eye unreachable: {type(e).__name__}: {e}")
+            snapshot=self._error_snapshot(reason="EYE_UNAVAILABLE")
+            self._diagnostic("hint_error",f"cold hint failed: {type(e).__name__}: {e}",{"telemetry":snapshot})
+            try:
+                fb=self.autoplay.schedule_failsafe(self.state,reason="EYE_UNAVAILABLE")
+                self._hand_cc_failed=True
+                self._diagnostic("fallback_ready","PokerEYE unreachable; timeout safety action queued",{
+                    "action":fb.get("action"),"attempt":1,
+                    "max_attempts":self.action_max_attempts,
+                    "reason":"EYE_UNAVAILABLE",
+                })
+            except Exception as fallback_error:
+                self._diagnostic("failsafe_unavailable",f"Eye unreachable and no CHECK/FOLD is legal: {fallback_error}",{"telemetry":snapshot})
+        except Exception as e:
+            log("HAND",f"cold hint error: {type(e).__name__}: {e}")
+            snapshot=self._error_snapshot(reason="COLD_HINT_ERROR")
+            self._diagnostic("hint_error",f"cold hint failed: {type(e).__name__}: {e}",{"telemetry":snapshot})
+            try:
+                fb=self.autoplay.schedule_failsafe(self.state,reason="COLD_HINT_ERROR")
+                self._diagnostic("fallback_ready","hint failed; safety action queued",{
+                    "action":fb.get("action"),"attempt":1,
+                    "max_attempts":self.action_max_attempts,
+                    "reason":"COLD_HINT_ERROR",
+                })
+            except Exception as fallback_error:
+                self._diagnostic("failsafe_unavailable",f"hint failed and no CHECK/FOLD is legal: {fallback_error}",{"telemetry":snapshot})
+        finally:
+            self._eye_send_deadline=None
 
     async def start_incremental_hint(self,event:dict,payload:Any,raw:bytes,data:dict):
         async with self.hint_lock:
-            if not self.current_hand:return
-            # Refresh autoplay turn info and build notify from live Coin options.
+            await self._start_incremental_hint_locked(event,payload,raw,data)
+
+    async def _start_incremental_hint_locked(self,event:dict,payload:Any,raw:bytes,data:dict):
+        try:
+            await self._start_incremental_hint_body(event,payload,raw,data)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            self._diagnostic(
+                "hint_error",
+                f"incremental hint failed: {type(exc).__name__}: {exc}",
+            )
+            await self._failsafe_hero_turn(reason="INCREMENTAL_HINT_ERROR", event=event, data=data if isinstance(data, dict) else None)
+
+    async def _start_incremental_hint_body(self,event:dict,payload:Any,raw:bytes,data:dict):
+        if not self.current_hand:
+            await self._failsafe_hero_turn(reason="NO_HAND_SEED", event=event, data=data if isinstance(data, dict) else None)
+            return
+        # handle_event already observed this turn. Re-observe would mark the
+        # same unique event as extraTimer and steal its turn_id.
+        if not event.get("_hmuriy_turn_id"):
             self.autoplay.observe(event,payload,raw,self.state)
-            if await self._try_nlh_prefold(self.current_hand):
-                self.state["_pending_finish_hint"]=None
-                log("HAND",f"prefold incremental hand={self.state.get('hand_id')}")
-                return
-            h=self.current_hand; hero=h.ppp_hero_seat
-            put=self.street_contrib.get(hero,0); current=max(self.street_contrib.values(),default=0)
-            call=max(0,current-put)
-            covers=[self.street_contrib.get(other-1,0)+self.remaining_stack.get(other-1,0)
-                    for other in self.active_seats if other and other-1!=hero]
-            mx=max(0,(max(covers) if covers else put)-put)
-            can=max(1,len(self.active_seats-self.all_in_seats))
-            mn=0 if can<=1 else max(0,current+max(1,self.last_full_raise)-put)
-            notify=core.p_int(1,hero)+core.p_int(2,call)+core.p_int(3,mn)+core.p_int(4,mx)+core.p_int(5,can)
+        if await self._try_nlh_prefold(self.current_hand):
+            self.state["_pending_finish_hint"]=None
+            log("HAND",f"prefold incremental hand={self.state.get('hand_id')}")
+            return
+        if not await self._ensure_eye_for_hint():
+            await self._failsafe_hero_turn(reason="EYE_UNAVAILABLE", event=event, data=data if isinstance(data, dict) else None)
+            return
+        h=self.current_hand; hero=h.ppp_hero_seat
+        put=self.street_contrib.get(hero,0); current=max(self.street_contrib.values(),default=0)
+        call=max(0,current-put)
+        covers=[self.street_contrib.get(other-1,0)+self.remaining_stack.get(other-1,0)
+                for other in self.active_seats if other and other-1!=hero]
+        mx=max(0,(max(covers) if covers else put)-put)
+        can=max(1,len(self.active_seats-self.all_in_seats))
+        mn=0 if can<=1 else max(0,current+max(1,self.last_full_raise)-put)
+        notify=core.p_int(1,hero)+core.p_int(2,call)+core.p_int(3,mn)+core.p_int(4,mx)+core.p_int(5,can)
+        self._eye_send_deadline=time.monotonic()+float(getattr(self,"eye_connect_timeout",2.5) or 2.5)
+        try:
             await self.eye_send_cmd("pb.ActionNotifyBRC",notify)
             self._clear_cc_queue(); self.manual_action_event.clear()
             derived_seats=max([int(r.get("seatId") or 0) for r in h.roster] or [0])
@@ -2235,6 +2934,10 @@ class LiveCoinBridge:
                 await self._close_open_hint("play-off")
                 return
             await self._wait_cc_and_schedule()
+        except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError):
+            await self._failsafe_hero_turn(reason="EYE_UNAVAILABLE")
+        finally:
+            self._eye_send_deadline=None
 
     async def _wait_cc_and_schedule(self):
         # One table bridge has one hint at a time. Flush pre-existing CC so a late
@@ -2245,25 +2948,45 @@ class LiveCoinBridge:
         cc_task=asyncio.create_task(self.cc_queue.get())
         manual_task=asyncio.create_task(self.manual_action_event.wait())
         self.awaiting_cc=True
-        # Never let the backend consume the whole Coin turn.  Seven seconds is
-        # only the ceiling; short/already-running turns reserve a fallback window.
-        timeout_s=self.cc_timeout_seconds
+        # Never let the backend consume the whole Coin turn. Four seconds is
+        # the ceiling; short/already-running turns reserve a fallback window.
+        timeout_s=self._cc_wait_timeout()
         try:
             room=self.context_hook_room or self.active_hook_room
             turn=self.autoplay.turn_by_room.get(int(room),{}) if room is not None else {}
-            observed=float(turn.get("_observed_monotonic") or 0.0)
-            total=float(turn.get("turnTime") or 0.0)
-            if observed>0 and total>0:
-                remaining=max(0.0,observed+total-time.monotonic())
-                timeout_s=min(timeout_s,max(0.75,remaining-self.cc_fallback_margin_seconds))
+            remaining=self._hero_turn_remaining_seconds(turn)
+            margin=float(self.cc_fallback_margin_seconds)
+            if remaining>0:
+                usable=max(0.75, remaining-margin)
+                if self._chart_miss_preflop():
+                    # TT/AJs and other chart-miss preflop hands get the Coin clock,
+                    # not the 4s Eye ceiling. Failsafe FOLD of those is the bug.
+                    timeout_s=min(max(timeout_s, usable), 12.0)
+                else:
+                    timeout_s=min(timeout_s, usable)
         except (TypeError,ValueError):
             pass
         try:
-            done,_=await asyncio.wait(
-                {cc_task,manual_task},
-                timeout=timeout_s,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            if self._cc_wait_should_abort():
+                self.abort_cc_wait(self._abort_reason_for_silent_eye())
+            self._cc_deadline=time.monotonic()+float(timeout_s)
+            deadline=self._cc_deadline
+            done=set()
+            while True:
+                deadline=max(deadline, float(getattr(self,"_cc_deadline",0.0) or 0.0))
+                left=deadline-time.monotonic()
+                if left<=0:
+                    done=set()
+                    break
+                if self._cc_wait_should_abort() and not self._cc_abort:
+                    self.abort_cc_wait(self._abort_reason_for_silent_eye())
+                done,_pending=await asyncio.wait(
+                    {cc_task,manual_task},
+                    timeout=min(0.2,left),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if done:
+                    break
             if not done:
                 message=f"timeout {timeout_s:.1f}s; PokerEYE produced no CC"
                 log("CC",message)
@@ -2279,15 +3002,16 @@ class LiveCoinBridge:
                 except Exception as e:
                     self._diagnostic("finish_hint_error",f"finish after CC timeout failed: {e}")
                 try:
-                    fb=self.autoplay.schedule_failsafe(self.state,reason="CC_TIMEOUT")
+                    hint=self._hero_hint_event()
+                    fb=self.autoplay.schedule_failsafe(
+                        self.state,
+                        reason="CC_TIMEOUT",
+                        turn_id=self._current_hero_turn_id(hint) or None,
+                    )
                     self._diagnostic(
                         "fallback_ready",
                         "PokerEYE did not answer; timeout safety action queued",
-                        {"action":fb.get("action"),"attempt":1,
-                         "max_attempts":self.action_max_attempts,
-                         "reason":"CC_TIMEOUT",
-                         "delay_ms":int(fb.get("delay_ms") or 0),
-                         "hud":hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0)},
+                        self._failsafe_detail(fb, "CC_TIMEOUT"),
                     )
                 except Exception as e:
                     self._diagnostic(
@@ -2297,6 +3021,30 @@ class LiveCoinBridge:
                     )
                 return
             if manual_task in done and self.manual_action_event.is_set():
+                abort=self._cc_abort
+                self._cc_abort=None
+                if abort:
+                    if abort == "GAME_IS_BROKEN":
+                        log("CC","GAME_IS_BROKEN; finish then resend same hand")
+                        # Drop leftover cc_queue.get() / wait() before nested
+                        # _wait_cc_and_schedule, or they steal the resend CC.
+                        # cancel() alone is not enough: the getter stays in
+                        # Queue._getters until the cancellation is awaited.
+                        self.manual_action_event.clear()
+                        leftover=[t for t in (cc_task, manual_task) if not t.done()]
+                        for t in leftover:
+                            t.cancel()
+                        if leftover:
+                            await asyncio.gather(*leftover, return_exceptions=True)
+                        ev, pl, rw = getattr(self, "_last_hero_hint", ({}, None, b""))
+                        if await self.replay_broken_eye_hand(
+                            ev, pl, rw or b"", holding_hint_lock=True,
+                        ):
+                            return
+                    log("CC",f"Eye wait aborted ({abort}); CHECK/FOLD failsafe")
+                    if not self.autoplay.pending:
+                        await self._failsafe_hero_turn(reason=str(abort))
+                    return
                 log("CC","manual hero action observed before cc; releasing hint lock")
                 return
             z=cc_task.result()
@@ -2338,7 +3086,7 @@ class LiveCoinBridge:
                         "max_attempts":self.action_max_attempts,
                         "reason":"CC_MAPPING_ERROR",
                         "delay_ms":int(fb.get("delay_ms") or 0),
-                        "hud":hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0),
+                        "hud":hud_action(fb.get("action") or "FOLD", fb.get("display_amount"), fb.get("delay_ms") or 0, source="failsafe"),
                     })
                 except Exception as fallback_error:
                     self._diagnostic("failsafe_unavailable",f"mapping failed and no CHECK/FOLD failsafe is legal: {fallback_error}",{"telemetry":snapshot})
@@ -2618,8 +3366,8 @@ class LiveCoinBridge:
                 await self._close_open_hint("reset_data")
                 self.autoplay.reset_street(self.context_hook_room or self.active_hook_room)
                 self.street_contrib.clear(); self.hand_contrib.clear(); self.forced_adjustment_by_seat.clear(); self.forced_raw_remaining_by_seat.clear(); self.remaining_stack.clear(); self.hand_participants.clear(); self.action_seen.clear(); self.notify_seen.clear(); self.last_full_raise=0; self.street_generation+=1
-                self.current_hand=None; self.active_seats.clear(); self.all_in_seats.clear(); self.last_winner_info=[]; self.state["hand_id"]=""; self.state["_pending_finish_hint"]=None
-                self.emitted_primary_stages.clear(); self.emitted_second_boards.clear(); self.pending_actor_seat=None
+                self.current_hand=None; self.cold_hands.clear(); self.active_seats.clear(); self.all_in_seats.clear(); self.last_winner_info=[]; self.state["hand_id"]=""; self.state["_pending_finish_hint"]=None
+                self.emitted_primary_stages.clear(); self.emitted_second_boards.clear(); self._street_hand_id=""; self.pending_actor_seat=None
                 self.chipsback_refresh_seats.clear(); self.pending_action_ack=None; self.last_pools=[]; self.settlement_round_over_sent=False
                 self.round_over_seen.clear(); self.round_zoom_seen.clear(); self.pending_round_over=None; self.round_boundary_open=False; self.runout_closed=False; self.last_round_name=""; self.last_gross_pools=[]
                 self.winner_fragments_seen.clear(); self.winner_pot_gross={}; self.winner_rsp_sent=False; self.show_hole_cards={}; self.show_hand_sent=False; self.is_doing_evchop=False
@@ -3051,11 +3799,26 @@ class LiveCoinBridge:
             try: seat=int(data.get("straddleSeatId") or 0)
             except (TypeError,ValueError): seat=0
             self.state["straddleSeatId"]=seat if seat>0 else 0
+            hid=data.get("gameId") or data.get("handId") or data.get("hand_id")
+            if hid:
+                self._reset_board_street(hid)
             h=self.current_hand or self.context_hand
             if h is not None:
                 pre=getattr(h,"pre",None)
                 if isinstance(pre,dict):
                     pre["straddleSeatId"]=self.state["straddleSeatId"]
+            self._note_missed_deal_if_idle()
+
+        if direction=="in" and str(cmd).lower()=="game.sitout" and isinstance(data,dict):
+            latched=sitout_map_latched(data)
+            playing=False
+            hero_row=next((row for row in (self.seat_map or {}).values()
+                           if isinstance(row,dict) and self._is_hero_row(row)),None)
+            if hero_row and hero_row.get("isPlaying") is True:
+                playing=True
+            if playing and not latched:
+                self._missed_deals=0
+            self._apply_hero_sitout_flags(latched, playing, source="sitout_map")
 
         if not self._is_active_room(room):
             return
@@ -3127,6 +3890,18 @@ class LiveCoinBridge:
         try:self._bombpot_for(room).observe(payload)
         except Exception:pass
         obs=self.autoplay.observe(event,payload,raw,self.state)
+        if (
+            direction=="in"
+            and cmd=="game.user_turn"
+            and isinstance(data, dict)
+            and not event.get("_hmuriy_duplicate_turn")
+            and self.awaiting_cc
+            and room is not None
+            and self.active_hook_room is not None
+            and int(room)==int(self.active_hook_room)
+            and self._is_hero_turn(data)
+        ):
+            self.abort_cc_wait("TURN_CHANGED")
         decision={"id":event.get("id",""),"action":"forward"}; finish_after=None
 
         # A scheduled app-side send is still cancellable until its due timestamp.
@@ -3146,13 +3921,10 @@ class LiveCoinBridge:
         elif ack and obs.cancel_reason:cancel_reason=str(obs.cancel_reason).lower().replace("_","-")
         elif ack and cmd in ("game.reset_data","game.quit_table","game.pre_hand_start_info","lobby.join_game_table","lobby.join_game"):cancel_reason=cmd
         elif ack and direction=="in" and cmd=="game.user_turn":
-            whose=str(data.get("whoseTurn") or "")
-            if whose and whose!=str(self.state.get("user_name") or ""):
-                if time.monotonic()<float(ack.get("due") or 0):cancel_reason="turn-advanced-before-due"
-                else:
-                    log("ACTION_ACK",f"turn advanced after {ack.get('action')} hand={ack.get('hand_id')}")
-                    self.confirm_pending_action(source="turn-advanced",action=str(ack.get("action") or ""))
-                    ack=None
+            turn_cancel=self._note_pending_ack_on_turn(event,cmd,direction,data if isinstance(data,dict) else {})
+            if turn_cancel:
+                cancel_reason=turn_cancel
+            ack=self.pending_action_ack
         if ack and cancel_reason:
             token=str(ack.get("token") or "")
             if token:
@@ -3201,12 +3973,18 @@ class LiveCoinBridge:
                 token=str(inj.schedule_token or f"{self.state.get('hand_id')}:{event.get('id')}")
                 try:seat=int(self.state.get("hero_seat") or 0)
                 except (TypeError,ValueError):seat=0
+                pending=dict(getattr(self.autoplay,"pending",None) or {})
                 self.pending_action_ack={"action":str(inj.action_name or name),"raw":inj.inject_raw,"at":now,"due":now+delay/1000.0,
                     "retry_at":now+delay/1000.0+self.action_retry_delay,"retries":0,"hand_id":str(self.state.get("hand_id") or ""),
                     "ws_id":str(inj.target_ws_id or event.get("ws_id") or ""),
                     "channel_id":str(inj.target_channel_id or event.get("_channel_id") or ""),
                     "url":event.get("url"),"token":token,"seat":seat,
-                    "display_amount":inj.display_amount,"finish_room_id":inj.finish_room_id}
+                    "display_amount":inj.display_amount,"finish_room_id":inj.finish_room_id,
+                    "fallback":bool(pending.get("fallback")),
+                    "prefold":bool(pending.get("prefold")),
+                    "hand":pending.get("hand"),
+                    "position":pending.get("position"),
+                    "facing":pending.get("facing")}
                 if scheduled:
                     task=asyncio.create_task(self._finish_hint_after(delay,inj.finish_room_id,token)); self.schedule_finish_tasks[token]=task
             elif self.pending_action_ack:
@@ -3217,6 +3995,14 @@ class LiveCoinBridge:
                 self.pending_action_ack["due"]=now+delay/1000.0
                 self.pending_action_ack["retry_at"]=now+delay/1000.0+self.action_retry_delay
                 self.pending_action_ack["_exhausted_reported"]=False
+            with self.autoplay.lock:
+                queued=self.autoplay.pending
+                if isinstance(queued, dict):
+                    queued["_hud_done"]=True
+            self._diagnostic("action_dispatched", f"{name or 'action'} dispatched to Coin", {
+                "action": str(inj.action_name or name or ""),
+                "hud": hud_clear(),
+            })
             log("INJECT",f"{'SCHEDULE' if scheduled else 'REPLACE'} lobby.dummy -> {inj.log}; awaiting Coin server ACK")
         elif obs.manual_cancel or obs.cancel_reason:
             finish_after=finish_after or obs.finish_room_id

@@ -434,14 +434,20 @@ public final class HmuriyBridge {
                     bannerAction = parts[0];
                     bannerAmount = parts[1];
                     bannerDelay = parts[2];
+                } else if (parts.length == 1 && isHintAction(parts[0])) {
+                    bannerAction = parts[0];
                 }
             }
             bannerTone = tone == null ? "" : tone.trim().toLowerCase();
             bannerSticky = sticky;
-            // Sticky only lengthens TTL. A sticky flag used to keep the hint
-            // bar forever after the action already executed.
-            long life = sticky ? 8000L : 2500L;
-            bannerUntil = SystemClock.uptimeMillis() + life;
+            if (banner.length() == 0) {
+                bannerUntil = 0L;
+                bannerSticky = false;
+            } else {
+                // Sticky only lengthens TTL. Never keep the bar after execution.
+                long life = sticky ? 8000L : 2500L;
+                bannerUntil = SystemClock.uptimeMillis() + life;
+            }
             postInvalidate();
             postDelayed(new Runnable() {
                 @Override public void run() { invalidate(); }
@@ -1360,7 +1366,7 @@ public final class HmuriyBridge {
         return c.equals("FOLD") || c.equals("CHECK") || c.equals("CALL")
             || c.equals("RAISE") || c.equals("BET") || c.equals("ALLIN")
             || c.equals("ALL-IN") || c.equals("CHECKFOLD") || c.equals("PREFOLD")
-            || c.equals("LEAVE");
+            || c.equals("FALLBACK") || c.equals("LEAVE");
     }
 
     private static boolean isHintNumber(String s) {

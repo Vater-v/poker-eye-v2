@@ -25,18 +25,82 @@ def _safe(value: str, fallback: str = "unknown") -> str:
 
 
 class _JsonlWriter:
+    """Keep one append handle. ``flush=True`` is the only fsync path."""
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
+        self._fh: Optional[Any] = None
+
+    def _ensure_locked(self) -> Any:
+        fh = self._fh
+        if fh is None or getattr(fh, "closed", False):
+            fh = self.path.open("a", encoding="utf-8", newline="\n")
+            self._fh = fh
+        return fh
 
     def write(self, record: dict, *, flush: bool = False) -> None:
-        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
         with self._lock:
-            with self.path.open("a", encoding="utf-8", newline="\n") as fh:
-                fh.write(line)
-                if flush:
-                    fh.flush()
-                    os.fsync(fh.fileno())
+            fh = self._ensure_locked()
+            fh.write(line)
+            fh.flush()
+            if flush:
+                os.fsync(fh.fileno())
+
+    def close(self) -> None:
+        with self._lock:
+            fh = self._fh
+            self._fh = None
+            if fh is None:
+                return
+            try:
+                fh.flush()
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+class _AppendText:
+    """Same handle reuse as jsonl; fsync only when ``flush=True``."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._fh: Optional[Any] = None
+
+    def _ensure_locked(self) -> Any:
+        fh = self._fh
+        if fh is None or getattr(fh, "closed", False):
+            fh = self.path.open("a", encoding="utf-8", newline="\n")
+            self._fh = fh
+        return fh
+
+    def write(self, text: str, *, flush: bool = False) -> None:
+        with self._lock:
+            fh = self._ensure_locked()
+            fh.write(text)
+            fh.flush()
+            if flush:
+                os.fsync(fh.fileno())
+
+    def close(self) -> None:
+        with self._lock:
+            fh = self._fh
+            self._fh = None
+            if fh is None:
+                return
+            try:
+                fh.flush()
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 class TableLogger:
@@ -52,7 +116,8 @@ class TableLogger:
         self.events.write(record, flush=flush)
         return record
 
-    def close(self) -> None: pass
+    def close(self) -> None:
+        self.events.close()
 
 
 class DeviceLogger:
@@ -81,6 +146,7 @@ class DeviceLogger:
     def close(self) -> None:
         for tl in self._tables.values():
             tl.close()
+        self.events.close()
 
     def __iter__(self):
         return iter(self._tables.items())
@@ -102,9 +168,10 @@ class SessionLogger:
         # interpret a quiet run as a missing/broken logging pipeline.
         for path in (self.operator_path, self.technical_path, self.error_path):
             path.touch(exist_ok=True)
+        self.operator_log = _AppendText(self.operator_path)
+        self.technical_log = _AppendText(self.technical_path)
+        self.error_log = _AppendText(self.error_path)
         self.manifest_path = self.directory / "manifest.json"
-        self._operator_lock = threading.Lock()
-        self._technical_lock = threading.Lock()
         self._error_lock = threading.Lock()
         self._closed = False
         self._devices: dict[str, DeviceLogger] = {}
@@ -145,28 +212,23 @@ class SessionLogger:
         text = message or event
         if self._closed:
             raise RuntimeError("session logger is closed")
-        flush_io = flush or severity in {"WARN", "ERROR"}
+        # WARN is common (sit-out, fallback). Barrier the disk only on ERROR
+        # or an explicit flush so a multi-table burst is not one fsync/open each.
+        flush_io = bool(flush) or severity == "ERROR"
         self.run_events.write(record, flush=flush_io)
         # Every event has a compact plain-text technical twin, but the operator
         # file is reserved strictly for the same human Russian lines shown in console.
-        with self._technical_lock:
-            with self.technical_path.open("a", encoding="utf-8", newline="\n") as fh:
-                field_text = " ".join(
-                    f"{k}={json.dumps(v, ensure_ascii=False, default=str)}"
-                    for k, v in fields.items() if v is not None
-                )
-                fh.write(f"{record['ts']} [{severity}] {event}{(' ' + field_text) if field_text else ''}\n")
-                if flush_io:
-                    fh.flush()
-                    os.fsync(fh.fileno())
+        field_text = " ".join(
+            f"{k}={json.dumps(v, ensure_ascii=False, default=str)}"
+            for k, v in fields.items() if v is not None
+        )
+        self.technical_log.write(
+            f"{record['ts']} [{severity}] {event}{(' ' + field_text) if field_text else ''}\n",
+            flush=flush_io,
+        )
         # A supplied human-readable message is operator-facing by definition.
         if operator or message is not None:
-            with self._operator_lock:
-                with self.operator_path.open("a", encoding="utf-8", newline="\n") as fh:
-                    fh.write(f"{record['ts']} {text}\n")
-                    if flush_io:
-                        fh.flush()
-                        os.fsync(fh.fileno())
+            self.operator_log.write(f"{record['ts']} {text}\n", flush=flush_io)
         return record
 
     def error(self, event: str, *, message: str = "", **fields: Any) -> dict[str, Any]:
@@ -186,10 +248,7 @@ class SessionLogger:
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
         with self._error_lock:
-            with self.error_path.open("a", encoding="utf-8", newline="\n") as fh:
-                fh.write(line)
-                fh.flush()
-                os.fsync(fh.fileno())
+            self.error_log.write(line, flush=True)
         # Keep the canonical structured event stream in sync with the incident file.
         self.run_events.write({
             "schema_version": 1,
@@ -208,6 +267,10 @@ class SessionLogger:
         self.emit("trainer.stopped", message=f"Trainer остановлен: {reason}", flush=True, reason=reason)
         for dl in self._devices.values():
             dl.close()
+        self.run_events.close()
+        self.operator_log.close()
+        self.technical_log.close()
+        self.error_log.close()
         self._closed = True
 
     def __enter__(self) -> "SessionLogger":

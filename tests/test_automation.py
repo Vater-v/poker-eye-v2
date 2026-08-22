@@ -34,6 +34,15 @@ class AutoPolicyTests(unittest.TestCase):
         self.assertTrue(policy.enabled)
         self.assertFalse(policy.play_enabled)
 
+    def test_ledger_enabled_off_by_default_and_roundtrips(self):
+        policy = AutoPolicy.from_mapping({"enabled": True})
+        self.assertFalse(policy.ledger_enabled)
+        on = AutoPolicy.from_mapping({"enabled": True, "ledger_enabled": True})
+        self.assertTrue(on.ledger_enabled)
+        alias = AutoPolicy.from_mapping({"uchet": True})
+        self.assertTrue(alias.ledger_enabled)
+        self.assertTrue(on.public()["ledger_enabled"])
+
     def test_auto_off_clears_want_seat_and_ignores_game_init(self):
         auto = DeviceAutomation("dev")
         auto.apply_policy({"enabled": True, "table_count": 5, "bb": 0.02}, enable=True)
@@ -46,6 +55,45 @@ class AutoPolicyTests(unittest.TestCase):
             direction="in", room_id=9, table_ids=(11,), data={},
         ))
         self.assertNotIn(11, auto._want_seat)
+
+
+class LobbyWalletCaptureTests(unittest.TestCase):
+    def test_join_game_table_freezes_start_even_if_already_seated(self):
+        auto = DeviceAutomation("dev")
+        auto._seated.add(11)
+        auto._observe(RoutedEvent(
+            event={}, payload=None, raw=b"", command="lobby.join_game_table",
+            direction="in", room_id=5, table_ids=(12,),
+            data={"balance": 12.4, "tablesToJoin": [{"tableId": 12, "tableName": "NLH 12"}]},
+        ))
+        self.assertEqual(auto.lobby_wallet_cash, 12.4)
+        self.assertEqual(auto.wallet_cash, 12.4)
+
+    def test_later_balance_does_not_overwrite_start(self):
+        auto = DeviceAutomation("dev")
+        auto._capture_start_wallet({"balance": 12.4})
+        auto._seated.add(11)
+        auto._capture_start_wallet({"balance": 10.4})
+        self.assertEqual(auto.lobby_wallet_cash, 12.4)
+        self.assertEqual(auto.wallet_cash, 10.4)
+
+    def test_game_init_does_not_steal_table_gold_as_lobby(self):
+        auto = DeviceAutomation("dev")
+        auto._observe(RoutedEvent(
+            event={}, payload=None, raw=b"", command="game.game_init",
+            direction="in", room_id=9, table_ids=(11,),
+            data={"gameInitResponseData": {"balance": 19.47, "gold": 19.47, "maxSize": 6, "tableName": "NLH 11"}},
+        ))
+        self.assertIsNone(auto.lobby_wallet_cash)
+
+    def test_last_table_keeps_lobby_snapshot(self):
+        auto = DeviceAutomation("dev")
+        auto.lobby_wallet_cash = 12.4
+        auto.wallet_cash = 10.4
+        auto._seated.add(11)
+        auto.note_table_closed(11)
+        self.assertEqual(auto.lobby_wallet_cash, 12.4)
+        self.assertEqual(auto.wallet_cash, 10.4)
 
 
 class JoinPacketTests(unittest.TestCase):
@@ -560,7 +608,7 @@ class WatchdogJoinTests(unittest.TestCase):
         auto.mark_hand(11, False)
         auto.mark_stack(11, 100.0, 1, True)
         auto.tick(seated_tables=1, live_table_ids=[11])
-        self.assertNotIn(11, auto._leave_reasons)
+        self.assertIn(11, auto._leave_reasons)
 
     def test_uidump_hero_only_leaves_now(self):
         from core.v6router.automation import parse_ui_dump
@@ -591,9 +639,9 @@ class WatchdogJoinTests(unittest.TestCase):
         self.assertNotIn(11, auto._leave_reasons)
         auto.mark_hand(11, False)
         auto.tick(seated_tables=1, live_table_ids=[11])
-        self.assertNotIn(11, auto._leave_reasons)
+        self.assertIn(11, auto._leave_reasons)
         first = auto.drain_leaves()
-        self.assertEqual(first, [])
+        self.assertEqual(first[0][0], 11)
 
     def test_coin_five_tab_cap_blocks_join(self):
         auto = DeviceAutomation("dev")
@@ -698,7 +746,7 @@ class WatchdogJoinTests(unittest.TestCase):
         self.assertNotIn(11, auto._leave_reasons)
         auto.mark_hand(11, False)
         auto.tick(seated_tables=1, live_table_ids=[11])
-        self.assertNotIn(11, auto._leave_reasons)
+        self.assertIn(11, auto._leave_reasons)
 
     def test_two_player_next_hand_does_not_retract_short_leave(self):
         auto = DeviceAutomation("dev")
@@ -707,10 +755,10 @@ class WatchdogJoinTests(unittest.TestCase):
         auto.mark_hand(11, True)
         auto.mark_hand(11, False)
         auto.tick(seated_tables=1, live_table_ids=[11])
-        self.assertNotIn(11, auto._leave_reasons)
+        self.assertIn(11, auto._leave_reasons)
         auto.mark_hand(11, True)
         auto.tick(seated_tables=1, live_table_ids=[11])
-        self.assertNotIn(11, auto._leave_reasons)
+        self.assertIn(11, auto._leave_reasons)
 
     def test_console_closed_leftover_felt_still_leaves(self):
         auto = DeviceAutomation("dev")
@@ -767,6 +815,63 @@ class WatchdogJoinTests(unittest.TestCase):
         auto.mark_hand(11, False)
         auto.tick(seated_tables=1, live_table_ids=[11])
         self.assertFalse(auto._joining)
+
+    def test_snapshot_ui_omits_uidump_rows(self):
+        auto = DeviceAutomation("dev")
+        auto._ui_last = {
+            "closed": False,
+            "timer": 11.0,
+            "janitor": True,
+            "nodes": 75,
+            "rows": [{"t": "Fold", "id": "peye.action_fold"}] * 80,
+        }
+        snap = auto.snapshot()
+        self.assertNotIn("rows", snap.get("ui") or {})
+        self.assertEqual((snap.get("ui") or {}).get("timer"), 11.0)
+        self.assertEqual((snap.get("ui") or {}).get("nodes"), 75)
+
+    def test_false_sitout_does_not_block_short_handed_leave(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({
+            "enabled": True, "play_enabled": True, "table_count": 1, "watch_players": True,
+        })
+        auto.mark_stack(11, 100.0, 2, True)
+        auto.mark_hand(11, True)
+        auto.mark_hand(11, False)
+        auto.mark_sitout(11, True)
+        auto.tick(seated_tables=1, live_table_ids=[11])
+        self.assertIn(11, auto._leave_reasons)
+        self.assertEqual(auto.drain_leaves()[0][0], 11)
+        self.assertFalse(auto.request_sit_in(11, room=42))
+
+    def test_sitout_queues_sit_in_not_leave(self):
+        from core.verified_v1.coin_action_wire import decode_packet
+
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": False, "play_enabled": True, "table_count": 1})
+        auto.mark_stack(11, 100.0, 6, True)
+        auto.mark_sitout(11, True)
+        auto.game_ws[11] = "aabb"
+        self.assertTrue(auto.request_sit_in(11, room=42, ws_id="aabb"))
+        self.assertNotIn(11, auto._leave_reasons)
+        self.assertEqual(auto.drain_leaves(), [])
+        item = next(row for row in auto._queue if row.command == "game.sitout")
+        decoded = decode_packet(item.raw)
+        self.assertEqual(decoded["p"]["c"], "game.sitout")
+        data = json.loads(decoded["p"]["p"]["data"])
+        self.assertIs(data["sitOutMap"]["sitOutNextHand"], False)
+        self.assertFalse(any(data["sitOutMap"].values()))
+        self.assertFalse(any(row.command in {"game.leave_Seat", "game.quit_table"} for row in auto._queue))
+
+    def test_sit_in_skipped_when_play_off_or_leave_all(self):
+        auto = DeviceAutomation("dev")
+        auto.policy = AutoPolicy.from_mapping({"enabled": False, "play_enabled": False, "table_count": 1})
+        auto.mark_stack(11, 100.0, 6, True)
+        auto.mark_sitout(11, True)
+        self.assertFalse(auto.request_sit_in(11, room=42))
+        auto.policy.play_enabled = True
+        auto.schedule_leave_all([11], gradual=False)
+        self.assertFalse(auto.request_sit_in(11, room=42))
 
     def test_sitout_never_leaves_a_live_table(self):
         auto = DeviceAutomation("dev")
@@ -825,7 +930,7 @@ class WatchdogJoinTests(unittest.TestCase):
         self.assertNotIn(11, auto._leave_reasons)
         auto.mark_stack(11, 100.0, 1, True)
         auto.tick(seated_tables=1, live_table_ids=[11])
-        self.assertNotIn(11, auto._leave_reasons)
+        self.assertIn(11, auto._leave_reasons)
 
     def test_known_low_stack_leaves_after_grace(self):
         auto = DeviceAutomation("dev")

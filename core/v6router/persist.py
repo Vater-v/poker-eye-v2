@@ -62,6 +62,7 @@ class AutoPolicy:
     min_players: int = MIN_PLAYERS
     leave_below_bb: float = LEAVE_BELOW_BB
     open_if_free_bb: float = OPEN_IF_FREE_BB
+    ledger_enabled: bool = False
 
     def __init__(self, **kwargs: Any) -> None:
         self.enabled = bool(kwargs.get("enabled", False))
@@ -73,6 +74,7 @@ class AutoPolicy:
         self.min_players = int(kwargs.get("min_players", MIN_PLAYERS))
         self.leave_below_bb = float(kwargs.get("leave_below_bb", LEAVE_BELOW_BB))
         self.open_if_free_bb = float(kwargs.get("open_if_free_bb", OPEN_IF_FREE_BB))
+        self.ledger_enabled = bool(kwargs.get("ledger_enabled", False))
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "AutoPolicy":
@@ -84,6 +86,9 @@ class AutoPolicy:
         leave_below = _finite(data.get("leave_below_bb")) or LEAVE_BELOW_BB
         open_free = _finite(data.get("open_if_free_bb")) or OPEN_IF_FREE_BB
         play = data.get("play_enabled")
+        ledger = data.get("ledger_enabled")
+        if ledger is None:
+            ledger = data.get("uchet")
         return cls(
             enabled=bool(data.get("enabled")),
             play_enabled=True if play is None else bool(play),
@@ -94,6 +99,7 @@ class AutoPolicy:
             min_players=min_players,
             leave_below_bb=max(1.0, float(leave_below)),
             open_if_free_bb=max(1.0, float(open_free)),
+            ledger_enabled=bool(ledger),
         )
 
     def public(self) -> dict[str, Any]:
@@ -107,6 +113,7 @@ class AutoPolicy:
             "min_players": self.min_players,
             "leave_below_bb": self.leave_below_bb,
             "open_if_free_bb": self.open_if_free_bb,
+            "ledger_enabled": bool(self.ledger_enabled),
         }
 
 

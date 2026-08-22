@@ -51,6 +51,9 @@ export type TableRow = {
   hero_seat?: number;
   warning?: string;
   warning_text?: string;
+  session_profit?: number | null;
+  docs_status?: string;
+  docs_hands?: number | null;
 };
 
 export type AutoPolicy = {
@@ -63,6 +66,7 @@ export type AutoPolicy = {
   min_players: number;
   leave_below_bb: number;
   open_if_free_bb: number;
+  ledger_enabled?: boolean;
 };
 
 export type AutomationState = {
@@ -118,6 +122,13 @@ export type Snapshot = {
   fuel_per_minute?: number | null;
   fuel_per_hour?: number | null;
   fuel_active_tables?: number | null;
+  run?: string;
+  stale?: boolean;
+  snapshot_error?: string;
+  seated_tables?: number;
+  live_tables?: number;
+  staged_build?: string;
+  reload_pending?: boolean;
 };
 
 export type ConsoleEvent = {
@@ -213,9 +224,20 @@ export function useConsole() {
     if (paused.value) return;
     try {
       const data = await api("api/state");
-      snapshot.value = data.snapshot || data;
-      events.value = data.events || [];
-      run.value = data.run || "";
+      const incoming = (data.snapshot || data) as Snapshot;
+      const incomingDevices = incoming?.devices || [];
+      const hadDevices = (snapshot.value?.devices || []).length > 0;
+      if (incomingDevices.length === 0 && hadDevices) {
+        snapshot.value = {
+          ...(snapshot.value as Snapshot),
+          stale: true,
+          snapshot_error: String(incoming?.snapshot_error || "empty_live_snapshot"),
+        };
+      } else {
+        snapshot.value = incoming;
+      }
+      events.value = data.events || events.value;
+      run.value = String(data.run || run.value || "");
       health.value = "live";
       error.value = "";
     } catch (exc: any) {

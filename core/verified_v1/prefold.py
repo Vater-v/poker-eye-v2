@@ -292,6 +292,34 @@ def parse_prefold_config(text: str) -> PrefoldConfig:
     return PrefoldConfig(enabled=enabled, mode=mode, rules=tuple(rules))
 
 
+def street_from_board(
+    *,
+    hand_id: Any = "",
+    board_count: int = 0,
+    emitted_stages: Iterable[str] = (),
+    street_hand_id: Any = "",
+) -> str:
+    """Street for the NLH chart. A leaked FLOP mark from the previous hand
+    is not a flop when this deal has no board and a different/empty hand id.
+    """
+    try:
+        count = int(board_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count >= 5:
+        return "RIVER"
+    if count >= 4:
+        return "TURN"
+    if count >= 3:
+        return "FLOP"
+    hid = str(hand_id or "").strip()
+    previous = str(street_hand_id or "").strip()
+    stages = {str(stage or "").strip().upper() for stage in emitted_stages}
+    if hid and hid == previous and stages.intersection({"FLOP", "TURN", "RIVER"}):
+        return "FLOP"
+    return "PREFLOP"
+
+
 def evaluate_prefold(config: PrefoldConfig, context: PrefoldContext) -> PrefoldDecision:
     live = config.mode is PrefoldMode.LIVE
     flags = {"audit_only": not live, "emit_protocol": live, "bypass_ai": live}
@@ -301,7 +329,10 @@ def evaluate_prefold(config: PrefoldConfig, context: PrefoldContext) -> PrefoldD
         return PrefoldDecision(False, None, "PREFOLD_MODE_BLOCKED", audit_only=True, emit_protocol=False, bypass_ai=False)
     if not context.state_complete:
         return PrefoldDecision(False, None, "PREFOLD_STATE_INCOMPLETE", **flags)
-    if context.game_family.strip().upper() != "NLH":
+    family = context.game_family.strip().upper().replace(" ", "").replace("_", "")
+    if family in {"RING", "CASH", "CASHGAME", "NL", "NLHE", "HOLDEM", "HOLD'EM"}:
+        family = "NLH"
+    if family != "NLH":
         return PrefoldDecision(False, None, "PREFOLD_NOT_NLH", **flags)
     if context.street.strip().upper() != "PREFLOP":
         return PrefoldDecision(False, None, "PREFOLD_NOT_PREFLOP", **flags)

@@ -16,6 +16,7 @@ from ..verified_v1.coin_action_wire import (
     build_game_leave_seat_packet,
     build_game_quit_table_packet,
     build_game_reserve_seat_packet,
+    build_game_sitout_packet,
     build_game_take_seat_packet,
     build_lobby_join_game_packet,
 )
@@ -45,6 +46,12 @@ from .persist import (
     _policy_path,
 )
 from .router import RoutedEvent, _decode_event, _forward
+from .wallet_cash import apply_table_close, is_lobby_command, wallet_from_payload
+
+
+def _wallet_from_payload(data: Any, *, source: str = "lobby") -> Optional[float]:
+    return wallet_from_payload(data, source=source)
+
 
 JOIN_GAP_MIN_SECONDS = 25.0
 JOIN_GAP_MAX_SECONDS = 40.0
@@ -104,6 +111,7 @@ class DeviceAutomation:
         self.table_of_room: dict[int, int] = {}
         self.configs: dict[int, RoomConfig] = {}
         self.wallet_cash: Optional[float] = None
+        self.lobby_wallet_cash: Optional[float] = None
         self._queue: list[PendingCommand] = []
         self._joining = False
         self._last_join_at = 0.0
@@ -130,6 +138,7 @@ class DeviceAutomation:
         self._peak_players: dict[int, int] = {}
         self._table_bb: dict[int, float] = {}
         self._leave_inflight: set[int] = set()
+        self._sit_in_at: dict[int, float] = {}
         self._tabs: dict[int, float] = {}
         self._join_block_until = 0.0
         self._next_join_gap = JOIN_GAP_MIN_SECONDS
@@ -155,6 +164,8 @@ class DeviceAutomation:
             "seated_tables": sorted(int(tid) for tid in self._seated if int(tid) > 0),
             "play_enabled": bool(self.policy.play_enabled),
             "policy": self.policy.public(),
+            "lobby_wallet_cash": self.lobby_wallet_cash,
+            "wallet_cash": self.wallet_cash,
         })
 
     def _restore_runtime(self) -> None:
@@ -175,6 +186,8 @@ class DeviceAutomation:
         play = blob.get("play_enabled")
         if play is not None:
             self.policy.play_enabled = bool(play)
+        # Never restore wallet from disk. run_7e1d persisted leftover+stacks
+        # (16.476/23.405) and the next sit wrote that lie as History St/End.
 
     def snapshot(self) -> dict[str, Any]:
         bbs = sorted({round(row.big_blind, 4) for row in self.configs.values() if row.mini_game_type == 1})
@@ -195,7 +208,11 @@ class DeviceAutomation:
             "sitout_tables": sorted(self._sitout),
             "coin_tabs": self.coin_tab_count(),
             "coin_tab_cap": COIN_MAX_TABLES,
-            "ui": dict(self._ui_last),
+            "ui": {
+                key: value
+                for key, value in dict(self._ui_last).items()
+                if key != "rows"
+            },
         }
 
     def apply_policy(self, raw: dict[str, Any], *, enable: Optional[bool] = None) -> AutoPolicy:
@@ -269,8 +286,9 @@ class DeviceAutomation:
         self._closed_reasons[table_id] = why
         stack_bb = self._stack_bb.pop(table_id, None)
         bb = self._table_bb.pop(table_id, self.policy.bb)
-        if stack_bb and bb and self.wallet_cash is not None:
-            self.wallet_cash = float(self.wallet_cash) + float(stack_bb) * float(bb)
+        self.wallet_cash = apply_table_close(
+            wallet=self.wallet_cash, stack_bb=stack_bb, bb=bb,
+        )
         self._seated.discard(table_id)
         self._sitout.discard(table_id)
         self._sitout_since.pop(table_id, None)
@@ -389,8 +407,59 @@ class DeviceAutomation:
     def tick(self, *, seated_tables: int, live_table_ids: Optional[list[int]] = None) -> None:
         live = set(int(item) for item in (live_table_ids or self._seated))
         self._seated = {tid for tid in self._seated if tid in live}
-        # Manual: operator sits and leaves in Coin. Trainer only plays CC
-        # and honors operator leave-all. No auto-join, no auto-standup.
+        # Auto-off: operator sits and leaves. Auto-on + watch_players: leave a
+        # ring that finished a hand below min_players. Sitout never leaves.
+        if self.policy.enabled and self.policy.watch_players:
+            self._watch_short_handed(live)
+
+    def _watch_short_handed(self, live: set[int]) -> None:
+        min_n = int(self.policy.min_players)
+        for table_id in list(live):
+            if bool(self._hand_live.get(table_id)):
+                continue
+            if table_id in self._leave_reasons or self._leaving_all:
+                continue
+            hands = int(self._hands_done.get(table_id) or 0)
+            players = int(self._players.get(table_id) or 0)
+            if hands > 0 and players > 0 and players < min_n:
+                self._request_leave(table_id, f"пусто {players} игроков")
+
+    def request_sit_in(self, table_id: int, *, room: int, ws_id: str = "") -> bool:
+        """Queue captured game.sitout sitOutNextHand=false. Never leave_Seat."""
+        table_id = int(table_id)
+        if not bool(self.policy.play_enabled):
+            return False
+        if self._leaving_all or table_id in self._leave_reasons or table_id in self._leave_inflight:
+            return False
+        if table_id not in self._sitout:
+            return False
+        if table_id not in self._seated:
+            return False
+        try:
+            room_id = int(room)
+        except (TypeError, ValueError):
+            room_id = 0
+        if room_id <= 0:
+            return False
+        now = time.monotonic()
+        last = float(self._sit_in_at.get(table_id) or 0.0)
+        if now - last < 20.0:
+            return False
+        if any(item.table_id == table_id and item.command == "game.sitout" for item in self._queue):
+            return False
+        if ws_id:
+            self.game_ws[table_id] = str(ws_id)
+        self.room_of_table[table_id] = room_id
+        self._sit_in_at[table_id] = now
+        self._enqueue(
+            "game.sitout",
+            room_id,
+            build_game_sitout_packet(room_id, sit_out_next_hand=False),
+            ws_kind="game",
+            table_id=table_id,
+        )
+        self._note("automation.sit_in", f"возвращаемся из ситаута · стол {table_id}")
+        return True
 
     def _watch_tables(self, live: set[int], now: float) -> None:
         for table_id in list(live):
@@ -648,6 +717,8 @@ class DeviceAutomation:
             return
         data = routed.data if isinstance(routed.data, dict) else {}
         self._ingest_catalog(routed)
+        if routed.direction == "in" and is_lobby_command(routed.command):
+            self._capture_start_wallet(data, source="lobby")
         if routed.command == "lobby.join_game" and routed.direction == "in":
             failed = data.get("isSuccess") is False or int(data.get("errorCode") or 0) != 0
             if failed:
@@ -658,6 +729,7 @@ class DeviceAutomation:
                 self._note("automation.join_rejected", "Coin отклонил поиск стола · пауза", severity="WARN")
         if routed.command == "lobby.join_game_table" and routed.direction == "in":
             self._joining = False
+            self._capture_start_wallet(data, source="lobby")
             for tid in routed.table_ids:
                 self._tabs[int(tid)] = 0.0
                 self._last_opened_table = int(tid)
@@ -666,9 +738,8 @@ class DeviceAutomation:
                     continue
                 props = row.get("roomProperties") if isinstance(row.get("roomProperties"), dict) else {}
                 self._remember_config(props, name=str(row.get("tableName") or ""))
-                balance = _finite(data.get("balance") or props.get("balance"))
-                if balance is not None:
-                    self.wallet_cash = balance
+                self._capture_start_wallet(row, source="table")
+                self._capture_start_wallet(props, source="table")
         if routed.command in {"game.game_init", "game.wait_list_data"} and routed.table_ids:
             table_id = int(routed.table_ids[0])
             if routed.room_id:
@@ -676,9 +747,11 @@ class DeviceAutomation:
                 self.table_of_room[int(routed.room_id)] = table_id
             if routed.websocket_id:
                 self.game_ws[table_id] = str(routed.websocket_id)
+            self._capture_start_wallet(data, source="table")
             if routed.command == "game.game_init":
                 size = 0
                 init = data.get("gameInitResponseData") if isinstance(data.get("gameInitResponseData"), dict) else data
+                self._capture_start_wallet(init, source="table")
                 try:
                     size = int((init or {}).get("maxSize") or (init or {}).get("tableSize") or 0)
                 except (TypeError, ValueError):
@@ -700,9 +773,7 @@ class DeviceAutomation:
                 ):
                     self._want_seat.add(table_id)
         if routed.command == "game.reserve_Seat" and routed.direction == "in":
-            balance = _finite(data.get("balance"))
-            if balance is not None:
-                self.wallet_cash = balance
+            self._capture_start_wallet(data, source="table")
             if data.get("isReserved") is True or int(data.get("errorCode") or 0) == 0:
                 table_id = int(self.table_of_room.get(int(routed.room_id or 0), 0) or (routed.table_ids[0] if routed.table_ids else 0))
                 seat = int(data.get("seatId") or 0)
@@ -1019,16 +1090,47 @@ class DeviceAutomation:
             self._table_bb[int(table_id)] = float(value)
 
     def mark_wallet(self, cash: float) -> None:
-        value = _finite(cash)
-        if value is not None:
-            self.wallet_cash = value
+        self._capture_start_wallet({"balance": cash}, source="lobby")
 
-    def _note(self, event: str, text: str, *, severity: str = "INFO") -> None:
+    def _capture_start_wallet(self, data: Any, *, source: str = "lobby") -> None:
+        """Freeze Coin lobby cash from lobby traffic. Never a table stack."""
+        value = _wallet_from_payload(data, source=source)
+        if value is None:
+            return
+        previous = self.wallet_cash
+        self.wallet_cash = value
+        first = self.lobby_wallet_cash is None
+        if first:
+            self.lobby_wallet_cash = value
+            self._note(
+                "automation.lobby_wallet",
+                f"стартовый баланс лобби {value:g}",
+                wallet_cash=value,
+                wallet_source="lobby",
+            )
+            self.persist_runtime()
+            return
+        if source == "lobby" and (
+            previous is None or abs(float(previous) - float(value)) >= 0.005
+        ):
+            self._note(
+                "automation.lobby_wallet",
+                f"баланс лобби {value:g}",
+                wallet_cash=value,
+                wallet_source="lobby",
+            )
+
+    def _note(self, event: str, text: str, *, severity: str = "INFO", **extra) -> None:
         try:
-            self._sink(event, text, severity)
+            self._sink(event, text, severity, extra)
         except TypeError:
             try:
-                self._sink(event)
+                self._sink(event, text, severity)
+            except TypeError:
+                try:
+                    self._sink(event)
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception:

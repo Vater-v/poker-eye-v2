@@ -90,6 +90,37 @@ def _nonempty(value: Any) -> bool:
     return True
 
 
+def _second_board_cards(value: Any) -> bool:
+    """True only when a second board actually has cards.
+
+    Coin often ships ``dealerCardsDoubleBoard: {FLOP:[], TURN:[], RIVER:[]}``
+    on preflop ``game.user_turn``. A nonempty dict is not a second board.
+    """
+    if value in (None, "", False, 0, 0.0):
+        return False
+    if isinstance(value, dict):
+        if any(key in value for key in ("suit", "value", "rank", "card")):
+            return True
+        return any(_second_board_cards(child) for child in value.values())
+    if isinstance(value, (list, tuple, set)):
+        for child in value:
+            if isinstance(child, bool):
+                continue
+            if isinstance(child, (int, float)):
+                if int(child) > 0:
+                    return True
+                continue
+            if _second_board_cards(child):
+                return True
+        return False
+    if isinstance(value, (int, float)):
+        return int(value) > 0
+    if isinstance(value, str):
+        text = value.strip()
+        return bool(text) and text.lower() not in {"0", "false", "null", "none"}
+    return False
+
+
 def _configuration_path(path: str, node: dict[str, Any]) -> bool:
     lower = path.lower()
     if any(marker in lower for marker in _CONFIG_PATH_MARKERS):
@@ -99,6 +130,43 @@ def _configuration_path(path: str, node: dict[str, Any]) -> bool:
         ("isBombpot" in node or "isFixedHandBombpot" in node)
         and "isBombpotHand" not in node
     )
+
+
+def has_primary_board_cards(payload: Any) -> bool:
+    """True when the current hand already has a flop/turn/river on the main board."""
+    for _path, value in _walk(payload):
+        if not isinstance(value, dict):
+            continue
+        for key in ("dealerCards", "communityCards"):
+            if key in value and _second_board_cards(value.get(key)):
+                return True
+    return False
+
+
+def stale_double_board_should_drop(
+    payload: Any,
+    command: Optional[str] = None,
+    *,
+    detected: bool = False,
+) -> bool:
+    """Drop a leftover Warning: DB when this packet is an ordinary new hand or preflop.
+
+    Extra Time on an empty board is still preflop. A previous hand's room mark
+    must not freeze it.
+    """
+    if detected:
+        return False
+    cmd = str(command or _command(payload) or "").lower()
+    if cmd in {
+        "game.reset_data",
+        "game.pre_hand_start_info",
+        "game.game_init",
+        "game.game_start",
+    }:
+        return True
+    if cmd == "game.user_turn" and not has_primary_board_cards(payload):
+        return True
+    return False
 
 
 def detect_double_board(payload: Any, command: Optional[str] = None) -> tuple[bool, str]:
@@ -131,8 +199,8 @@ def detect_double_board(payload: Any, command: Optional[str] = None) -> tuple[bo
         # Non-empty second-board data is the strongest evidence and is valid even
         # if Coin omitted the boolean flags.
         for key in _SECOND_BOARD_KEYS:
-            if key in value and _nonempty(value.get(key)):
-                return True, f"{path}.{key}=nonempty"
+            if key in value and _second_board_cards(value.get(key)):
+                return True, f"{path}.{key}=cards"
 
         is_hand = value.get("isBombpotHand") is True
         if is_hand and value.get("bombpotInducesDoubleBoard") is True:

@@ -14,16 +14,20 @@ import argparse
 import asyncio
 import base64
 import collections
+import contextlib
 import hashlib
 import hmac
 import json
 import http.server
 import os
 import queue
+import signal
 import socket
 import struct
+import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -41,7 +45,14 @@ from .v6router.router import (
     RouterObservation,
     _decode_event,
 )
-from .verified_v1.coin_bridge_live import device_hud_payload
+from .verified_v1.coin_bridge_live import device_hud_payload, hud_clear
+from .deploy_reload import (
+    annotate_snapshot,
+    clear_reload_request,
+    read_disk_build,
+    request_path,
+    should_apply_deferred_reload,
+)
 
 PROTOCOL_VERSION = 2
 TRANSPORT_MAX_FRAME = 20_000_000
@@ -399,6 +410,8 @@ class OperatorConsole:
         self._completed_hands: set[tuple[str, int, str]] = set()
         self._table_account: dict[tuple[str, int], str] = {}
         self._device_nick: dict[str, str] = {}
+        self.history_ledger = None
+        self.hud_sender = None
 
     def _clock(self) -> str:
         return datetime.now().strftime("%H:%M:%S")
@@ -468,7 +481,10 @@ class OperatorConsole:
     @staticmethod
     def _game_type_label(value: Any) -> str:
         text = str(value or "").upper().replace(" ", "")
-        aliases = {"PLO": "PLO4", "OMAHA": "PLO4", "HOLDEM": "NLH", "HOLD'EM": "NLH"}
+        aliases = {
+            "PLO": "PLO4", "OMAHA": "PLO4", "HOLDEM": "NLH", "HOLD'EM": "NLH",
+            "RING": "NLH", "CASH": "NLH", "NL": "NLH", "NLHE": "NLH",
+        }
         return aliases.get(text, text or "OTHER")
 
     def _session_hands_text(self, device_id: str) -> str:
@@ -668,6 +684,11 @@ class OperatorConsole:
                 "operator.action_sent", device_id=device_id, table_id=table_id,
                 action=meta.get("action"), amount=meta.get("amount"), attempt=attempt, token=token,
             )
+            sender = self.hud_sender
+            if callable(sender):
+                payload = device_hud_payload(hud_clear())
+                if payload:
+                    sender(device_id, payload)
         else:
             reason = self.NATIVE_FAIL_RU.get(int(result.get("reason_code") or 0), "локальная отправка не удалась")
             self._line(
@@ -677,15 +698,89 @@ class OperatorConsole:
                 reason_code=result.get("reason_code"),
             )
 
+    def _feed_ledger(self, observation: RouterObservation) -> None:
+        ledger = getattr(self, "history_ledger", None)
+        if ledger is None:
+            return
+        kind = observation.kind
+        device = observation.device_id
+        detail = dict(observation.detail or {})
+        tag = str(detail.get("tag") or "")
+        sat = kind in {"table_sat", "seated"} or (kind == "bridge_diag" and tag == "seated")
+        if kind == "hand_started" or sat:
+            if not str(detail.get("nickname") or "").strip():
+                detail["nickname"] = str(self._device_nick.get(device) or "")
+            game_type = self._game_type_label(observation.game_type or detail.get("game_type"))
+            if game_type:
+                detail["game_type"] = game_type
+            counter = self._hands_by_type_device.get(str(device)) or collections.Counter()
+            if detail.get("session_hands") is None:
+                detail["session_hands"] = int(counter.get(game_type, 0) or 0)
+            if detail.get("wallet_cash") is None and detail.get("lobby_wallet") is None:
+                lookup = getattr(ledger, "lobby_wallet_lookup", None) or getattr(ledger, "wallet_lookup", None)
+                if callable(lookup):
+                    try:
+                        detail["lobby_wallet"] = lookup(device)
+                    except Exception:
+                        pass
+            # RouterObservation is frozen. Copy, never assign back onto `detail`.
+            observation = replace(observation, detail=detail)
+        elif kind == "table_close":
+            # End is lobby traffic or St+hands. Never reconstructed wallet.
+            observation = replace(observation, detail=detail)
+
+        def _run_observe() -> None:
+            try:
+                ledger.observe(observation)
+            except Exception as exc:
+                self.technical(
+                    "operator.ledger_error",
+                    severity="WARN",
+                    device_id=device,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        # Sheets HTTP must not stall the native event loop. A blocking
+        # get_history on hand_started emptied the console to 0/0 while учет
+        # was on (run_a1f77178068c).
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _run_observe()
+        else:
+            loop.run_in_executor(None, _run_observe)
+
     def observation(self, observation: RouterObservation) -> None:
         kind = observation.kind
         device = observation.device_id
         table = int(observation.table_id or 0)
         detail = dict(observation.detail or {})
+        tag = str(detail.get("tag") or "")
+        ledger_kinds = kind in {"hand_started", "hand_completed", "table_close", "table_sat", "seated"}
+        ledger_diag = kind == "bridge_diag" and tag == "seated"
+        if ledger_kinds or ledger_diag:
+            # Ledger must never abort Coin routing. A FrozenInstanceError here
+            # used to drop the rest of the packet, including FOLD ACKs.
+            try:
+                self._feed_ledger(observation)
+            except Exception as exc:
+                self.technical(
+                    "operator.ledger_error",
+                    severity="WARN",
+                    device_id=device,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
         if table > 0:
             label = self._label(device, table)
         else:
             label = f"Устройство {self._device(device)}"
+
+        if kind == "bridge_diag" and tag == "sitout_detected" and table <= 0:
+            self._line(
+                f"{label}: ⚠ ситаут не по сценарию",
+                "operator.nonscript_sitout", severity="WARN",
+                device_id=device, table_id=table,
+            )
 
         if kind == "account_connecting" and table > 0:
             if observation.account_id:
@@ -959,6 +1054,10 @@ class OperatorConsole:
                     "amount": None,
                     "attempt": int(detail.get("attempt") or 1),
                     "max_attempts": int(detail.get("max_attempts") or 3),
+                    "source": "failsafe",
+                    "hand": detail.get("hand"),
+                    "position": detail.get("position"),
+                    "facing": detail.get("facing"),
                 }
                 self._latest_by_table[(device, table)] = dict(meta)
                 why = str(detail.get("reason") or "").upper()
@@ -968,6 +1067,23 @@ class OperatorConsole:
                     "operator.fallback_ready", severity="WARN",
                     device_id=device, table_id=table,
                     action=meta["action"], reason=why,
+                )
+                where = " · ".join(
+                    part for part in (
+                        str(detail.get("position") or ""),
+                        str(detail.get("facing") or ""),
+                        str(detail.get("hand") or ""),
+                        why,
+                    ) if part
+                )
+                self._line(
+                    f"{label}: ⚠ {self._action_text(meta)} не по сценарию · failsafe"
+                    + (f" · {where}" if where else ""),
+                    "operator.nonscript_fold", severity="WARN",
+                    device_id=device, table_id=table,
+                    action=meta["action"], reason=why,
+                    hand=detail.get("hand"), position=detail.get("position"),
+                    facing=detail.get("facing"),
                 )
             elif tag == "action_retry":
                 meta = dict(self._latest_by_table.get((device, table)) or {})
@@ -993,12 +1109,31 @@ class OperatorConsole:
                     "action": detail.get("action") or meta.get("action"),
                     "amount": detail.get("amount", meta.get("amount")),
                 })
+                source = str(detail.get("source") or meta.get("source") or "").lower()
                 self._line(
                     f"{label}: ✓ {self._action_text(meta)} выполнено",
                     "operator.action_confirmed", device_id=device, table_id=table,
                     action=meta.get("action"), amount=meta.get("amount"),
                     attempt=detail.get("attempt"),
                 )
+                action_name = str(meta.get("action") or "").upper()
+                if source == "failsafe" or (
+                    action_name in {"FOLD", "CHECK"} and source in {"failsafe", "fallback"}
+                ):
+                    where = " · ".join(
+                        part for part in (
+                            str(meta.get("position") or detail.get("position") or ""),
+                            str(meta.get("facing") or detail.get("facing") or ""),
+                            str(meta.get("hand") or detail.get("hand") or ""),
+                        ) if part
+                    )
+                    self._line(
+                        f"{label}: ⚠ {self._action_text(meta)} ACK не по сценарию · failsafe"
+                        + (f" · {where}" if where else ""),
+                        "operator.nonscript_ack", severity="WARN",
+                        device_id=device, table_id=table,
+                        action=meta.get("action"), source=source or "failsafe",
+                    )
             elif tag == "action_cancelled":
                 reason = self.CANCEL_RU.get(str(detail.get("reason") or ""), str(detail.get("reason") or "отменено"))
                 self._line(
@@ -1010,6 +1145,11 @@ class OperatorConsole:
                 self._line(
                     f"{label}: ситаут / wait BB — остаёмся за столом",
                     "operator.sitout", severity="WARN",
+                    device_id=device, table_id=table,
+                )
+                self._line(
+                    f"{label}: ⚠ ситаут не по сценарию",
+                    "operator.nonscript_sitout", severity="WARN",
                     device_id=device, table_id=table,
                 )
             elif tag == "cc_streak_standup":
@@ -1154,6 +1294,7 @@ class RouterService:
         self.accounts = accounts
         self.observation_sink = observation_sink
         self.technical_sink = technical_sink or (lambda *_args, **_kwargs: None)
+        self.error_sink = None
         self.factory = LiveTableSessionFactory(
             accounts=accounts,
             credential_file=credential_file,
@@ -1187,7 +1328,14 @@ class RouterService:
         self._device_labels: dict[str, str] = {}
         self.fleet_provider = None
         self.automation_store = AutomationStore()
+        from .v6router.history_ledger import HistoryLedger
+
+        self.history_ledger = HistoryLedger.open_default()
+        self.history_ledger.wallet_lookup = self._wallet_cash_for
+        self.history_ledger.lobby_wallet_lookup = self._lobby_wallet_for
+        self.history_ledger.event_sink = self._ledger_event
         self._last_snapshot: dict[str, Any] = {}
+        self.run_name: str = ""
         self._ui_log_at: dict[str, float] = {}
         self._ui_log_key: dict[str, str] = {}
         self._reaper = asyncio.run_coroutine_threadsafe(self._reaper_loop(), self.loop)
@@ -1195,6 +1343,26 @@ class RouterService:
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
+
+    def _wallet_cash_for(self, device_id: str) -> Any:
+        router = self._routers.get(str(device_id))
+        auto = getattr(router, "automation", None)
+        return getattr(auto, "wallet_cash", None)
+
+    def _lobby_wallet_for(self, device_id: str) -> Any:
+        router = self._routers.get(str(device_id))
+        auto = getattr(router, "automation", None)
+        return getattr(auto, "lobby_wallet_cash", None)
+
+    def _ledger_event(self, code: str, text: str, fields: dict[str, Any] | None = None) -> None:
+        line = getattr(self, "_operator_line", None)
+        if line is None:
+            return
+        payload = dict(fields or {})
+        severity = "INFO"
+        if str(code) == "ledger_error" or payload.get("status") == "dry":
+            severity = "WARN"
+        line(str(text), f"operator.{code}", severity=severity, **payload)
 
     async def _router(self, device_id: str) -> DeviceIngressRouter:
         router = self._routers.get(device_id)
@@ -1204,13 +1372,13 @@ class RouterService:
             automation = DeviceAutomation(
                 device_id,
                 store=self.automation_store,
-                sink=lambda event, text="", severity="INFO": self.observation_sink(
+                sink=lambda event, text="", severity="INFO", extra=None: self.observation_sink(
                     RouterObservation(
                         kind=str(event),
                         device_id=device_id,
                         status="green" if severity == "INFO" else "yellow",
                         reason=str(text or ""),
-                        detail={"automation": True},
+                        detail={"automation": True, **(extra or {})},
                     )
                 ),
             )
@@ -1235,8 +1403,13 @@ class RouterService:
                 startup_attempt_timeout=3.0,
                 startup_stale_seconds=20.0,
                 automation=automation,
+                history_ledger=self.history_ledger,
             )
             self._routers[device_id] = router
+            if self.history_ledger is not None:
+                self.history_ledger.set_device_enabled(
+                    device_id, bool(getattr(automation.policy, "ledger_enabled", False))
+                )
             router.start_watchdog()
         return router
 
@@ -1308,6 +1481,24 @@ class RouterService:
         self._heartbeat_at[device_id] = now
         self._last_seen[device_id] = now
 
+    def persist_error(self, event: str, exc: BaseException, **fields: Any) -> None:
+        payload = {
+            "severity": "ERROR",
+            "error_type": type(exc).__name__,
+            "error": _short(exc),
+            **fields,
+        }
+        try:
+            self.technical_sink(str(event or "runtime.handler_error"), **payload)
+        except Exception:
+            pass
+        sink = self.error_sink
+        if callable(sink):
+            try:
+                sink(str(event or "runtime.handler_error"), message=_short(exc), **payload)
+            except Exception:
+                pass
+
     def device_online(self, device_id: str, *, now: Optional[float] = None) -> bool:
         device_id = str(device_id or "")
         stamp = float(self._heartbeat_at.get(device_id) or self._last_seen.get(device_id) or 0.0)
@@ -1317,6 +1508,46 @@ class RouterService:
         # A 1s native reconnect used to drop `_connected` and paint the device
         # offline even though the next hello was already on the wire.
         return age < HEARTBEAT_OFFLINE_SECONDS
+
+    def live_pressure(self) -> tuple[int, int]:
+        """Seated and live table counts. Conservative: max of routers, persist, last snap."""
+        seated = 0
+        live = 0
+        try:
+            routers = list(self._routers.values())
+        except Exception:
+            return 1, 1
+        for router in routers:
+            try:
+                auto = getattr(router, "automation", None)
+                if auto is not None:
+                    seated += len(getattr(auto, "_seated", ()) or ())
+                live += len(getattr(router, "active_table_ids", ()) or ())
+            except Exception:
+                seated += 1
+                live += 1
+        try:
+            store = getattr(self, "automation_store", None)
+            if store is not None:
+                for blob in (store.all_runtime() or {}).values():
+                    n = 0
+                    for raw in (blob or {}).get("seated_tables") or []:
+                        try:
+                            if int(raw) > 0:
+                                n += 1
+                        except (TypeError, ValueError):
+                            continue
+                    seated = max(seated, n)
+                    live = max(live, n)
+        except Exception:
+            pass
+        last = self._last_snapshot if isinstance(getattr(self, "_last_snapshot", None), dict) else {}
+        try:
+            seated = max(seated, int(last.get("seated_tables") or 0))
+            live = max(live, int(last.get("live_tables") or 0))
+        except (TypeError, ValueError):
+            pass
+        return seated, live
 
     async def _handle(self, device_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         self.note_ping(device_id)
@@ -1344,6 +1575,7 @@ class RouterService:
             return future.result(timeout=4.0)
         except Exception as exc:
             future.cancel()
+            self.persist_error("router.handle", exc, device_id=device_id)
             self.technical_sink("router.slow_or_error", severity="WARN", device_id=device_id, error_type=type(exc).__name__, error=_short(exc))
             return {
                 "id": event.get("id"),
@@ -1435,7 +1667,7 @@ class RouterService:
         except asyncio.CancelledError:
             return
 
-    async def _control_snapshot(self) -> dict[str, Any]:
+    async def _control_snapshot(self, compact: bool = True) -> dict[str, Any]:
         devices = []
         fleet = {}
         provider = self.fleet_provider
@@ -1446,8 +1678,22 @@ class RouterService:
                 fleet = {}
         listed: set[str] = set()
         now_mono = time.monotonic()
+        last_by_id = {
+            str(row.get("device_id") or ""): row
+            for row in ((self._last_snapshot or {}).get("devices") or [])
+            if isinstance(row, dict) and row.get("device_id")
+        }
         for device_id, router in sorted(self._routers.items()):
-            row = await router.control_snapshot()
+            try:
+                row = await asyncio.wait_for(
+                    router.control_snapshot(compact=compact), timeout=1.5
+                )
+            except Exception:
+                prev = last_by_id.get(device_id)
+                if isinstance(prev, dict):
+                    devices.append(dict(prev))
+                    listed.add(device_id)
+                continue
             for table in row.get("tables") or []:
                 table["device_id"] = device_id
             stats = fleet.get(device_id) or {}
@@ -1578,7 +1824,7 @@ class RouterService:
             fuel_per_hour = round(float(fuel_per_min) * 60.0, 1)
         if fuel_have and fuel_per_min and fuel_per_min > 0:
             fuel_hours = round(float(fuel_remaining) / (float(fuel_per_min) * 60.0), 1)
-        return {
+        payload = {
             "ok": True,
             "build": BUILD_ID,
             "patch": "MTABLE-20260818-A",
@@ -1595,21 +1841,58 @@ class RouterService:
             "fuel_active_tables": active_tables,
             "seated_tables": seated,
             "live_tables": live_tables,
+            "run": str(getattr(self, "run_name", "") or ""),
         }
+        return annotate_snapshot(
+            payload,
+            disk_build=read_disk_build(),
+            request_exists=request_path().is_file(),
+            live_build=BUILD_ID,
+        )
 
-    def control_snapshot(self) -> dict[str, Any]:
-        future = asyncio.run_coroutine_threadsafe(self._control_snapshot(), self.loop)
+    def _attach_run(self, snap: dict[str, Any]) -> dict[str, Any]:
+        snap = dict(snap or {})
+        run = str(snap.get("run") or getattr(self, "run_name", "") or "").strip()
+        if not run:
+            last = self._last_snapshot if isinstance(getattr(self, "_last_snapshot", None), dict) else {}
+            run = str(last.get("run") or "").strip()
+        if run:
+            snap["run"] = run
+        return snap
+
+    def _remember_snapshot(self, snap: dict[str, Any]) -> dict[str, Any]:
+        """Never let an empty/timeout snapshot wipe a live fleet or run id."""
+        snap = self._attach_run(snap)
+        last = self._last_snapshot if isinstance(getattr(self, "_last_snapshot", None), dict) else {}
+        last_devices = list(last.get("devices") or [])
+        if not (snap.get("devices") or []) and last_devices:
+            kept = dict(last)
+            kept["stale"] = True
+            kept["snapshot_error"] = str(
+                snap.get("snapshot_error") or "empty_live_snapshot"
+            )
+            if snap.get("run"):
+                kept["run"] = snap.get("run")
+            return kept
+        if snap.get("devices") or not last_devices:
+            self._last_snapshot = snap
+        return snap
+
+    def control_snapshot(self, compact: bool = True) -> dict[str, Any]:
+        future = asyncio.run_coroutine_threadsafe(
+            self._control_snapshot(compact=compact), self.loop
+        )
         try:
-            snap = dict(future.result(timeout=6.0))
+            snap = dict(future.result(timeout=4.0 if compact else 6.0))
             if not (snap.get("devices") or []) and (self._routers or self._connected):
                 snap = self._snapshot_on_timeout(
                     RuntimeError("empty snapshot while native sessions exist")
                 )
-            self._last_snapshot = snap
-            return snap
+            return self._remember_snapshot(snap)
         except Exception as exc:
             future.cancel()
-            return self._snapshot_on_timeout(exc)
+            self.persist_error("control.snapshot", exc, compact=compact)
+            return self._remember_snapshot(self._snapshot_on_timeout(exc))
 
     def _skeleton_snapshot(self, error: str) -> dict[str, Any]:
         now_mono = time.monotonic()
@@ -1627,7 +1910,7 @@ class RouterService:
                 "hero_name": "",
                 "display_name": self._device_labels.get(device_id, "") or device_id,
             })
-        return {
+        return self._attach_run({
             "ok": True,
             "build": BUILD_ID,
             "devices": devices,
@@ -1635,7 +1918,7 @@ class RouterService:
             "connected_devices": sum(1 for row in devices if row.get("connected")),
             "snapshot_error": error,
             "stale": True,
-        }
+        })
 
     def _snapshot_on_timeout(self, exc: BaseException) -> dict[str, Any]:
         error = f"{type(exc).__name__}: {_short(exc)}"
@@ -1644,9 +1927,7 @@ class RouterService:
             stale = dict(last)
             stale["stale"] = True
             stale["snapshot_error"] = error
-            return stale
-        if self._routers or self._connected:
-            return self._skeleton_snapshot(error)
+            return self._attach_run(stale)
         return self._skeleton_snapshot(error)
 
     async def _control_close_table(self, device_id: str, table_id: int) -> bool:
@@ -1723,6 +2004,10 @@ class RouterService:
         if isinstance(policy, dict) and "enabled" in policy:
             enable = bool(policy.get("enabled"))
         saved = auto.apply_policy(policy, enable=enable)
+        if self.history_ledger is not None:
+            self.history_ledger.set_device_enabled(
+                device_id, bool(getattr(saved, "ledger_enabled", False))
+            )
         if apply:
             await router._watchdog_tick()
         return {"ok": True, "policy": saved.public(), "automation": auto.snapshot()}
@@ -1817,14 +2102,24 @@ class TrainerControlServer:
                     return {}
 
             def do_GET(self) -> None:
-                if self.path.split("?", 1)[0] == "/snapshot":
+                raw_path = self.path.split("?", 1)[0]
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                if raw_path == "/snapshot":
                     try:
-                        self._reply(200, owner.router_service.control_snapshot())
+                        compact = "full=1" not in query
+                        self._reply(200, owner.router_service.control_snapshot(compact=compact))
                     except Exception as exc:
-                        self._reply(500, {"ok": False, "error": f"{type(exc).__name__}: {_short(exc)}"})
+                        owner.router_service.persist_error("control.http.snapshot", exc)
+                        snap = owner.router_service._snapshot_on_timeout(exc)
+                        self._reply(200, snap)
                     return
-                if self.path.split("?", 1)[0] == "/health":
-                    self._reply(200, {"ok": True, "build": BUILD_ID, "patch": "MTABLE-20260818-A"})
+                if raw_path == "/health":
+                    self._reply(200, annotate_snapshot(
+                        {"ok": True, "build": BUILD_ID, "patch": "MTABLE-20260818-A"},
+                        disk_build=read_disk_build(),
+                        request_exists=request_path().is_file(),
+                        live_build=BUILD_ID,
+                    ))
                     return
                 self._reply(404, {"ok": False, "error": "not_found"})
 
@@ -1863,6 +2158,7 @@ class TrainerControlServer:
                         self._reply(404, {"ok": False, "error": "not_found"})
                         return
                 except Exception as exc:
+                    owner.router_service.persist_error("control.http.post", exc, path=path)
                     self._reply(500, {"ok": False, "error": f"{type(exc).__name__}: {_short(exc)}"})
                     return
                 self._reply(200 if ok else 404, {"ok": bool(ok)})
@@ -2553,6 +2849,7 @@ class ProductionTrainer:
         self.public_host = public_host
         self.logger = SessionLogger(log_dir)
         self._stop = threading.Event()
+        self._reload_flag = threading.Event()
         account_path = Path(account_file)
         data = json.loads(account_path.read_text(encoding="utf-8-sig"))
         # POKEREYE_SAFE_ACCOUNT_BOOTSTRAP_V2
@@ -2637,6 +2934,12 @@ class ProductionTrainer:
             account_provisioner=None if panel is None else panel.create_account,
         )
         self.router_service.fleet_provider = self.operator.fleet_snapshot
+        self.router_service.error_sink = self.logger.error
+        self.router_service.run_name = f"run_{self.logger.run_id}"
+        self.operator.history_ledger = self.router_service.history_ledger
+        self.router_service._operator_line = self.operator._line
+        if self.operator.history_ledger is not None:
+            self.operator.history_ledger.event_sink = self.router_service._ledger_event
         self.server = NativeIngressServer(
             self.secret,
             self.router_service,
@@ -2646,6 +2949,7 @@ class ProductionTrainer:
             host=host,
             port=port,
         )
+        self.operator.hud_sender = self.server.send_json
         self.control = TrainerControlServer(self.router_service)
         # Android APK uses exactly one configured public HMN1 endpoint.
         # There is intentionally no implicit localhost/adb-reverse fallback.
@@ -2669,7 +2973,7 @@ class ProductionTrainer:
             )
         )
         noisy_diag = kind == "bridge_diag" and str((observation.detail or {}).get("tag") or "") in {
-            "hint_sent", "turn_refresh", "identity_uid",
+            "hint_sent", "turn_refresh", "identity_uid", "action_dispatched",
         }
         if not noisy_table and not noisy_diag:
             self.logger.emit(
@@ -2693,6 +2997,10 @@ class ProductionTrainer:
     def start(self) -> None:
         port = self.server.start()
         control_port = self.control.start()
+        disk_build = read_disk_build()
+        if disk_build == BUILD_ID:
+            clear_reload_request()
+        self._install_reload_signal()
         self.logger.emit(
             "trainer.ready",
             flush=True,
@@ -2710,10 +3018,85 @@ class ProductionTrainer:
         )
         self.operator.ready()
 
+    def _install_reload_signal(self) -> None:
+        if not hasattr(signal, "SIGUSR1"):
+            return
+
+        def _handler(_signum: int, _frame: Any) -> None:
+            self._reload_flag.set()
+
+        try:
+            signal.signal(signal.SIGUSR1, _handler)
+        except (ValueError, OSError):
+            return
+
+    def _maybe_module_reload(self) -> bool:
+        flag = Path("/opt/pokereye/data/module_reload")
+        if not flag.is_file():
+            return False
+        try:
+            from .hot_reload import refresh_runtime
+            result = refresh_runtime(self)
+        except Exception as exc:
+            self.logger.emit("trainer.module_reload", severity="ERROR", error=str(exc))
+            try:
+                flag.unlink()
+            except OSError:
+                pass
+            return False
+        try:
+            flag.unlink()
+        except OSError:
+            pass
+        self.logger.emit(
+            "trainer.module_reload",
+            severity="WARN",
+            reloaded=result.get("reloaded"),
+            prefold_caches=result.get("prefold_caches"),
+        )
+        return True
+
+    def _maybe_deferred_exec(self) -> bool:
+        pending = self._reload_flag.is_set() or request_path().is_file()
+        disk_build = read_disk_build()
+        if disk_build == BUILD_ID:
+            if pending:
+                clear_reload_request()
+                self._reload_flag.clear()
+            return False
+        if not pending:
+            return False
+        seated, live = self.router_service.live_pressure()
+        if not should_apply_deferred_reload(
+            seated_tables=seated,
+            live_tables=live,
+            reload_pending=True,
+        ):
+            return False
+        self.logger.emit(
+            "trainer.deferred_reload",
+            flush=True,
+            severity="WARN",
+            live_build=BUILD_ID,
+            staged_build=disk_build,
+            seated_tables=seated,
+            live_tables=live,
+        )
+        clear_reload_request()
+        self.shutdown()
+        argv = [sys.executable, *sys.argv]
+        try:
+            os.execv(sys.executable, argv)
+        except OSError:
+            os._exit(1)
+        return True
+
     def run_forever(self) -> None:
         try:
             while not self._stop.wait(1.0):
-                pass
+                self._maybe_module_reload()
+                if self._maybe_deferred_exec():
+                    return
         except KeyboardInterrupt:
             pass
         finally:

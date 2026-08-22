@@ -12,13 +12,19 @@ from types import SimpleNamespace
 from core.v6router.automation import DeviceAutomation
 from core.v6router.router import (
     DeviceIngressRouter, LiveTableSession, RoutedEvent, _LiveTableSnapshot, _SessionSlot,
-    in_play_enough_to_lease,
+    TableLogic, hero_sitout_for_watchdog, in_play_enough_to_lease, swap_logic_between_hands,
 )
 from core.verified_v1.coin_action_wire import (
     _Byte, _Int, _Obj, _Short, _Str, decode_packet, encode_packet,
+    CAPTURED_TIMEOUT_SITOUT_MAP, SITOUT_MAP_KEYS,
+    build_game_sitout_packet, sitout_map_latched,
 )
 from core.verified_v1 import coin_ppp_bridge as ppp
-from core.verified_v1.bombpot_support import BombpotTracker, detect_double_board
+from core.verified_v1.bombpot_support import (
+    BombpotTracker,
+    detect_double_board,
+    stale_double_board_should_drop,
+)
 from core.verified_v1.coin_autoplay import CoinAutoplayCoordinator
 from core.verified_v1.coin_bridge_live import (
     LiveCoinBridge, compute_net_profits, device_hud_payload, format_action_hint,
@@ -78,6 +84,39 @@ class DoubleBoardPcapRegressionTests(unittest.TestCase):
         )
         self.assertTrue(active)
         self.assertIn("dealerCardsDoubleBoard", reason)
+
+    def test_empty_preflop_doubleboard_map_is_not_a_second_board(self):
+        extra = payload(
+            "game.user_turn",
+            {
+                "timerName": "extraTimer",
+                "whoseTurn": "Weedman834",
+                "userTurnOptions": {"4": [0.03], "7": None},
+                "dealerCards": {"FLOP": [], "TURN": [], "RIVER": []},
+                "dealerCardsDoubleBoard": {"FLOP": [], "TURN": [], "RIVER": []},
+                "potAmountListDoubleBoard": [],
+                "isDoubleBoard": True,
+            },
+        )
+        active, reason = detect_double_board(extra, "game.user_turn")
+        self.assertFalse(active, reason)
+        self.assertTrue(stale_double_board_should_drop(extra, "game.user_turn", detected=False))
+
+    def test_flop_extratimer_without_second_board_keeps_real_db_mark(self):
+        flop = payload(
+            "game.user_turn",
+            {
+                "timerName": "extraTimer",
+                "dealerCards": {
+                    "FLOP": [{"suit": "HEARTS", "value": "ACE"}, {"suit": "CLUBS", "value": "KING"}, {"suit": "SPADES", "value": "TWO"}],
+                    "TURN": [],
+                    "RIVER": [],
+                },
+                "dealerCardsDoubleBoard": {"FLOP": [], "TURN": [], "RIVER": []},
+            },
+        )
+        self.assertFalse(detect_double_board(flop, "game.user_turn")[0])
+        self.assertFalse(stale_double_board_should_drop(flop, "game.user_turn", detected=False))
 
     def test_lobby_second_board_preview_is_not_active_hand_evidence(self):
         active, reason = detect_double_board(
@@ -271,6 +310,70 @@ class TurnOptionPcapRegressionTests(unittest.TestCase):
         fallback = autoplay.schedule_failsafe(state, reason="CASE")
         self.assertEqual(fallback["action"], "CHECK")
 
+    def test_extratimer_empty_options_keeps_pending_check(self):
+        autoplay = CoinAutoplayCoordinator(chip_scale=100)
+        state = {"user_name": "TelImit", "user_id": 1, "_hook_room": ROOM}
+        first = {"direction": "in", "ws_id": "abcd0001"}
+        autoplay.observe(
+            first,
+            payload("game.user_turn", {
+                "whoseTurn": "TelImit",
+                "userTurnOptions": {"3": None, "7": None},
+                "callAmount": 0,
+                "totalPot": 0.03,
+                "turnTime": 16,
+                "timerName": "playerHandTimer",
+                "extraTimerEnabled": True,
+            }),
+            b"",
+            state,
+        )
+        autoplay.pending = {
+            "room": ROOM,
+            "turn_id": first.get("_hmuriy_turn_id"),
+            "action": "CHECK",
+            "delay_ms": 4509,
+        }
+        extra = {"direction": "in", "ws_id": "abcd0001"}
+        result = autoplay.observe(
+            extra,
+            payload("game.user_turn", {
+                "whoseTurn": "TelImit",
+                "userTurnOptions": {},
+                "turnTime": 16,
+                "timerName": "extraTimer",
+                "extraTimerEnabled": True,
+                "extraTurnTime": 14,
+            }),
+            b"",
+            state,
+        )
+        self.assertTrue(extra.get("_hmuriy_duplicate_turn"))
+        self.assertFalse(result.cancel_reason)
+        self.assertIsNotNone(autoplay.pending)
+        self.assertEqual(autoplay.pending["action"], "CHECK")
+        self.assertEqual(first.get("_hmuriy_turn_id"), extra.get("_hmuriy_turn_id"))
+        forced = autoplay.force_pending_now()
+        self.assertEqual(int(forced["delay_ms"]), 0)
+        self.assertTrue(forced.get("extra_urgent"))
+        self.assertLessEqual(float(forced["due"]), time.monotonic() + 0.05)
+
+    def test_check_delay_never_eats_the_main_clock(self):
+        autoplay = CoinAutoplayCoordinator(chip_scale=100)
+        state = {"user_name": "Hero", "user_id": 1, "_hook_room": ROOM, "hand_id": "h1"}
+        now = time.monotonic()
+        autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "t-check",
+            "_observed_monotonic": now,
+            "turnTime": 16,
+            "_ws_id": "abcd0001",
+        }
+        autoplay.schedule_cc({"action": "check", "delay": 4509, "lifetime": 4000}, state)
+        self.assertLessEqual(int(autoplay.pending["delay_ms"]), 800)
+        self.assertEqual(autoplay.pending["action"], "CHECK")
+
     def test_failsafe_folds_when_turn_map_is_empty_but_room_is_known(self):
         autoplay = CoinAutoplayCoordinator(chip_scale=100)
         state = {"user_name": "Hero", "user_id": 1, "_hook_room": ROOM}
@@ -369,6 +472,196 @@ class ReconnectSilenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.autoplay.pending["action"], "CHECK")
         self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "RECONNECT_SILENCE")
 
+    async def test_hero_turn_failsafe_when_eye_is_recovering(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.active_hook_room = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.eye_backend = SimpleNamespace(
+            _recovery_in_progress=True,
+            _hint_watchdog=SimpleNamespace(recovery_pending=True),
+            backend_status_snapshot=SimpleNamespace(
+                status="RECOVERING", health="red", message="GAME_IS_BROKEN",
+            ),
+        )
+        hinted = []
+
+        async def boom(*_args, **_kwargs):
+            hinted.append("hint")
+
+        bridge.start_cold_hint = boom  # type: ignore[method-assign]
+        bridge.start_incremental_hint = boom  # type: ignore[method-assign]
+        turn = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "turnTime": 12,
+        }
+        await bridge._on_hero_user_turn({}, {}, b"", turn, ROOM)
+        self.assertEqual(hinted, [])
+        self.assertEqual(bridge.autoplay.pending["action"], "CHECK")
+        self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "EYE_UNAVAILABLE")
+
+    async def test_cc_wait_abort_queues_failsafe_not_manual_silence(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.active_hook_room = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.abort_cc_wait("RECOVERY")
+        await bridge._wait_cc_and_schedule()
+        self.assertEqual(bridge.autoplay.pending["action"], "FOLD")
+        self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "RECOVERY")
+
+    def test_failsafe_between_hands_is_not_coin_sitout(self):
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.wait_blind_cancelled = True
+        bridge.cc_miss_streak = 1
+        bridge._missed_deals = 0
+        bridge.current_hand = None
+        bridge._apply_hero_sitout_flags(False, False)
+        self.assertFalse(bridge.hero_sitting_out)
+        self.assertFalse(bridge._sit_in_wanted)
+        self.assertFalse(hero_sitout_for_watchdog(bridge))
+
+    def test_watchdog_sitout_ignores_failsafe_streak_between_hands(self):
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.cc_miss_streak = 4
+        bridge.current_hand = None
+        bridge.hero_sitting_out = False
+        self.assertFalse(hero_sitout_for_watchdog(bridge))
+        bridge.hero_sitting_out = True
+        self.assertTrue(hero_sitout_for_watchdog(bridge))
+
+    def test_watchdog_source_uses_bridge_latch_only(self):
+        source = (Path(__file__).parents[1] / "core" / "v6router" / "router.py").read_text(encoding="utf-8")
+        self.assertIn("sitout = hero_sitout_for_watchdog(bridge)", source)
+        self.assertNotIn("and not getattr(bridge, \"current_hand\", None)", source)
+
+    def test_coin_flag_or_missed_deal_wants_sit_in(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", user_id=42)
+        bridge.identity.update(user_name="Hero", user_id=42)
+        bridge.hero_sitting = True
+        bridge.current_hand = None
+        bridge.wait_blind_cancelled = True
+        bridge.seat_map = {
+            2: {"seatId": 2, "userId": 42, "userName": "Hero", "userChips": 2.0, "isPlaying": False},
+        }
+        bridge._apply_hero_sitout_flags(True, False)
+        self.assertTrue(bridge.hero_sitting_out)
+        self.assertTrue(bridge._sit_in_wanted)
+        bridge.hero_sitting_out = False
+        bridge._sit_in_wanted = False
+        bridge._note_missed_deal_if_idle()
+        self.assertEqual(bridge._missed_deals, 0)
+        self.assertFalse(bridge.hero_sitting_out)
+        bridge._clock_missed_this_orbit = True
+        bridge._note_missed_deal_if_idle()
+        self.assertEqual(bridge._missed_deals, 0)
+        self.assertFalse(bridge.hero_sitting_out)
+        self.assertFalse(bridge._sit_in_wanted)
+        bridge._apply_hero_sitout_flags(True, False, source="sitout_map")
+        self.assertTrue(bridge.hero_sitting_out)
+        bridge._apply_hero_sitout_flags(False, False, source="sitout_map")
+        self.assertFalse(bridge.hero_sitting_out)
+        self.assertFalse(bridge._sit_in_wanted)
+
+    def test_between_hands_isplaying_false_is_not_sitout(self):
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.current_hand = None
+        bridge.wait_blind_cancelled = True
+        bridge._missed_deals = 3
+        bridge._apply_hero_sitout_flags(False, False)
+        self.assertFalse(bridge.hero_sitting_out)
+        bridge._note_missed_deal_if_idle()
+        self.assertFalse(bridge.hero_sitting_out)
+
+    def test_inbound_sitout_map_latches_without_seat_flag(self):
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.current_hand = None
+        payload = {"sitOutMap": dict(CAPTURED_TIMEOUT_SITOUT_MAP),
+                   "msg": "Since you are timed-out, you will sit-out in the next hand"}
+        self.assertTrue(sitout_map_latched(payload))
+        bridge._apply_hero_sitout_flags(sitout_map_latched(payload), False, source="sitout_map")
+        self.assertTrue(bridge.hero_sitting_out)
+        bridge._apply_hero_sitout_flags(False, False, source="seat")
+        self.assertTrue(bridge.hero_sitting_out)
+        bridge._apply_hero_sitout_flags(False, False, source="sitout_map")
+        self.assertFalse(bridge.hero_sitting_out)
+
+
+class SitOutPacketTests(unittest.TestCase):
+    def test_sit_in_uses_captured_sitout_map(self):
+        raw = build_game_sitout_packet(77, sit_out_next_hand=False)
+        decoded = decode_packet(raw)
+        self.assertEqual(decoded["p"]["c"], "game.sitout")
+        self.assertEqual(decoded["p"]["r"], 77)
+        self.assertNotEqual(decoded["p"]["c"], "game.leave_Seat")
+        self.assertNotEqual(decoded["p"]["c"], "game.quit_table")
+        self.assertNotEqual(decoded["p"]["c"], "game.sitOut")
+        data = json.loads(decoded["p"]["p"]["data"])
+        self.assertEqual(set(data["sitOutMap"]), set(CAPTURED_TIMEOUT_SITOUT_MAP))
+        self.assertEqual(set(data["sitOutMap"]), set(SITOUT_MAP_KEYS))
+        self.assertIs(data["sitOutMap"]["sitOutNextHand"], False)
+        armed = dict(CAPTURED_TIMEOUT_SITOUT_MAP)
+        self.assertTrue(sitout_map_latched({"sitOutMap": armed}))
+        self.assertFalse(sitout_map_latched({"sitOutMap": data["sitOutMap"]}))
+
+
+class RecoveryKeepsFailsafeTests(unittest.TestCase):
+    def test_keep_failsafe_pending_does_not_wipe_check_fold(self):
+        from core.verified_v1.eye_direct_proxy import keep_failsafe_pending
+
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+        }
+        bridge.autoplay.schedule_failsafe(bridge.state, reason="CC_TIMEOUT")
+        raw = bridge.autoplay.pending
+        keep_failsafe_pending(bridge)
+        self.assertIs(bridge.autoplay.pending, raw)
+        self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "CC_TIMEOUT")
+
+    def test_keep_failsafe_pending_replaces_eye_mapped_action(self):
+        from core.verified_v1.eye_direct_proxy import keep_failsafe_pending
+
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+        }
+        with bridge.autoplay.lock:
+            bridge.autoplay.pending = {
+                "action": "RAISE", "fallback": False, "raw": b"x",
+            }
+        keep_failsafe_pending(bridge)
+        self.assertEqual(bridge.autoplay.pending["action"], "CHECK")
+        self.assertTrue(bridge.autoplay.pending.get("fallback"))
+
+    def test_recover_bridge_source_does_not_hold_hint_lock(self):
+        source = (
+            Path(__file__).parents[1] / "core" / "verified_v1" / "eye_direct_proxy.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("keep_failsafe_pending(bridge)", source)
+        self.assertIn("Do not hold hint_lock across recycle/login", source)
+        self.assertNotIn("async with hint_lock:\n                        await perform()", source)
+
 
 class LiveSnapshotNotEmptyTests(unittest.TestCase):
     def test_timeout_keeps_native_sessions_instead_of_zero_zero(self):
@@ -405,6 +698,32 @@ class LiveSnapshotNotEmptyTests(unittest.TestCase):
         self.assertIn("dev-sony", ids)
         self.assertGreaterEqual(int(snap.get("connected_devices") or 0), 1)
 
+    def test_empty_snapshot_does_not_wipe_run_or_connected_device(self):
+        from core.production_runtime import RouterService
+
+        svc = RouterService.__new__(RouterService)
+        svc.run_name = "run_live"
+        svc._routers = {"dev-1": object()}
+        svc._connected = {"dev-1"}
+        svc._device_labels = {"dev-1": "Sony"}
+        svc._heartbeat_at = {"dev-1": time.monotonic()}
+        svc._last_seen = {}
+        svc._last_snapshot = {
+            "ok": True,
+            "devices": [{"device_id": "dev-1", "connected": True, "tables": [{"table_id": 11}]}],
+            "connected_devices": 1,
+            "run": "run_live",
+        }
+        kept = svc._remember_snapshot({"ok": True, "devices": [], "run": ""})
+        self.assertEqual(len(kept.get("devices") or []), 1)
+        self.assertEqual(kept.get("run"), "run_live")
+        self.assertTrue(kept.get("stale"))
+        self.assertNotEqual(int(kept.get("connected_devices") or 0), 0)
+        timeout = svc._snapshot_on_timeout(TimeoutError("control"))
+        timeout = svc._remember_snapshot(timeout)
+        self.assertEqual(timeout.get("run"), "run_live")
+        self.assertEqual(len(timeout.get("devices") or []), 1)
+
     def test_web_merge_keeps_run_and_devices_on_empty_proxy(self):
         import importlib.util
         path = Path(__file__).resolve().parents[1] / "vps" / "pokereye-web.py"
@@ -424,6 +743,716 @@ class LiveSnapshotNotEmptyTests(unittest.TestCase):
         self.assertEqual(merged.get("run"), "run_abc")
         self.assertTrue((merged.get("snapshot") or {}).get("devices"))
         self.assertTrue((merged.get("snapshot") or {}).get("stale"))
+
+    def test_persist_error_is_recorded(self):
+        from core.production_runtime import RouterService
+
+        svc = RouterService.__new__(RouterService)
+        technical = []
+        errors = []
+        svc.technical_sink = lambda event, **fields: technical.append((event, fields))
+        svc.error_sink = lambda event, **fields: errors.append((event, fields))
+        svc.persist_error("control.snapshot", TimeoutError("slow"), where="test")
+        self.assertTrue(technical)
+        self.assertEqual(technical[0][0], "control.snapshot")
+        self.assertEqual(technical[0][1].get("error_type"), "TimeoutError")
+        self.assertTrue(errors)
+
+    def test_handle_and_snapshot_persist_errors_in_source(self):
+        from core import production_runtime as runtime
+
+        source = Path(runtime.__file__).read_text(encoding="utf-8")
+        self.assertIn('self.persist_error("router.handle", exc, device_id=device_id)', source)
+        self.assertIn('self.persist_error("control.snapshot", exc, compact=compact)', source)
+        self.assertIn('owner.router_service.persist_error("control.http.snapshot", exc)', source)
+        self.assertIn("return self._remember_snapshot(self._snapshot_on_timeout(exc))", source)
+        self.assertIn("self._remember_snapshot", source)
+
+
+class FailsafeAckAndReloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_extratimer_sends_pending_eye_immediately(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="TelImit", user_id=1, _hook_room=ROOM, hand_id="h1")
+        bridge.active_hook_room = ROOM
+        now = time.monotonic()
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "TelImit",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "t-eye",
+            "_observed_monotonic": now,
+            "turnTime": 16,
+            "_ws_id": "ws",
+        }
+        bridge.autoplay.pending = {
+            "room": ROOM,
+            "turn_id": "t-eye",
+            "action": "CHECK",
+            "delay_ms": 4509,
+            "due": now + 4.509,
+            "_arbiter_ready_at": now + 4.509,
+            "hand_id": "h1",
+        }
+        event = {"_hmuriy_duplicate_turn": True, "_hmuriy_turn_refresh": "extraTimer"}
+        data = {
+            "whoseTurn": "TelImit",
+            "timerName": "extraTimer",
+            "extraTimerEnabled": True,
+            "userTurnOptions": {},
+        }
+        await bridge._on_hero_user_turn(event, {}, b"", data, ROOM)
+        pending = bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["action"], "CHECK")
+        self.assertEqual(int(pending["delay_ms"]), 0)
+        self.assertTrue(pending.get("extra_urgent"))
+        self.assertFalse(pending.get("fallback"))
+        self.assertLessEqual(float(pending["due"]), time.monotonic() + 0.05)
+        self.assertFalse(bridge._clock_missed_this_orbit)
+
+    async def test_extratimer_without_eye_queues_check_now(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", user_id=1, _hook_room=ROOM, hand_id="h2")
+        bridge.active_hook_room = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "t-none",
+            "_observed_monotonic": time.monotonic(),
+            "turnTime": 16,
+            "_ws_id": "ws",
+        }
+        event = {"_hmuriy_duplicate_turn": True, "_hmuriy_turn_refresh": "extraTimer"}
+        data = {
+            "whoseTurn": "Hero",
+            "timerName": "extraTimer",
+            "extraTimerEnabled": True,
+            "userTurnOptions": {"3": None, "7": None},
+        }
+        started = time.monotonic()
+        await bridge._on_hero_user_turn(event, {}, b"", data, ROOM)
+        self.assertLess(time.monotonic() - started, 0.5)
+        pending = bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["action"], "CHECK")
+        self.assertTrue(pending.get("fallback"))
+        self.assertEqual(pending.get("fallback_reason"), "EXTRA_TIMER")
+        self.assertEqual(int(pending.get("delay_ms") or 0), 0)
+        self.assertFalse(bridge._clock_missed_this_orbit)
+
+    async def test_extratimer_after_send_does_not_mark_clock_miss(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", user_id=1, _hook_room=ROOM, hand_id="h3")
+        bridge.active_hook_room = ROOM
+        bridge.pending_action_ack = {"action": "CHECK", "retries": 0}
+        event = {"_hmuriy_duplicate_turn": True, "_hmuriy_turn_refresh": "extraTimer"}
+        data = {"whoseTurn": "Hero", "timerName": "extraTimer", "extraTimerEnabled": True}
+        await bridge._on_hero_user_turn(event, {}, b"", data, ROOM)
+        self.assertFalse(bridge._clock_missed_this_orbit)
+
+    def test_cc_timeout_default_is_eight_seconds(self):
+        bridge = LiveCoinBridge()
+        self.assertLessEqual(bridge.cc_timeout_seconds, 8.0)
+        self.assertGreaterEqual(bridge.cc_timeout_seconds, 2.0)
+        self.assertLessEqual(bridge._cc_wait_timeout(), 8.0)
+        self.assertEqual(bridge.cc_timeout_seconds, 8.0)
+
+    def _broken_eye(self, *, recovering: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(
+            _recovery_in_progress=recovering,
+            _closed=False,
+            _hint_watchdog=SimpleNamespace(recovery_pending=recovering),
+            backend_status_snapshot=SimpleNamespace(
+                status="RECOVERING" if recovering else "ERROR",
+                health="red",
+                message="GAME_IS_BROKEN",
+            ),
+        )
+
+    async def test_game_is_broken_replays_same_hand_not_failsafe(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM, hand_id="h-broken")
+        bridge.active_hook_room = ROOM
+        bridge.current_hand = SimpleNamespace(hand_id="h-broken")
+        bridge.cold_hands.add("h-broken")
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.eye_backend = self._broken_eye(recovering=False)
+        finished: list[str] = []
+        hinted: list[str] = []
+
+        async def close_hint(why: str = "") -> bool:
+            finished.append(why)
+            return True
+
+        async def cold(*_args, **_kwargs) -> None:
+            hinted.append("resend")
+
+        bridge._close_open_hint = close_hint  # type: ignore[method-assign]
+        bridge.start_cold_hint = cold  # type: ignore[method-assign]
+        started = time.monotonic()
+        turn = {"whoseTurn": "Hero", "userTurnOptions": {"3": None, "7": None}, "turnTime": 12}
+        await bridge._on_hero_user_turn({}, {}, b"", turn, ROOM)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(finished, ["GAME_IS_BROKEN"])
+        self.assertEqual(hinted, ["resend"])
+        self.assertIsNone(bridge.autoplay.pending)
+        self.assertNotIn("h-broken", bridge.cold_hands)
+
+    async def test_game_is_broken_failsafe_only_after_replay_spent(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM, hand_id="h-broken")
+        bridge.active_hook_room = ROOM
+        bridge.current_hand = SimpleNamespace(hand_id="h-broken")
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.eye_backend = self._broken_eye(recovering=False)
+        hinted: list[str] = []
+
+        async def close_hint(why: str = "") -> bool:
+            return True
+
+        async def cold(*_args, **_kwargs) -> None:
+            hinted.append("resend")
+
+        bridge._close_open_hint = close_hint  # type: ignore[method-assign]
+        bridge.start_cold_hint = cold  # type: ignore[method-assign]
+        turn = {"whoseTurn": "Hero", "userTurnOptions": {"3": None, "7": None}, "turnTime": 12}
+        await bridge._on_hero_user_turn({}, {}, b"", turn, ROOM)
+        self.assertEqual(hinted, ["resend"])
+        self.assertIsNone(bridge.autoplay.pending)
+        await bridge._on_hero_user_turn({}, {}, b"", turn, ROOM)
+        self.assertEqual(hinted, ["resend"])
+        self.assertEqual(bridge.autoplay.pending["action"], "CHECK")
+        self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "EYE_UNAVAILABLE")
+
+    async def test_hero_turn_red_eye_still_sends_hint(self):
+        """Red/ERROR is not a dead socket. Ask Eye; failsafe only if it does not answer."""
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.active_hook_room = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.eye_backend = SimpleNamespace(
+            _recovery_in_progress=False,
+            _closed=False,
+            _hint_watchdog=SimpleNamespace(recovery_pending=False),
+            backend_status_snapshot=SimpleNamespace(
+                status="ERROR", health="red", message="NO_TRAFFIC_FROM_ROOM",
+            ),
+        )
+        hinted: list[str] = []
+
+        async def cold(*_args, **_kwargs) -> None:
+            hinted.append("hint")
+
+        bridge.start_cold_hint = cold  # type: ignore[method-assign]
+        turn = {"whoseTurn": "Hero", "userTurnOptions": {"3": None, "7": None}, "turnTime": 12}
+        await bridge._on_hero_user_turn({}, {}, b"", turn, ROOM)
+        self.assertEqual(hinted, ["hint"])
+        self.assertIsNone(bridge.autoplay.pending)
+
+    async def test_cc_wait_red_without_broken_waits_for_answer(self):
+        bridge = LiveCoinBridge()
+        bridge.cc_timeout_seconds = 0.35
+        bridge.cc_fallback_margin_seconds = 0.0
+        bridge.state.update(user_name="Hero", _hook_room=ROOM, hand_id="h-live")
+        bridge.active_hook_room = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+            "turnTime": 12,
+        }
+        bridge.eye_backend = SimpleNamespace(
+            _recovery_in_progress=False,
+            _closed=False,
+            _hint_watchdog=SimpleNamespace(recovery_pending=False),
+            backend_status_snapshot=SimpleNamespace(
+                status="ERROR", health="red", message="NO_TRAFFIC_FROM_ROOM",
+            ),
+        )
+        started = time.monotonic()
+        await bridge._wait_cc_and_schedule()
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertEqual(bridge.autoplay.pending["action"], "CHECK")
+        self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "CC_TIMEOUT")
+
+    async def test_cc_wait_game_is_broken_replays_not_multisecond_hang(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM, hand_id="h-broken")
+        bridge.active_hook_room = ROOM
+        bridge.current_hand = SimpleNamespace(hand_id="h-broken")
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.eye_backend = self._broken_eye(recovering=False)
+        hinted: list[str] = []
+
+        async def close_hint(why: str = "") -> bool:
+            return True
+
+        async def cold(*_args, **_kwargs) -> None:
+            hinted.append("resend")
+
+        bridge._close_open_hint = close_hint  # type: ignore[method-assign]
+        bridge._start_cold_hint_locked = cold  # type: ignore[method-assign]
+        started = time.monotonic()
+        await bridge._wait_cc_and_schedule()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(hinted, ["resend"])
+        self.assertIsNone(bridge.autoplay.pending)
+
+    async def test_cc_wait_game_is_broken_resend_under_held_hint_lock(self):
+        """Outer wait holds hint_lock; leftover cc_queue.get() must not steal the resend CC.
+
+        Uses the real ``_start_cold_hint_locked`` → nested ``_wait_cc_and_schedule``.
+        """
+        hand_id = 112595900001
+        table_id = ppp.table_id_from_hand(hand_id)
+        ev = ColdReplayRoomWindowTests._event
+        model = ppp.CoinCaptureModel([
+            ev(0, None, {"userId": 1, "userName": "Hero", "sessionId": "s"}, room=None),
+            ev(1, "game.wait_list_data", {"tableId": table_id, "configId": 7}),
+            ev(
+                2, "game.pre_hand_start_info",
+                {
+                    "gameId": hand_id, "dealerSeatId": 1,
+                    "sbSeatId": 1, "bbSeatId": 2,
+                    "sbAmount": 0.01, "bbAmount": 0.02,
+                    "anteAmount": 0, "initTimeStamp": 1_700_000_000_000,
+                },
+                hand_id=hand_id, table_id=table_id,
+            ),
+            ev(3, "game.seatInfo", {"seatResponseDataList": [
+                {"userId": 1, "userName": "Hero", "seatId": 1,
+                 "userChips": 2.00, "isPlaying": True},
+                {"userId": 2, "userName": "Villain", "seatId": 2,
+                 "userChips": 2.00, "isPlaying": True},
+            ]}),
+            ev(
+                4, "game.player_info",
+                {"playerCards": [
+                    {"value": "ACE", "suit": "SPADES"},
+                    {"value": "KING", "suit": "HEARTS"},
+                ]},
+                hand_id=hand_id, table_id=table_id,
+            ),
+            ev(
+                5, "game.user_turn",
+                {"whoseTurn": "Hero", "callAmount": 0.0,
+                 "turnTime": 15, "userTurnOptions": {"3": None, "7": None}},
+            ),
+        ])
+        model.hero_id = 1
+        model.hero_name = "Hero"
+        cands = [row for row in model.candidate_hands() if ppp.table_id_from_hand(row[0]) == table_id]
+        self.assertTrue(cands)
+
+        bridge = LiveCoinBridge()
+        bridge.cc_timeout_seconds = 0.4
+        bridge.cc_fallback_margin_seconds = 0.0
+        bridge.mid_hand_recovery_grace = 0.0
+        bridge.frame_delay = 0.0
+        bridge._prefold_config_loaded = True
+        bridge._prefold_config = None
+        bridge.identity.update(user_id=1, user_name="Hero")
+        bridge.state.update(
+            user_name="Hero", user_id=1, _hook_room=ROOM, hand_id="h-broken",
+            table_id=table_id, _pending_finish_hint=11,
+        )
+        bridge.active_hook_room = ROOM
+        bridge.room_to_table[ROOM] = table_id
+        bridge.table_to_room[table_id] = ROOM
+        bridge.current_hand = SimpleNamespace(hand_id="h-broken")
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.eye_backend = self._broken_eye(recovering=False)
+        bridge.finish_frame_by_table[11] = {
+            "msg": json.dumps({"cmd": "pb.FinishRoundHintRSP"}),
+        }
+        sent: list[str] = []
+
+        async def send_cmd(cmd, body=b""):
+            sent.append(str(cmd))
+            return True
+
+        async def send_outer(frame, cmd):
+            sent.append(str(cmd))
+
+        async def must_not_reenter(*_args, **_kwargs):
+            raise AssertionError("start_cold_hint re-entered under hint_lock")
+
+        bridge.eye_send_cmd = send_cmd  # type: ignore[method-assign]
+        bridge.eye_send_outer = send_outer  # type: ignore[method-assign]
+        bridge.eye_w = SimpleNamespace(is_closing=lambda: False)
+        bridge.start_cold_hint = must_not_reenter  # type: ignore[method-assign]
+        self.assertIs(
+            bridge._start_cold_hint_locked.__func__,
+            LiveCoinBridge._start_cold_hint_locked,
+        )
+        bridge._cold_candidate_snapshot = (  # type: ignore[method-assign]
+            lambda: (model, table_id, cands)
+        )
+        bridge._restore_active_money_profile = lambda: SimpleNamespace(  # type: ignore[method-assign]
+            valid_blinds=True, chip_scale=1,
+        )
+        bridge._quantize_pending_cc_amount = lambda cc, profile: ""  # type: ignore[method-assign]
+
+        async def run():
+            async with bridge.hint_lock:
+                wait = asyncio.create_task(bridge._wait_cc_and_schedule())
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline:
+                    if bridge._broken_replay_in_progress and bridge.awaiting_cc:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("nested _wait_cc_and_schedule never started")
+                await asyncio.sleep(0.02)
+                await bridge.cc_queue.put({
+                    "data": {"type": "CHECK", "delay": 0, "lifetime": 4000, "amount": 0.0},
+                })
+                await wait
+
+        started = time.monotonic()
+        await asyncio.wait_for(run(), 3.0)
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertIn("pb.FinishRoundHintRSP", sent)
+        pending = bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["action"], "CHECK")
+        self.assertFalse(pending.get("fallback"))
+        self.assertNotEqual(pending.get("fallback_reason"), "CC_TIMEOUT")
+
+    def _held_ack(self, *, retries: int = 0) -> LiveCoinBridge:
+        bridge = LiveCoinBridge()
+        now = time.monotonic()
+        bridge.state.update(hand_id="h1", user_name="Hero")
+        bridge.pending_action_ack = {
+            "action": "FOLD",
+            "raw": b"fold",
+            "retries": retries,
+            "retry_at": now - 1.0,
+            "hand_id": "h1",
+            "ws_id": "ws",
+            "url": "wss://coin",
+            "token": "tok",
+            "_exhausted_reported": False,
+        }
+        self.assertTrue(bridge.defer_pending_exhaustion(source="extraTimer"))
+        return bridge
+
+    def _dummy(self) -> tuple[dict, dict]:
+        event = {"direction": "out", "v": 6, "ws_id": "ws", "url": "wss://coin", "id": "d1"}
+        payload = {"p": {"c": "lobby.dummy", "r": 1, "p": {"data": {}}}}
+        return event, payload
+
+    async def test_extra_timer_hold_blocks_dummy_retry(self):
+        bridge = self._held_ack(retries=0)
+        event, payload = self._dummy()
+        inj = await bridge._maybe_inject_async(event, payload, b"")
+        self.assertIsNone(inj.inject_raw)
+        ack = bridge.pending_action_ack
+        self.assertEqual(int(ack.get("retries") or 0), 0)
+        self.assertTrue(ack.get("_refresh_hold"))
+        self.assertFalse(bridge.report_action_exhausted_if_due(now=time.monotonic() + 10))
+
+    def test_extra_timer_hold_blocks_action_offers_retry(self):
+        bridge = self._held_ack(retries=0)
+        session = LiveTableSession.__new__(LiveTableSession)
+        session.play_enabled = True
+        session.table_id = 11
+        session._bridge = bridge
+        session._arbiter_cancellations = collections.deque()
+        offers = session.action_offers({"v": 6, "ws_id": "ws", "url": "wss://coin"})
+        self.assertEqual(offers, ())
+        self.assertEqual(int(bridge.pending_action_ack.get("retries") or 0), 0)
+        claim = session.action_claim({"v": 6, "ws_id": "ws", "url": "wss://coin"})
+        self.assertIsNone(claim)
+
+    async def test_duplicate_turn_holds_before_dummy_inject(self):
+        bridge = LiveCoinBridge()
+        now = time.monotonic()
+        bridge.state.update(hand_id="h1", user_name="Hero")
+        bridge.pending_action_ack = {
+            "action": "FOLD",
+            "raw": b"fold",
+            "retries": 0,
+            "retry_at": now - 1.0,
+            "due": now - 1.0,
+            "hand_id": "h1",
+            "ws_id": "ws",
+            "url": "wss://coin",
+            "token": "tok",
+        }
+        event = {"_hmuriy_duplicate_turn": True, "direction": "in"}
+        self.assertIsNone(bridge._note_pending_ack_on_turn(
+            event, "game.user_turn", "in", {"whoseTurn": "Hero"},
+        ))
+        self.assertTrue(bridge.pending_action_ack.get("_refresh_hold"))
+        dummy_event, dummy_payload = self._dummy()
+        inj = await bridge._maybe_inject_async(dummy_event, dummy_payload, b"")
+        self.assertIsNone(inj.inject_raw)
+        self.assertEqual(int(bridge.pending_action_ack.get("retries") or 0), 0)
+        self.assertTrue(bridge.pending_action_ack.get("_refresh_hold"))
+        self.assertFalse(bridge.report_action_exhausted_if_due(now=now + 10))
+        self.assertTrue(bridge.confirm_pending_action(source="coin-seat", action="FOLD"))
+        self.assertIsNone(bridge.pending_action_ack)
+
+    def test_new_hero_turn_releases_hold(self):
+        bridge = self._held_ack()
+        self.assertTrue(bridge.pending_action_ack.get("_refresh_hold"))
+        bridge._note_pending_ack_on_turn(
+            {"direction": "in"}, "game.user_turn", "in", {"whoseTurn": "Hero"},
+        )
+        self.assertIsNone(bridge.pending_action_ack)
+        self.assertFalse(bridge.report_action_exhausted_if_due())
+
+    async def test_unacked_dummy_still_retries_without_extra_timer(self):
+        bridge = LiveCoinBridge()
+        now = time.monotonic()
+        bridge.state.update(hand_id="h1")
+        bridge.pending_action_ack = {
+            "action": "FOLD",
+            "raw": b"fold",
+            "retries": 0,
+            "retry_at": now - 1.0,
+            "hand_id": "h1",
+            "ws_id": "ws",
+            "url": "wss://coin",
+            "token": "tok",
+        }
+        event, payload = self._dummy()
+        inj = await bridge._maybe_inject_async(event, payload, b"")
+        self.assertIsNotNone(inj.inject_raw)
+        self.assertEqual(int(bridge.pending_action_ack.get("retries") or 0), 1)
+
+    def test_coin_ack_clears_exhausted(self):
+        bridge = LiveCoinBridge()
+        now = time.monotonic()
+        bridge.pending_action_ack = {
+            "action": "FOLD",
+            "retries": 2,
+            "retry_at": now - 1.0,
+        }
+        self.assertTrue(bridge.confirm_pending_action(source="coin-seat", action="FOLD"))
+        self.assertFalse(bridge.report_action_exhausted_if_due(now=now + 10))
+
+    def test_recovery_failsafe_does_not_exhaust_leftover_ack(self):
+        from core.verified_v1.eye_direct_proxy import keep_failsafe_pending
+
+        bridge = LiveCoinBridge()
+        now = time.monotonic()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+        }
+        bridge.pending_action_ack = {
+            "action": "RAISE",
+            "retries": 2,
+            "retry_at": now - 1.0,
+        }
+        keep_failsafe_pending(bridge)
+        self.assertTrue(bridge.autoplay.pending.get("fallback"))
+        self.assertIsNone(bridge.pending_action_ack)
+        self.assertFalse(bridge.report_action_exhausted_if_due(now=now + 10))
+
+    async def test_cc_wait_failsafe_when_eye_has_nothing_to_answer(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.active_hook_room = ROOM
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+        }
+        bridge.eye_backend = SimpleNamespace(
+            _recovery_in_progress=True,
+            _hint_watchdog=SimpleNamespace(recovery_pending=True),
+            backend_status_snapshot=SimpleNamespace(
+                status="RECOVERING", health="red", message="GAME_IS_BROKEN",
+            ),
+        )
+        started = time.monotonic()
+        await bridge._wait_cc_and_schedule()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(bridge.autoplay.pending["action"], "FOLD")
+        self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "EYE_UNAVAILABLE")
+
+    def test_swap_logic_between_hands_changes_cc_wait(self):
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.current_hand = None
+        bridge.state["hand_id"] = ""
+        before = bridge._cc_wait_timeout()
+        self.assertEqual(before, 8.0)
+        logic = TableLogic(revision="r2", cc_timeout_seconds=2.5)
+        self.assertTrue(swap_logic_between_hands(bridge, logic))
+        self.assertTrue(bridge.hero_sitting)
+        self.assertEqual(bridge._cc_wait_timeout(), 2.5)
+        self.assertEqual(bridge.cc_timeout_seconds, 2.5)
+        self.assertEqual(bridge.table_logic.revision, "r2")
+        self.assertFalse(bridge.hero_departing)
+        bridge.current_hand = SimpleNamespace(hand_id="h1")
+        self.assertFalse(swap_logic_between_hands(
+            bridge, TableLogic(revision="r3", cc_timeout_seconds=3.0),
+        ))
+        self.assertEqual(bridge._cc_wait_timeout(), 2.5)
+        self.assertTrue(bridge.hero_sitting)
+        self.assertFalse(bridge.hero_departing)
+
+    def test_pending_logic_applies_between_hands(self):
+        session = LiveTableSession.__new__(LiveTableSession)
+        bridge = LiveCoinBridge()
+        bridge.hero_sitting = True
+        bridge.current_hand = SimpleNamespace(hand_id="h1")
+        bridge.state["hand_id"] = "h1"
+        session._bridge = bridge
+        session._pending_logic = None
+        session._logic = None
+        self.assertFalse(session.swap_logic_between_hands(
+            TableLogic(revision="r2", cc_timeout_seconds=2.5),
+        ))
+        self.assertEqual(bridge._cc_wait_timeout(), 8.0)
+        self.assertTrue(bridge.hero_sitting)
+        self.assertIsNotNone(session._pending_logic)
+        bridge.current_hand = None
+        bridge.state["hand_id"] = ""
+        self.assertTrue(session._apply_pending_table_logic())
+        self.assertEqual(bridge._cc_wait_timeout(), 2.5)
+        self.assertTrue(bridge.hero_sitting)
+        self.assertIsNone(session._pending_logic)
+
+    def test_failsafe_streak_standup_still_arms(self):
+        bridge = LiveCoinBridge()
+        for _ in range(4):
+            bridge._hero_turn_this_hand = True
+            bridge._hand_cc_failed = True
+            bridge._account_hero_hand_cc()
+        self.assertTrue(bridge.cc_failsafe_standup)
+        self.assertTrue(bridge.hero_departing)
+
+
+_EXTRA_TAGS = {
+    "extraTimer", "hero_turn_resumed", "turn_refresh", "turn_refresh_hold",
+}
+_FAILSAFE_TAGS = {
+    "GAME_IS_BROKEN", "RECOVERY", "recovery", "fallback_ready",
+    "cc_timeout", "EYE_UNAVAILABLE", "hero_turn_eye_unavailable",
+}
+
+
+def replay_captured_exhausted(incident: dict) -> bool:
+    """Replay one captured nearby sequence through shipped dummy/ACK helpers.
+
+    Tags are applied in list order. extraTimer is not assumed. A sequence of
+    only ``action_retry`` still exhausts. Returns True if exhausted is reported.
+    """
+    sequence = [str(tag) for tag in (incident.get("nearby") or [])]
+    bridge = LiveCoinBridge()
+    now = time.monotonic()
+    action = str(incident.get("action") or "FOLD")
+    bridge.state.update(hand_id="h1", user_name="Hero", _hook_room=ROOM)
+    bridge.pending_action_ack = {
+        "action": action,
+        "raw": b"\x00",
+        "retries": 0,
+        "retry_at": now - 1.0,
+        "due": now - 1.0,
+        "hand_id": "h1",
+        "ws_id": "ws",
+        "url": "wss://coin",
+        "token": "tok",
+        "_exhausted_reported": False,
+    }
+    dummy_event = {"direction": "out", "v": 6, "ws_id": "ws", "url": "wss://coin", "id": "d"}
+    dummy_payload = {"p": {"c": "lobby.dummy", "r": 1, "p": {"data": {}}}}
+
+    async def apply_tag(tag: str) -> None:
+        if tag in _EXTRA_TAGS:
+            bridge._note_pending_ack_on_turn(
+                {"_hmuriy_duplicate_turn": True, "direction": "in"},
+                "game.user_turn",
+                "in",
+                {"whoseTurn": "Hero"},
+            )
+            return
+        if tag == "action_retry":
+            inj = await bridge._maybe_inject_async(dummy_event, dummy_payload, b"")
+            ack = bridge.pending_action_ack
+            if inj.inject_raw and ack and not bridge.ack_refresh_blocks_retry(ack):
+                ack["retry_at"] = time.monotonic() - 0.01
+            return
+        if tag == "action_confirmed":
+            if bridge.pending_action_ack:
+                bridge.confirm_pending_action(source="coin-seat", action=action)
+            return
+        if tag in _FAILSAFE_TAGS:
+            from core.verified_v1.eye_direct_proxy import keep_failsafe_pending
+            bridge.autoplay.turn_by_room[ROOM] = {
+                "userTurnOptions": {"7": None, "3": None},
+            }
+            keep_failsafe_pending(bridge)
+            return
+        if tag == "action_cancelled":
+            bridge.pending_action_ack = None
+
+    async def step() -> bool:
+        for tag in sequence:
+            await apply_tag(tag)
+        late = bool(bridge.report_action_exhausted_if_due(now=time.monotonic() + 1))
+        ack = bridge.pending_action_ack
+        already = bool(ack and ack.get("_exhausted_reported"))
+        return late or already
+
+    return bool(asyncio.run(step()))
+
+
+class ExhaustedBacktestTests(unittest.TestCase):
+    def test_retry_only_sequence_still_exhausts(self):
+        self.assertTrue(replay_captured_exhausted({
+            "action": "FOLD",
+            "nearby": ["action_retry", "action_retry", "action_retry"],
+        }))
+
+    def test_extra_timer_before_retries_does_not_exhaust(self):
+        self.assertFalse(replay_captured_exhausted({
+            "action": "FOLD",
+            "nearby": ["hero_turn_resumed", "action_retry", "action_retry", "action_retry"],
+        }))
+
+    def test_captured_46_new_path(self):
+        path = Path(__file__).parent / "fixtures" / "exhausted_46.jsonl"
+        rows = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+        self.assertEqual(len(rows), 46)
+        after = sum(1 for row in rows if replay_captured_exhausted(row))
+        self.assertLess(after, 46)
 
 
 class MidHandRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -511,6 +1540,14 @@ class MidHandRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(monitor, 1.0)
         self.assertNotIn("live-hand", session._completed)
         self.assertFalse(any(getattr(row, "kind", "") == "hand_completed" for row in observations))
+
+    def test_unstarted_table_deal_is_not_a_history_hand(self):
+        session = object.__new__(LiveTableSession)
+        session._started = set()
+        session._completed = set()
+        session._last_hand = "orbit-only"
+        session._emit_hand_completed("orbit-only", "next hand")
+        self.assertNotIn("orbit-only", session._completed)
 
 
 class AccountingRegressionTests(unittest.TestCase):
@@ -601,10 +1638,14 @@ class ActionHintFormatTests(unittest.TestCase):
         self.assertEqual(format_action_hint("FOLD", 0, 3726), "FOLD 0.0 3726")
         self.assertEqual(format_action_hint("RAISE", 9.37, 6024), "RAISE 9.37 6024")
         self.assertEqual(format_action_hint("FOLD ACK", None, 1), "FOLD 0.0 1")
+        self.assertEqual(format_action_hint("FOLD", 0, 0, source="prefold"), "PREFOLD")
+        self.assertEqual(format_action_hint("FOLD", 0, 0, source="failsafe"), "FALLBACK")
         payload = hud_action("CHECK", 0.0, 800)
         self.assertEqual(payload["text"], "CHECK 0.0 800")
-        self.assertTrue(payload["sticky"])
+        self.assertFalse(payload["sticky"])
         self.assertFalse(payload["leave"])
+        self.assertEqual(hud_action("FOLD", 0.0, 0, source="prefold")["text"], "PREFOLD")
+        self.assertEqual(hud_action("FOLD", 0.0, 0, source="failsafe")["text"], "FALLBACK")
         clear = hud_clear()
         self.assertTrue(clear.get("clear"))
         frame = device_hud_payload(clear, fallback_text="action confirmed via coin-seat")
@@ -953,6 +1994,9 @@ class SharedWsDummyGuardTests(unittest.IsolatedAsyncioTestCase):
                     "ws_id": ws_id,
                     "hand_id": "h1",
                     "turn_id": "t1",
+                    "fallback": True,
+                    "extra_urgent": True,
+                    "action": "FOLD",
                 }
                 self._bridge.state["hand_id"] = "h1"
                 self._bridge.autoplay.turn_by_room[100] = {"_turn_id": "t1"}
@@ -989,12 +2033,68 @@ class SharedWsDummyGuardTests(unittest.IsolatedAsyncioTestCase):
         dummy["v"] = 6
         decision, _ = await router.handle_event(dummy)
         op = decision.get("_operator_action") or {}
-        self.assertNotEqual(op.get("table_id"), 22)
-        self.assertNotIn(
-            str(op.get("action") or ""),
-            {"CHECK", "FOLD", "CHECKFOLD", "STANDUP", "LEAVE"},
+        self.assertEqual(decision.get("action"), "schedule_send")
+        self.assertEqual(int(op.get("table_id") or 0), 22)
+        self.assertIn(str(op.get("action") or ""), {"CHECK", "FOLD", "CHECKFOLD"})
+
+    async def test_delayed_sibling_does_not_block_db_checkfold(self):
+        class LiveDelayed(LiveTableSession):
+            def __init__(self, table_id: int, ws_id: str):
+                self.table_id = table_id
+                self.play_enabled = True
+                self._closed = False
+                self._lock = asyncio.Lock()
+                self._bridge = LiveCoinBridge()
+                self._arbiter_cancellations = collections.deque()
+                self._arbiter_dispatch_context = {}
+                self._bridge.autoplay.pending = {
+                    "due": time.monotonic() + 4.5,
+                    "raw": b"cc",
+                    "room": 100,
+                    "ws_id": ws_id,
+                    "hand_id": "h1",
+                    "turn_id": "t1",
+                    "action": "CHECK",
+                    "_arbiter_ready_at": time.monotonic() + 4.5,
+                }
+                self._bridge.state["hand_id"] = "h1"
+                self._bridge.autoplay.turn_by_room[100] = {"_turn_id": "t1"}
+
+            async def handle_event(self, event):
+                return {"id": event.get("id", ""), "action": "replace"}, None
+
+            def prepare_action_dispatch(self, plan):
+                return True
+
+            def finalize_action_dispatch(self, plan, decision):
+                return True
+
+        ws = "aabbccdd"
+        router = DeviceIngressRouter("device-test", object())
+        live = LiveDelayed(11, ws)
+        router._sessions[11] = _SessionSlot(
+            table_id=11, created_order=1, buffer=collections.deque(),
         )
-        self.assertNotEqual(decision.get("action"), "schedule_send")
+        router._sessions[11].session = live
+        router._ws_to_tables[ws] = {11, 22}
+        router._room_to_table[200] = 22
+        evidence = RoutedEvent(
+            event={"id": "db", "v": 6}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=200, table_ids=(22,), websocket_id=ws,
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ensure_unsupported_exit_locked(
+            22, evidence, reset=True, exit_kind="unsupported",
+        )
+        dummy = coin_hook_event("lobby.dummy", {}, room=-1, mid="dummy-db")
+        dummy["ws_id"] = "lobby-ws"
+        dummy["direction"] = "out"
+        dummy["v"] = 6
+        decision, _ = await router.handle_event(dummy)
+        op = decision.get("_operator_action") or {}
+        self.assertEqual(decision.get("action"), "schedule_send")
+        self.assertEqual(int(op.get("table_id") or 0), 22)
+        self.assertIn(str(op.get("action") or ""), {"CHECK", "FOLD", "CHECKFOLD"})
 
 
 class PlayAndCloseGuardTests(unittest.TestCase):
@@ -1223,6 +2323,145 @@ class DoubleBoardExitTests(unittest.TestCase):
         self.assertEqual(table_id, 0)
         self.assertEqual(reason, "")
 
+    def test_native_v6_dummy_carries_db_checkfold_from_any_ws(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        incoming = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="game-ws",
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ws_to_tables["game-ws"] = {table_id}
+        router._ensure_unsupported_exit_locked(
+            table_id, incoming, reset=True, exit_kind="unsupported",
+        )
+        dummy = RoutedEvent(
+            event={"id": "dummy", "v": 6, "ws_id": "lobby-ws"}, payload=None, raw=b"",
+            command="lobby.dummy", direction="out", room_id=-1, table_ids=(),
+            websocket_id="lobby-ws", data={},
+        )
+        decision = router._forced_exit_decision_locked(dummy, table_id)
+        self.assertEqual(decision.get("action"), "schedule_send")
+        self.assertIn(str(decision.get("_operator_action", {}).get("action")), {"CHECK", "FOLD"})
+        self.assertTrue(bytes(base64.b64decode(decision.get("payload_b64") or b"")))
+
+    def test_db_keeps_pending_fold_extra_urgent(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        session = LiveTableSession.__new__(LiveTableSession)
+        session._bridge = LiveCoinBridge()
+        session._bridge.autoplay.pending = {
+            "action": "FOLD", "due": time.monotonic() + 4.0, "delay_ms": 4000, "raw": b"x",
+        }
+        router._sessions[table_id] = _SessionSlot(
+            table_id=table_id, created_order=1, buffer=collections.deque(),
+        )
+        router._sessions[table_id].session = session
+        incoming = RoutedEvent(
+            event={"id": "db"}, payload=None, raw=b"", command="game.dealer_cards",
+            direction="in", room_id=room, table_ids=(table_id,), websocket_id="aabbccdd",
+            data={"dealerCardsDoubleBoard": [1]},
+        )
+        router._ensure_unsupported_exit_locked(
+            table_id, incoming, reset=True, exit_kind="unsupported",
+        )
+        pending = session._bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["action"], "FOLD")
+        self.assertTrue(pending.get("extra_urgent"))
+        self.assertTrue(pending.get("fallback"))
+        self.assertEqual(int(pending["delay_ms"]), 0)
+
+    def test_release_clears_db_fallback_pending(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        session = LiveTableSession.__new__(LiveTableSession)
+        session._bridge = LiveCoinBridge()
+        session._bridge.autoplay.pending = {
+            "action": "FOLD",
+            "fallback": True,
+            "extra_urgent": True,
+            "delay_ms": 0,
+            "raw": b"x",
+        }
+        router._sessions[table_id] = _SessionSlot(
+            table_id=table_id, created_order=1, buffer=collections.deque(),
+        )
+        router._sessions[table_id].session = session
+        router._unsupported_tables[table_id] = "stale"
+        router._unsupported_room_reasons[room] = "stale"
+        router._unsupported_exit[table_id] = {
+            "kind": "unsupported",
+            "room": room,
+            "queue": collections.deque(),
+            "inflight": {},
+        }
+        router._sink = lambda obs: None
+        self.assertTrue(router._release_stale_double_board_locked(table_id))
+        self.assertIsNone(session._bridge.autoplay.pending)
+
+    def test_new_hand_without_second_board_drops_warning_db(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        router._unsupported_tables[table_id] = "stale"
+        router._unsupported_room_reasons[room] = "stale"
+        router._unsupported_exit[table_id] = {
+            "kind": "unsupported",
+            "room": room,
+            "queue": collections.deque(),
+            "inflight": {},
+        }
+        router._room_to_table[room] = table_id
+        router._sessions[table_id] = _SessionSlot(
+            table_id=table_id, created_order=1, buffer=collections.deque(),
+        )
+        dropped = []
+        router._sink = lambda obs: dropped.append(obs)
+        router._release_stale_double_board_locked(table_id)
+        self.assertNotIn(table_id, router._unsupported_tables)
+        self.assertNotIn(room, router._unsupported_room_reasons)
+        self.assertNotIn(table_id, router._unsupported_exit)
+        self.assertTrue(dropped)
+        self.assertTrue((dropped[-1].detail or {}).get("hud", {}).get("clear"))
+
+    def test_extratimer_on_db_table_arms_fold(self):
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        session = LiveTableSession.__new__(LiveTableSession)
+        session._bridge = LiveCoinBridge()
+        session._bridge.active_hook_room = room
+        session._bridge.autoplay.turn_by_room[room] = {
+            "userTurnOptions": {"4": [0.03], "7": None},
+            "_turn_id": "t-extra",
+            "_ws_id": "aabbccdd",
+        }
+        router._sessions[table_id] = _SessionSlot(
+            table_id=table_id, created_order=1, buffer=collections.deque(),
+        )
+        router._sessions[table_id].session = session
+        router._unsupported_tables[table_id] = "DOUBLE BOARD"
+        router._unsupported_exit[table_id] = {
+            "kind": "unsupported",
+            "room": room,
+            "ws_id": "aabbccdd",
+            "queue": collections.deque([{"stage": "CHECKFOLD", "attempt": 1}]),
+            "inflight": {"tok": {"stage": "CHECKFOLD", "attempt": 1}},
+            "awaiting_coin": True,
+            "next_at": time.monotonic() + 9,
+        }
+        router._arm_db_checkfold_locked(table_id)
+        router._unstick_db_checkfold_locked(table_id)
+        pending = session._bridge.autoplay.pending
+        self.assertEqual(pending["action"], "FOLD")
+        self.assertTrue(pending.get("extra_urgent"))
+        self.assertEqual(int(pending["delay_ms"]), 0)
+        self.assertFalse(router._unsupported_exit[table_id].get("inflight"))
+
     def test_checkfold_injects_on_dummy_not_incoming(self):
         router = DeviceIngressRouter("device-test", object())
         table_id = 1125959
@@ -1313,6 +2552,62 @@ class UnsupportedRoomLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(room, router._unsupported_room_reasons)
         self.assertNotIn(room, router._closing_rooms)
         self.assertIn(table_id, router._unsupported_tables)
+
+    async def test_extratimer_empty_preflop_drops_inherited_warning_db(self):
+        from core.v6router.router import _forward
+
+        class _PassthroughSession:
+            async def handle_event(self, event):
+                return _forward(event), None
+
+            def arbitration_action_ids(self):
+                return set()
+
+            def take_low_stack_exit_request(self):
+                return None
+
+        router = DeviceIngressRouter("device-test", object())
+        table_id = 1125959
+        room = ROOM
+        router._room_to_table[room] = table_id
+        router._unsupported_tables[table_id] = "stale previous hand"
+        router._unsupported_room_reasons[room] = "stale previous hand"
+        router._unsupported_exit[table_id] = {
+            "kind": "unsupported",
+            "room": room,
+            "queue": collections.deque([{"stage": "CHECKFOLD", "attempt": 1}]),
+            "inflight": {},
+        }
+        router._sessions[table_id] = _SessionSlot(
+            table_id=table_id,
+            created_order=1,
+            buffer=collections.deque(),
+            session=_PassthroughSession(),
+        )
+        dropped = []
+        router._sink = lambda obs: dropped.append(obs)
+        decision, _ = await router.handle_event(coin_hook_event(
+            "game.user_turn",
+            {
+                "timerName": "extraTimer",
+                "whoseTurn": "Weedman834",
+                "tableId": table_id,
+                "dealerCards": {"FLOP": [], "TURN": [], "RIVER": []},
+                "dealerCardsDoubleBoard": {"FLOP": [], "TURN": [], "RIVER": []},
+                "isDoubleBoard": True,
+                "userTurnOptions": {"4": [0.03], "7": None},
+            },
+            room=room,
+            mid="extra-preflop",
+        ))
+        self.assertNotIn(table_id, router._unsupported_tables)
+        self.assertNotIn(room, router._unsupported_room_reasons)
+        self.assertNotIn(table_id, router._unsupported_exit)
+        self.assertEqual(decision.get("action"), "forward")
+        self.assertTrue(any(
+            "no second board" in str(getattr(obs, "reason", "") or "")
+            for obs in dropped
+        ))
 
 
 class ColdReplayRoomWindowTests(unittest.TestCase):

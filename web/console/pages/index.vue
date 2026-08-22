@@ -47,6 +47,7 @@ function defaultPolicy(): AutoPolicy {
     min_players: 3,
     leave_below_bb: 79,
     open_if_free_bb: 100,
+    ledger_enabled: false,
   };
 }
 
@@ -88,6 +89,16 @@ async function toggleWatchPlayers(device: DeviceRow, on: boolean) {
   await control("device/auto", {
     device_id: device.device_id,
     policy: { ...policyOf(device), watch_players: on, enabled: !!device.automation?.enabled },
+    apply: true,
+  });
+}
+
+async function toggleLedger(device: DeviceRow, on: boolean) {
+  setDraft(device, { ledger_enabled: on });
+  savePanels();
+  await control("device/auto", {
+    device_id: device.device_id,
+    policy: { ...policyOf(device), ledger_enabled: on, enabled: !!device.automation?.enabled },
     apply: true,
   });
 }
@@ -139,6 +150,13 @@ function fmtAmount(n: number | null | undefined) {
   return String(v);
 }
 
+function fmtProfit(n: number | null | undefined) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  const sign = v > 0 ? "+" : "";
+  return sign + v.toFixed(2);
+}
+
 function handsText(device: DeviceRow) {
   const by = device.hands_by_type || {};
   const order = ["NLH", "PLO4", "PLO5", "PLO6"];
@@ -180,11 +198,27 @@ function hintAmount(n: number | null | undefined) {
   return s.includes(".") ? s : `${s}.0`;
 }
 
+function docsBadge(t: TableRow) {
+  if (!t.hero_sitting) return "";
+  const hands = Number(t.docs_hands || 0);
+  if (hands >= 50) return "";
+  const status = String(t.docs_status || "");
+  if (status === "written") return "записали в docs";
+  if (status === "dry" || status === "error" || status === "missing") return "docs не записались";
+  return "";
+}
+
 function lastAction(t: TableRow) {
   const action = String(t.last_action || "").toUpperCase().replace(/\s+ACK$/, "");
-  if (!action) return { empty: t.pending_action ? "ждём ход" : "—" };
-  const delay = Math.max(0, Math.round(Number(t.action_delay_ms || 0) || 0));
   const source = String(t.last_action_source || "").toLowerCase();
+  if (!action) return { empty: t.pending_action ? "ждём ход" : "—" };
+  if (action === "PREFOLD" || source === "prefold") {
+    return { action: "PREFOLD", amount: "", delay: "", delayWarn: false, source: "prefold" };
+  }
+  if (action === "FALLBACK" || source === "failsafe" || source === "fallback") {
+    return { action: "FALLBACK", amount: "", delay: "", delayWarn: false, source: "failsafe" };
+  }
+  const delay = Math.max(0, Math.round(Number(t.action_delay_ms || 0) || 0));
   const delayWarn = delay === 0 && source && source !== "cc";
   return { action, amount: hintAmount(t.last_amount), delay, delayWarn, source };
 }
@@ -362,6 +396,9 @@ const modes: Array<[LogMode, string]> = [
           <div class="text-[10px] text-[#8b95a3] mt-0.5 truncate">
             <span :class="health === 'live' ? 'text-[#53d18c]' : 'text-[#ff6b73]'">{{ health === "live" ? "онлайн" : "оффлайн" }}</span>
             · {{ snapshot?.build || "—" }}
+            <span v-if="snapshot?.reload_pending" class="text-[#ffb020]">
+              · staged {{ snapshot.staged_build }} (после пустых столов)
+            </span>
             · {{ stats.online }}/{{ stats.devices }} устройств
             · {{ stats.ready }}/{{ stats.tables }} столов
           </div>
@@ -442,6 +479,10 @@ const modes: Array<[LogMode, string]> = [
                     <input type="checkbox" :checked="policyOf(d).watch_players !== false" @change="toggleWatchPlayers(d, ($event.target as HTMLInputElement).checked)" />
                     &lt;3 игрока
                   </label>
+                  <label class="inline-flex items-center gap-1 text-[11px]">
+                    <input type="checkbox" :checked="!!policyOf(d).ledger_enabled" @change="toggleLedger(d, ($event.target as HTMLInputElement).checked)" />
+                    учет
+                  </label>
                 </td>
                 <td class="px-3 py-2">
                   <span class="uppercase tracking-wide text-[10px] font-bold" :class="d.connected ? 'text-[#53d18c]' : 'text-[#ff6b73]'">
@@ -511,6 +552,7 @@ const modes: Array<[LogMode, string]> = [
                       <div v-if="t.warning === 'DB'" class="text-[11px] text-[#ff6b73] font-semibold mt-0.5">Warning: DB</div>
                       <div class="text-[11px] text-[#8b95a3]">{{ t.hero_name || deviceName(d) }} · {{ d.connected ? "online" : "offline" }}</div>
                       <div class="text-[11px] mt-1">{{ t.state === 'starting' ? "подключаем Eye" : (t.state === 'failed' ? "Eye не поднялся" : (t.phase === 'coin' ? "вкладка Coin без сессии" : (t.state === 'closing' ? "вкладка Coin" : (t.hero_sitting ? "сидим" : "наблюдаем")))) }}<span v-if="t.state === 'observing' && t.phase !== 'coin'" class="text-[#8b95a3]"> · лобби</span><span v-if="t.state === 'closing'" class="text-[#8b95a3]"> · ещё открыта</span><span v-if="t.standup_queued" class="text-[#e7bb55]"> · стендап после руки</span></div>
+                      <div v-if="docsBadge(t)" class="text-[11px] mt-0.5" :class="docsBadge(t) === 'записали в docs' ? 'text-[#53d18c]' : 'text-[#e7bb55]'">{{ docsBadge(t) }}</div>
                     </div>
                     <div class="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1 text-[11px] min-w-0">
                       <div><span class="text-[#8b95a3]">игроки</span> {{ t.players ?? "—" }}<span v-if="t.max_seats"> / {{ t.max_seats }}</span></div>
@@ -526,6 +568,7 @@ const modes: Array<[LogMode, string]> = [
                       </div>
                       <div><span class="text-[#8b95a3]">карты</span> {{ cardText(t.hole_cards) }}</div>
                       <div><span class="text-[#8b95a3]">fuel</span> {{ fmtFuel(t.fuel_quantity) }}</div>
+                      <div v-if="t.session_profit != null"><span class="text-[#8b95a3]">профит</span> {{ fmtProfit(t.session_profit) }}</div>
                       <div class="col-span-2 md:col-span-3 flex items-center gap-2">
                         <span v-if="t.warning === 'DB'" class="inline-block w-2.5 h-2.5 rounded-full bg-[#ff6b73] shrink-0"></span>
                         <span class="text-[#8b95a3]">PokerEYE</span> {{ t.account_id || "—" }} · {{ t.backend_health || "—" }} / {{ t.backend_status || "—" }}
