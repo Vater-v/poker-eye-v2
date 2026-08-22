@@ -148,3 +148,69 @@ class ActionArbiterFailsafeTests(unittest.TestCase):
         arbiter._cancel_expired_locked(300.0)
         record = arbiter.record("late")
         self.assertEqual(record.state, ActionState.QUEUED)
+
+
+class HumanTimingTests(unittest.TestCase):
+    def test_default_gaps_are_wider_than_the_robot_band(self):
+        config = ActionArbiterConfig()
+        self.assertGreaterEqual(config.inter_action_gap_min, 0.8)
+        self.assertGreaterEqual(config.inter_action_gap_max, 2.0)
+        self.assertGreaterEqual(config.cross_table_gap_min, 1.1)
+        self.assertGreaterEqual(config.cross_table_gap_max, 2.4)
+        self.assertGreater(
+            config.cross_table_gap_min - config.inter_action_gap_min, 0.2,
+        )
+
+    def test_human_gap_sample_stays_in_range_and_is_not_flat(self):
+        from core.v6router.action_arbiter import sample_human_gap
+
+        class _Rng:
+            def __init__(self) -> None:
+                self.i = 0
+
+            def uniform(self, a, b):
+                self.i += 1
+                return a if self.i % 2 else b
+
+        rng = _Rng()
+        low = sample_human_gap(rng, 1.2, 2.8)
+        high = sample_human_gap(rng, 1.2, 2.8)
+        self.assertGreaterEqual(low, 1.2)
+        self.assertLessEqual(high, 2.8)
+        self.assertNotAlmostEqual(low, high)
+
+    def test_prefold_with_time_left_takes_human_gap(self):
+        from core.v6router.action_arbiter import should_bypass_action_gap
+
+        self.assertFalse(should_bypass_action_gap(
+            fallback=False, extra_urgent=False, retry=False,
+            prefold=True, remaining_seconds=8.0,
+        ))
+        self.assertFalse(should_bypass_action_gap(
+            fallback=False, extra_urgent=False, retry=False,
+            prefold=True, remaining_seconds=None,
+        ))
+
+    def test_prefold_near_deadline_and_failsafe_still_bypass(self):
+        from core.v6router.action_arbiter import should_bypass_action_gap
+
+        self.assertTrue(should_bypass_action_gap(
+            fallback=False, extra_urgent=False, retry=False,
+            prefold=True, remaining_seconds=2.4,
+        ))
+        self.assertTrue(should_bypass_action_gap(
+            fallback=True, extra_urgent=False, retry=False,
+            prefold=False, remaining_seconds=12.0,
+        ))
+        self.assertTrue(should_bypass_action_gap(
+            fallback=False, extra_urgent=True, retry=False,
+            prefold=False, remaining_seconds=12.0,
+        ))
+        self.assertTrue(should_bypass_action_gap(
+            fallback=False, extra_urgent=False, retry=True,
+            prefold=False, remaining_seconds=12.0,
+        ))
+
+
+if __name__ == "__main__":
+    unittest.main()

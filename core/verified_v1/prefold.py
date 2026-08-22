@@ -320,12 +320,16 @@ def street_from_board(
     return "PREFLOP"
 
 
+def _mode_name(mode: Any) -> str:
+    return str(getattr(mode, "value", mode) or "").strip().lower()
+
+
 def evaluate_prefold(config: PrefoldConfig, context: PrefoldContext) -> PrefoldDecision:
-    live = config.mode is PrefoldMode.LIVE
+    live = _mode_name(config.mode) == PrefoldMode.LIVE.value
     flags = {"audit_only": not live, "emit_protocol": live, "bypass_ai": live}
     if not config.enabled:
         return PrefoldDecision(False, None, "PREFOLD_DISABLED", **flags)
-    if config.mode not in {PrefoldMode.AUDIT, PrefoldMode.LIVE}:
+    if _mode_name(config.mode) not in {PrefoldMode.AUDIT.value, PrefoldMode.LIVE.value}:
         return PrefoldDecision(False, None, "PREFOLD_MODE_BLOCKED", audit_only=True, emit_protocol=False, bypass_ai=False)
     if not context.state_complete:
         return PrefoldDecision(False, None, "PREFOLD_STATE_INCOMPLETE", **flags)

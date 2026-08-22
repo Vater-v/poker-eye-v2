@@ -403,6 +403,20 @@ def seed_balance_st(
     return None
 
 
+MIN_HANDS_TO_CLOSE = 5
+
+
+def session_ready_to_close(hands: Any, *, force: bool = False) -> bool:
+    """Short sits stay an open History row unless the emulator went offline."""
+    if force:
+        return True
+    try:
+        count = int(hands or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return count >= MIN_HANDS_TO_CLOSE
+
+
 def close_balance_end(
     *,
     balance_st: Any,
@@ -988,7 +1002,7 @@ class HistoryLedger:
             elif session.write_error or self.errors:
                 status = "error"
             else:
-                status = "missing"
+                status = "pending"
             return {
                 "status": status,
                 "hands": int(session.hands),
@@ -1186,12 +1200,16 @@ class HistoryLedger:
                 self._sessions[key] = session
                 session.tables.add(token)
                 session.table_stacks[token] = stack_cash
+                session.pending_device = ""
+                session.pending_close = False
                 self._table_key[token] = key
                 self._write_open_locked(session)
                 return session
             if token not in session.tables:
                 session.tables.add(token)
                 session.table_stacks[token] = stack_cash
+                session.pending_device = ""
+                session.pending_close = False
                 self._table_key[token] = key
             self._apply_lobby_start_locked(session, wallet_cash)
             return session
@@ -1264,6 +1282,11 @@ class HistoryLedger:
                 return session
             if not self.device_enabled(device_id):
                 return session
+            if not session_ready_to_close(session.hands):
+                session.pending_device = str(device_id)
+                session.pending_close = False
+                self._persist_locked()
+                return session
             live = _usable_wallet(wallet_cash)
             ended, profit = close_balance_end(
                 balance_st=session.balance_st,
@@ -1308,6 +1331,10 @@ class HistoryLedger:
                 if not owned and not pending:
                     continue
                 if pending or not session.tables:
+                    if not session_ready_to_close(session.hands):
+                        session.pending_device = str(device_id)
+                        session.pending_close = False
+                        continue
                     ended, profit = close_balance_end(
                         balance_st=session.balance_st,
                         hand_profit=session.profit,
@@ -1336,7 +1363,8 @@ class HistoryLedger:
                 if session.closed:
                     continue
                 owned = [token for token in list(session.tables) if token.startswith(prefix)]
-                if not owned:
+                parked = (not session.tables and session.pending_device == str(device_id))
+                if not owned and not parked:
                     continue
                 for token in owned:
                     session.tables.discard(token)
@@ -1568,6 +1596,8 @@ class HistoryLedger:
                     "write_error": session.write_error,
                     "sheet_confirmed": bool(session.sheet_confirmed),
                     "rakeback_written": bool(session.rakeback_written),
+                    "pending_device": session.pending_device,
+                    "pending_close": bool(session.pending_close),
                 }
             )
         payload = {
@@ -1619,6 +1649,8 @@ class HistoryLedger:
                 write_error=str(row.get("write_error") or ""),
                 sheet_confirmed=False,
                 rakeback_written=bool(row.get("rakeback_written")),
+                pending_device=str(row.get("pending_device") or ""),
+                pending_close=bool(row.get("pending_close")),
             )
             if row.get("balance_end") is not None:
                 try:

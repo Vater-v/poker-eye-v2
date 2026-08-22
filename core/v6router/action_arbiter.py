@@ -35,12 +35,11 @@ class ActionArbiterConfig:
     or backend wire schemas.
     """
 
-    # Same-table actions should feel responsive.  A physical-device table switch
-    # gets its own slightly longer gap so two tables never fire back-to-back.
-    inter_action_gap_min: float = 0.45
-    inter_action_gap_max: float = 0.80
-    cross_table_gap_min: Optional[float] = None
-    cross_table_gap_max: Optional[float] = None
+    # Same-table think time. Cross-table is a physical device switch.
+    inter_action_gap_min: float = 0.85
+    inter_action_gap_max: float = 2.20
+    cross_table_gap_min: Optional[float] = 1.20
+    cross_table_gap_max: Optional[float] = 2.80
     deadline_safety_margin: float = 0.55
     deep_pot_threshold_bb: float = 60.0
     deep_pot_probability: float = 0.0
@@ -80,10 +79,10 @@ class ActionArbiterConfig:
             return default if raw is None or not raw.strip() else float(raw)
 
         return cls(
-            inter_action_gap_min=number("POKER_ACTION_GAP_MIN_SECONDS", 0.45),
-            inter_action_gap_max=number("POKER_ACTION_GAP_MAX_SECONDS", 0.80),
-            cross_table_gap_min=number("POKER_CROSS_TABLE_GAP_MIN_SECONDS", 0.55),
-            cross_table_gap_max=number("POKER_CROSS_TABLE_GAP_MAX_SECONDS", 0.90),
+            inter_action_gap_min=number("POKER_ACTION_GAP_MIN_SECONDS", 0.85),
+            inter_action_gap_max=number("POKER_ACTION_GAP_MAX_SECONDS", 2.20),
+            cross_table_gap_min=number("POKER_CROSS_TABLE_GAP_MIN_SECONDS", 1.20),
+            cross_table_gap_max=number("POKER_CROSS_TABLE_GAP_MAX_SECONDS", 2.80),
             deadline_safety_margin=number(
                 "POKER_ACTION_DEADLINE_SAFETY_MARGIN_SECONDS", 0.55
             ),
@@ -92,6 +91,40 @@ class ActionArbiterConfig:
             deep_pot_delay_min=number("POKER_DEEP_POT_DELAY_MIN_SECONDS", 2.0),
             deep_pot_delay_max=number("POKER_DEEP_POT_DELAY_MAX_SECONDS", 4.0),
         )
+
+
+PREFOLD_BYPASS_REMAINING_SECONDS = 3.0
+
+
+def sample_human_gap(rng: RandomSource, low: float, high: float) -> float:
+    """Log-uniform gap so most waits are short but not a flat 0.5s click."""
+    lo = max(0.05, float(low))
+    hi = max(lo, float(high))
+    if hi <= lo:
+        return lo
+    return float(math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
+def should_bypass_action_gap(
+    *,
+    fallback: bool = False,
+    extra_urgent: bool = False,
+    retry: bool = False,
+    prefold: bool = False,
+    remaining_seconds: Optional[float] = None,
+) -> bool:
+    """Failsafe/retry/extra fire now. Prefold only skips the gap near the clock."""
+    if fallback or extra_urgent or retry:
+        return True
+    if not prefold:
+        return False
+    if remaining_seconds is None:
+        return False
+    try:
+        left = float(remaining_seconds)
+    except (TypeError, ValueError):
+        return False
+    return left <= PREFOLD_BYPASS_REMAINING_SECONDS
 
 
 @dataclass(frozen=True)
@@ -446,8 +479,8 @@ class ActionArbiter:
                 else:
                     if record.sampled_gap_seconds is None:
                         gap_min, gap_max, cross_table = self._gap_range(record.table_id)
-                        record.sampled_gap_seconds = float(self._rng.uniform(
-                            gap_min, gap_max,
+                        record.sampled_gap_seconds = float(sample_human_gap(
+                            self._rng, gap_min, gap_max,
                         ))
                         self._emit(record, current, "GAP_SAMPLED", {
                             "seconds": record.sampled_gap_seconds,

@@ -22,7 +22,7 @@ from .accounts import (
     AccountProbeDeferred,
     AccountState,
 )
-from .action_arbiter import ActionArbiter, ActionOffer, ActionState, DispatchPlan
+from .action_arbiter import ActionArbiter, ActionOffer, ActionState, DispatchPlan, should_bypass_action_gap
 from .db_recent import store as db_recent_store
 from .fuel import fuel_health, fuel_reason_code, normalize_fuel_threshold
 from .history_ledger import attach_session_docs, attach_session_profit
@@ -879,7 +879,13 @@ class LiveTableSession:
                                 "_arbiter_ready_at", float(pending.get("due") or now)
                             )
                         )
+                    remaining = None
                     deadline = pending.get("turn_deadline_at")
+                    if deadline is not None:
+                        try:
+                            remaining = float(deadline) - now
+                        except (TypeError, ValueError):
+                            remaining = None
                     offers.append(
                         ActionOffer(
                             action_id=action_id,
@@ -891,10 +897,12 @@ class LiveTableSession:
                             # Claim a later dummy at/after the reserved timestamp
                             # instead of handing the app an uncancellable 6-12s timer.
                             supports_delayed_send=False,
-                            bypass_gap=bool(
-                                pending.get("fallback")
-                                or pending.get("prefold")
-                                or pending.get("extra_urgent")
+                            bypass_gap=should_bypass_action_gap(
+                                fallback=bool(pending.get("fallback")),
+                                extra_urgent=bool(pending.get("extra_urgent")),
+                                retry=False,
+                                prefold=bool(pending.get("prefold")),
+                                remaining_seconds=remaining,
                             ),
                         )
                     )

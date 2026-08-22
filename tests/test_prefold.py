@@ -463,5 +463,37 @@ class PrefoldChartTests(unittest.TestCase):
         self.assertGreater(remaining, without_extra + 5.0)
 
 
+class ReloadedPrefoldEnumTests(unittest.TestCase):
+    def test_stale_live_enum_from_hot_reload_still_folds_trash(self):
+        from enum import Enum
+
+        from core.verified_v1.prefold import PrefoldConfig, PrefoldRule
+
+        class StaleMode(str, Enum):
+            AUDIT = "audit"
+            LIVE = "live"
+
+        cards = frozenset({"J6o"})
+        config = PrefoldConfig(
+            enabled=True,
+            mode=StaleMode.LIVE,
+            rules=(PrefoldRule("6-BTN-RAISE", 6, "BTN", "RAISE", cards, 1),),
+        )
+        decision = evaluate_prefold(
+            config,
+            PrefoldContext(
+                dealt_in_players=6,
+                position="BTN",
+                facing="RAISE",
+                hole_cards=("Js", "6h"),
+            ),
+        )
+        self.assertTrue(decision.matched)
+        self.assertEqual(decision.recommended_action, "FOLD")
+        self.assertTrue(decision.bypass_ai)
+        self.assertFalse(decision.audit_only)
+        self.assertEqual(decision.reason_code, "LOCAL_PREFOLD_LIVE_MATCH")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -603,10 +603,25 @@ class OperatorConsole:
                 "operator.device_down", severity="WARN",
                 device_id=device_id, reason=reason, session_hands=session_hands,
             )
+            self._commit_device_offline(device_id)
 
         timer = threading.Timer(self._device_down_grace_seconds, announce_if_still_down)
         timer.daemon = True
         timer.start()
+
+    def _commit_device_offline(self, device_id: str) -> None:
+        ledger = self.history_ledger
+        if ledger is None:
+            return
+        try:
+            ledger.flush_device(device_id)
+        except Exception as exc:
+            self.technical(
+                "operator.ledger_error",
+                severity="WARN",
+                device_id=device_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
 
     def command_sent(self, device_id: str, meta: dict[str, Any]) -> None:

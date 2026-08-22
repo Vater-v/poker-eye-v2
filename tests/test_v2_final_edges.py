@@ -839,6 +839,44 @@ class FailsafeAckAndReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(pending.get("delay_ms") or 0), 0)
         self.assertFalse(bridge._clock_missed_this_orbit)
 
+    async def test_extra_flushes_queued_failsafe_instead_of_second_reason(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", user_id=1, _hook_room=ROOM, hand_id="")
+        bridge.active_hook_room = ROOM
+        now = time.monotonic()
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "t-mid",
+            "_observed_monotonic": now,
+            "turnTime": 16,
+            "_ws_id": "ws",
+        }
+        bridge.autoplay.pending = {
+            "due": now + 2.0,
+            "action": "CHECK",
+            "delay_ms": 0,
+            "fallback": True,
+            "fallback_reason": "MID_HAND_NO_SEED",
+            "turn_id": "t-mid",
+            "room": ROOM,
+            "ws_id": "ws",
+        }
+        event = {"_hmuriy_duplicate_turn": True, "_hmuriy_turn_refresh": "extraTimer"}
+        data = {
+            "whoseTurn": "Hero",
+            "timerName": "extraTimer",
+            "extraTimerEnabled": True,
+            "userTurnOptions": {"3": None, "7": None},
+        }
+        await bridge._on_hero_user_turn(event, {}, b"", data, ROOM)
+        pending = bridge.autoplay.pending
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.get("fallback_reason"), "MID_HAND_NO_SEED")
+        self.assertNotEqual(pending.get("fallback_reason"), "EXTRA_TIMER")
+        self.assertTrue(pending.get("extra_urgent"))
+        self.assertLessEqual(float(pending["due"]), time.monotonic() + 0.05)
+
     async def test_extratimer_after_send_does_not_mark_clock_miss(self):
         bridge = LiveCoinBridge()
         bridge.state.update(user_name="Hero", user_id=1, _hook_room=ROOM, hand_id="h3")

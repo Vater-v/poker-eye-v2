@@ -339,6 +339,73 @@ class RakebackTests(unittest.TestCase):
 
 
 class CloseTests(unittest.TestCase):
+    def test_fewer_than_five_hands_stays_open_until_device_offline(self):
+        ledger, transport = _ledger()
+        ledger.on_hand_started(
+            device_id="dev", table_id=11, nickname="Weedman834",
+            game_type="NLH", coin_bb=0.02, stack=2.0, wallet_cash=12.47,
+        )
+        for _ in range(3):
+            ledger.on_hand_completed(device_id="dev", table_id=11, table_profit=0.02)
+        ledger.on_table_left(device_id="dev", table_id=11, wallet_cash=12.53)
+        self.assertTrue(is_open_history_row(transport.rows[1]))
+        self.assertEqual(transport.rows[1][7], "")
+        again = ledger.on_hand_started(
+            device_id="dev", table_id=12, nickname="Weedman834",
+            game_type="NLH", coin_bb=0.02, stack=2.0, wallet_cash=12.53,
+        )
+        self.assertEqual(again.row_number, 2)
+        self.assertEqual(again.hands, 3)
+        self.assertTrue(is_open_history_row(transport.rows[1]))
+
+    def test_five_hands_close_on_last_table(self):
+        ledger, transport = _ledger()
+        ledger.on_hand_started(
+            device_id="dev", table_id=11, nickname="Weedman834",
+            game_type="NLH", coin_bb=0.02, stack=2.0, wallet_cash=12.47,
+        )
+        for index in range(5):
+            ledger.on_hand_completed(device_id="dev", table_id=11, table_profit=0.02 * (index + 1))
+        ledger.on_table_left(device_id="dev", table_id=11, wallet_cash=12.57)
+        self.assertFalse(is_open_history_row(transport.rows[1]))
+        self.assertEqual(transport.rows[1][13], 5)
+
+    def test_short_session_closes_only_when_emulator_goes_offline(self):
+        ledger, transport = _ledger()
+        ledger.on_hand_started(
+            device_id="dev", table_id=11, nickname="Weedman834",
+            game_type="NLH", coin_bb=0.02, stack=2.0, wallet_cash=12.47,
+        )
+        ledger.on_hand_completed(device_id="dev", table_id=11, table_profit=0.04)
+        ledger.on_table_left(device_id="dev", table_id=11)
+        self.assertTrue(is_open_history_row(transport.rows[1]))
+        ledger.apply_lobby_cash("dev", 12.51)
+        self.assertTrue(is_open_history_row(transport.rows[1]))
+        closed = ledger.flush_device("dev")
+        self.assertEqual(len(closed), 1)
+        self.assertFalse(is_open_history_row(transport.rows[1]))
+        self.assertEqual(transport.rows[1][13], 1)
+
+    def test_operator_offline_commits_parked_short_session(self):
+        from core.production_runtime import OperatorConsole
+
+        class _Log:
+            def emit(self, *args, **kwargs):
+                return {}
+
+        ledger, transport = _ledger()
+        console = OperatorConsole(_Log(), 1)
+        console.history_ledger = ledger
+        ledger.on_hand_started(
+            device_id="dev", table_id=11, nickname="Weedman834",
+            game_type="NLH", coin_bb=0.02, stack=2.0, wallet_cash=12.47,
+        )
+        ledger.on_hand_completed(device_id="dev", table_id=11, table_profit=0.02)
+        ledger.on_table_left(device_id="dev", table_id=11)
+        self.assertTrue(is_open_history_row(transport.rows[1]))
+        console._commit_device_offline("dev")
+        self.assertFalse(is_open_history_row(transport.rows[1]))
+
     def test_close_by_family_writes_only_finished_type(self):
         ledger, transport = _ledger()
         for tid in (11, 12, 13):
@@ -352,6 +419,10 @@ class CloseTests(unittest.TestCase):
                 game_type="PLO4", coin_bb=0.02, stack=2.0, session_hands=10,
             )
         ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.10)
+        ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.04)
+        ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.03)
+        ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.02)
+        ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.01)
         ledger.on_hand_completed(device_id="dev", table_id=21, hero_profit=-0.04)
         ledger.on_table_left(device_id="dev", table_id=11)
         ledger.on_table_left(device_id="dev", table_id=12)
@@ -361,14 +432,13 @@ class CloseTests(unittest.TestCase):
         plo = transport.rows[2]
         self.assertFalse(is_open_history_row(nl))
         self.assertEqual(nl[9], "NL")
-        self.assertEqual(nl[13], 1)
+        self.assertEqual(nl[13], 5)
         self.assertTrue(is_open_history_row(plo))
         self.assertEqual(plo[9], "PLO4")
         ledger.on_table_left(device_id="dev", table_id=21)
         self.assertTrue(is_open_history_row(transport.rows[2]))
         ledger.on_table_left(device_id="dev", table_id=22)
-        self.assertFalse(is_open_history_row(transport.rows[2]))
-        self.assertEqual(transport.rows[2][13], 1)
+        self.assertTrue(is_open_history_row(transport.rows[2]))
 
     def test_flush_device_closes_leftovers(self):
         ledger, transport = _ledger()
@@ -462,11 +532,13 @@ class AuthTests(unittest.TestCase):
             wallet_cash=19.47,
         )
         ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.08)
+        for _ in range(4):
+            ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.0)
         ledger.on_table_left(device_id="dev", table_id=11, wallet_cash=19.55)
         expected = assemble_close_row(
             nickname="Vaterv", game_type="NL", limit=NL,
             started_at=NOW, ended_at=NOW, balance_st=19.47,
-            profit=0.08, hands_s=5, hands=1, balance_end=19.55,
+            profit=0.08, hands_s=5, hands=5, balance_end=19.55,
         )
         self.assertEqual(transport.rows[1], expected)
 
@@ -495,6 +567,8 @@ class AuthTests(unittest.TestCase):
             detail={"table_profit": 0.05},
         )
         ledger.observe(finished)
+        for _ in range(4):
+            ledger.observe(finished)
         left = SimpleNamespace(
             kind="table_close",
             device_id="dev",
@@ -675,13 +749,15 @@ class SitOpenAndLobbyProfitTests(unittest.TestCase):
             game_type="NLH", coin_bb=0.02, stack=2.0, wallet_cash=20.00,
         )
         ledger.on_hand_completed(device_id="dev", table_id=11, table_profit=-0.07)
+        for _ in range(4):
+            ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.0)
         ledger.on_table_left(device_id="dev", table_id=11)
         row = transport.rows[1]
         self.assertFalse(is_open_history_row(row))
         self.assertEqual(row[6], 20.0)
         self.assertEqual(row[7], 19.93)
         self.assertNotEqual(row[7], 1.93)
-        self.assertEqual(row[13], 1)
+        self.assertEqual(row[13], 5)
 
     def test_ru_formulas_use_semicolon_not_comma_args(self):
         from core.v6router.history_ledger import (
@@ -725,6 +801,8 @@ class SitOpenAndLobbyProfitTests(unittest.TestCase):
             game_type="NLH", coin_bb=0.02, wallet_cash=20.00,
         )
         ledger.on_hand_completed(device_id="dev", table_id=11, table_profit=-0.03)
+        for _ in range(4):
+            ledger.on_hand_completed(device_id="dev", table_id=11, hero_profit=0.0)
         ledger.on_table_left(device_id="dev", table_id=11, wallet_cash=19.50)
         row = transport.rows[1]
         self.assertFalse(is_open_history_row(row))
@@ -756,7 +834,7 @@ class SitOpenAndLobbyProfitTests(unittest.TestCase):
             docs = second.session_docs("dev", 11)
             self.assertIsNotNone(docs)
             self.assertEqual(docs["hands"], 0)
-            self.assertEqual(docs["status"], "missing")
+            self.assertEqual(docs["status"], "pending")
 
     def test_stale_ring_persist_opens_nl_row_and_rakeback(self):
         closed = assemble_close_row(

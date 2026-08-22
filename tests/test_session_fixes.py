@@ -101,5 +101,34 @@ class LedgerSeedTests(unittest.TestCase):
         self.assertAlmostEqual(profit, -0.20)
 
 
+class DocsPendingTests(unittest.TestCase):
+    def test_open_session_before_sheet_ack_is_pending_not_missing(self) -> None:
+        from core.v6router.history_ledger import (
+            HistoryLedger,
+            FakeSheetsTransport,
+            attach_session_docs,
+        )
+
+        transport = FakeSheetsTransport()
+        ledger = HistoryLedger(transport)
+        ledger.set_device_enabled("dev", True)
+        session = ledger.on_table_sat(
+            device_id="dev",
+            table_id=11,
+            nickname="Weedman834",
+            game_type="NLH",
+            coin_bb=0.02,
+            stack=2.0,
+            wallet_cash=12.47,
+        )
+        self.assertIsNotNone(session)
+        session.sheet_confirmed = False
+        docs = ledger.session_docs("dev", 11)
+        self.assertIsNotNone(docs)
+        self.assertEqual(docs["status"], "pending")
+        row = attach_session_docs({}, docs, enabled=True)
+        self.assertEqual(row["docs_status"], "pending")
+
+
 if __name__ == "__main__":
     unittest.main()
