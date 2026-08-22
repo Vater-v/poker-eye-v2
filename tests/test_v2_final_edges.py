@@ -500,9 +500,39 @@ class ReconnectSilenceTests(unittest.IsolatedAsyncioTestCase):
             "whoseTurn": "Hero",
             "userTurnOptions": {"3": None, "7": None},
             "turnTime": 12,
+            "_observed_monotonic": time.monotonic(),
         }
         await bridge._on_hero_user_turn({}, {}, b"", turn, ROOM)
         self.assertEqual(hinted, [])
+        self.assertIsNone(bridge.autoplay.pending)
+
+    async def test_hero_turn_failsafe_when_eye_recovering_and_clock_is_dead(self):
+        bridge = LiveCoinBridge()
+        bridge.state.update(user_name="Hero", _hook_room=ROOM)
+        bridge.active_hook_room = ROOM
+        now = time.monotonic()
+        bridge.autoplay.turn_by_room[ROOM] = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "_turn_id": "live",
+            "_ws_id": "ws",
+            "turnTime": 12,
+            "_observed_monotonic": now - 11.0,
+        }
+        bridge.eye_backend = SimpleNamespace(
+            _recovery_in_progress=True,
+            _hint_watchdog=SimpleNamespace(recovery_pending=True),
+            backend_status_snapshot=SimpleNamespace(
+                status="RECOVERING", health="red", message="GAME_IS_BROKEN",
+            ),
+        )
+        turn = {
+            "whoseTurn": "Hero",
+            "userTurnOptions": {"3": None, "7": None},
+            "turnTime": 12,
+            "_observed_monotonic": now - 11.0,
+        }
+        await bridge._on_hero_user_turn({}, {}, b"", turn, ROOM)
         self.assertEqual(bridge.autoplay.pending["action"], "CHECK")
         self.assertEqual(bridge.autoplay.pending.get("fallback_reason"), "EYE_UNAVAILABLE")
 
@@ -2780,6 +2810,64 @@ class ColdReplayRoomWindowTests(unittest.TestCase):
         candidates = ppp.CoinCaptureModel.candidate_hands(model)
         self.assertNotIn(first, [row[0] for row in candidates])
         self.assertIn(second, [row[0] for row in candidates])
+
+
+class LateCardsAndRecoveryPolicyTests(unittest.TestCase):
+    def test_late_cards_retry_prefold_when_first_look_had_no_cards(self):
+        from core.verified_v1.coin_bridge_live import should_retry_prefold_after_cards
+
+        self.assertTrue(should_retry_prefold_after_cards(
+            previous_reason="PREFOLD_STATE_INCOMPLETE",
+            awaiting_cc=False,
+            pending=False,
+        ))
+        self.assertTrue(should_retry_prefold_after_cards(
+            previous_reason="PREFOLD_NOT_PREFLOP",
+            awaiting_cc=False,
+            pending=False,
+        ))
+        self.assertFalse(should_retry_prefold_after_cards(
+            previous_reason="PREFOLD_NO_EXPLICIT_RULE",
+            awaiting_cc=False,
+            pending=False,
+        ))
+        self.assertFalse(should_retry_prefold_after_cards(
+            previous_reason="PREFOLD_STATE_INCOMPLETE",
+            awaiting_cc=True,
+            pending=False,
+        ))
+
+    def test_eye_recycle_with_clock_left_waits_instead_of_folding(self):
+        from core.verified_v1.coin_bridge_live import should_failsafe_while_eye_recovering
+
+        self.assertFalse(should_failsafe_while_eye_recovering(remaining_seconds=9.0))
+        self.assertFalse(should_failsafe_while_eye_recovering(remaining_seconds=None))
+        self.assertTrue(should_failsafe_while_eye_recovering(remaining_seconds=2.0))
+
+    def test_retry_helper_folds_once_cards_exist(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from core.verified_v1.coin_bridge_live import LiveCoinBridge
+
+        bridge = LiveCoinBridge()
+        bridge._last_prefold_reason = "PREFOLD_STATE_INCOMPLETE"
+        bridge.awaiting_cc = False
+        folded = []
+
+        async def fake_try(h):
+            folded.append(True)
+            return True
+
+        bridge._try_nlh_prefold = fake_try
+        hand = SimpleNamespace(cards=({"value": "SEVEN"}, {"value": "TWO"}))
+        self.assertTrue(asyncio.run(bridge.retry_prefold_after_cards(hand)))
+        self.assertEqual(folded, [True])
+
+        bridge.awaiting_cc = True
+        folded.clear()
+        self.assertFalse(asyncio.run(bridge.retry_prefold_after_cards(hand)))
+        self.assertEqual(folded, [])
 
 
 if __name__ == "__main__":

@@ -160,6 +160,37 @@ def hud_action(
     }
 
 
+EYE_RECOVERY_FAILSAFE_REMAINING = 3.0
+PREFOLD_RETRY_AFTER_CARDS = frozenset({
+    "PREFOLD_STATE_INCOMPLETE",
+    "PREFOLD_NOT_PREFLOP",
+    "PREFOLD_CONTEXT_INVALID",
+})
+
+
+def should_retry_prefold_after_cards(
+    *,
+    previous_reason: str = "",
+    awaiting_cc: bool = False,
+    pending: bool = False,
+) -> bool:
+    """Late hole cards: retry the chart only while Eye has not been asked yet."""
+    if pending or awaiting_cc:
+        return False
+    return str(previous_reason or "") in PREFOLD_RETRY_AFTER_CARDS
+
+
+def should_failsafe_while_eye_recovering(remaining_seconds: Optional[float] = None) -> bool:
+    """Recycle is ~2s. Fold only when the Coin clock cannot wait for the new slot."""
+    if remaining_seconds is None:
+        return False
+    try:
+        left = float(remaining_seconds)
+    except (TypeError, ValueError):
+        return False
+    return left <= EYE_RECOVERY_FAILSAFE_REMAINING
+
+
 def lp_pack(obj: dict) -> bytes:
     raw=json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()
     return struct.pack(">I",len(raw))+raw
@@ -333,6 +364,7 @@ class LiveCoinBridge:
         self.emitted_primary_stages=set(); self.emitted_second_boards=set()
         self._street_hand_id=""
         self._cc_deadline=0.0
+        self._last_prefold_reason=""
         self.pending_actor_seat=None
         self.manual_action_event=asyncio.Event(); self.event_count=0; self.inject_count=0; self.cc_count=0; self.heartbeat_count=0
         self.state_error_count=0; self.protocol_error_count=0
@@ -2197,7 +2229,7 @@ class LiveCoinBridge:
             pass
         return False
 
-    def _hero_turn_remaining_seconds(self, turn: Optional[dict]=None) -> float:
+    def _hero_turn_remaining_seconds(self, turn: Optional[dict]=None):
         """Seconds left on the Coin clock, including the extraTimer bank."""
         room=self.context_hook_room or self.active_hook_room
         if turn is None and room is not None:
@@ -2218,7 +2250,7 @@ class LiveCoinBridge:
         except (TypeError,ValueError):
             extra=0.0
         if observed<=0:
-            return 0.0
+            return None
         return max(0.0, observed+total+extra-now)
 
     def _failsafe_detail(self, fb: dict, reason: str) -> dict:
@@ -2249,7 +2281,7 @@ class LiveCoinBridge:
         except (TypeError,ValueError):
             extra=0.0
         if extra<=0:
-            extra=self._hero_turn_remaining_seconds(turn or None)
+            extra=self._hero_turn_remaining_seconds(turn or None) or 0.0
         if extra<=0:
             return
         bump=min(float(self._cc_wait_timeout()), max(0.75, extra-float(self.cc_fallback_margin_seconds)))
@@ -2333,6 +2365,7 @@ class LiveCoinBridge:
                 "players":getattr(context,"dealt_in_players",0),
                 "can_check":bool(getattr(context,"can_check",False)),
             })
+            self._last_prefold_reason=str(decision.reason_code or "")
             return False
         if decision.audit_only or not decision.bypass_ai:
             self._diagnostic("prefold_audit",f"{decision.canonical_hand} would FOLD",{
@@ -2361,6 +2394,22 @@ class LiveCoinBridge:
             "hud":hud_action("FOLD", 0.0, scheduled.get("delay_ms") or 0, source="prefold"),
         })
         return True
+
+    async def retry_prefold_after_cards(self, h=None) -> bool:
+        """Second look at the chart once hole cards exist. Never cancel a live Eye wait."""
+        hand = h or self.current_hand or self.context_hand
+        if hand is None:
+            return False
+        if not should_retry_prefold_after_cards(
+            previous_reason=getattr(self, "_last_prefold_reason", "") or "",
+            awaiting_cc=bool(self.awaiting_cc),
+            pending=bool(self.autoplay.pending),
+        ):
+            return False
+        folded = await self._try_nlh_prefold(hand)
+        if folded:
+            self._diagnostic("prefold_late_cards", "chart fold after hole cards arrived")
+        return folded
 
     async def ensure_action_if_hero_silent(self, *, reason: str = "RECONNECT_SILENCE") -> bool:
         """Queue prefold or CHECK/FOLD when a live hero turn has no pending action.
@@ -2673,6 +2722,14 @@ class LiveCoinBridge:
             if self._eye_socket_dead() or (
                 self._eye_game_is_broken() and self._broken_replay_hand_id()
             ):
+                remaining=self._hero_turn_remaining_seconds(data if isinstance(data, dict) else {})
+                if self._eye_socket_dead() and not should_failsafe_while_eye_recovering(remaining):
+                    self._diagnostic(
+                        "hero_turn_eye_wait",
+                        "Eye recycling; clock left — wait for slot, do not failsafe yet",
+                        {"remaining": remaining},
+                    )
+                    return
                 await self._failsafe_hero_turn(reason="EYE_UNAVAILABLE")
                 return
         elif not (self.autoplay.pending or self.awaiting_cc):
@@ -2681,6 +2738,14 @@ class LiveCoinBridge:
             if self._eye_socket_dead() or (
                 self._eye_game_is_broken() and self._broken_replay_hand_id()
             ):
+                remaining=self._hero_turn_remaining_seconds(data if isinstance(data, dict) else {})
+                if self._eye_socket_dead() and not should_failsafe_while_eye_recovering(remaining):
+                    self._diagnostic(
+                        "hero_turn_eye_wait",
+                        "hero turn while Eye recycles; clock left — skip failsafe",
+                        {"remaining": remaining},
+                    )
+                    return
                 self._diagnostic(
                     "hero_turn_eye_unavailable",
                     "hero turn with PokerEYE socket dead or deal still broken; CHECK/FOLD without a hint",
@@ -2956,7 +3021,7 @@ class LiveCoinBridge:
             turn=self.autoplay.turn_by_room.get(int(room),{}) if room is not None else {}
             remaining=self._hero_turn_remaining_seconds(turn)
             margin=float(self.cc_fallback_margin_seconds)
-            if remaining>0:
+            if remaining is not None and remaining>0:
                 usable=max(0.75, remaining-margin)
                 if self._chart_miss_preflop():
                     # TT/AJs and other chart-miss preflop hands get the Coin clock,
